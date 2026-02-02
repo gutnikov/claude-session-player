@@ -69,7 +69,9 @@ class ScreenState:
 
     def to_markdown(self) -> str:
         """Render current state as markdown text."""
-        raise NotImplementedError("Implemented in issue 03-04")
+        from .formatter import to_markdown
+
+        return to_markdown(self)
 
     def clear(self) -> None:
         """Clear all state (used on compaction)."""
