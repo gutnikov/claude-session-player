@@ -18,6 +18,7 @@ class AssistantText:
     """Assistant's text response. Rendered as ● text with markdown passthrough."""
 
     text: str
+    request_id: str | None = None
 
 
 @dataclass

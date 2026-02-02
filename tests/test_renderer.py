@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from claude_session_player.models import ScreenState, SystemOutput, UserMessage
+from claude_session_player.models import AssistantText, ScreenState, SystemOutput, UserMessage
 from claude_session_player.renderer import render
 
 
@@ -93,6 +93,198 @@ class TestStateMutation:
         state = ScreenState(current_request_id="req_old")
         render(state, user_input_line)
         assert state.current_request_id is None
+
+
+class TestRenderAssistantText:
+    """Tests for rendering assistant text blocks."""
+
+    def test_single_line_text(self, empty_state: ScreenState, assistant_text_line: dict) -> None:
+        result = render(empty_state, assistant_text_line)
+        assert len(result.elements) == 1
+        assert isinstance(result.elements[0], AssistantText)
+        assert result.elements[0].text == "● Here is my response."
+
+    def test_request_id_set(self, empty_state: ScreenState, assistant_text_line: dict) -> None:
+        render(empty_state, assistant_text_line)
+        assert empty_state.current_request_id == "req_001"
+
+    def test_request_id_on_element(
+        self, empty_state: ScreenState, assistant_text_line: dict
+    ) -> None:
+        render(empty_state, assistant_text_line)
+        assert empty_state.elements[0].request_id == "req_001"
+
+    def test_multiline_text(self, empty_state: ScreenState) -> None:
+        line = {
+            "type": "assistant",
+            "requestId": "req_002",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "line one\nline two\nline three"}],
+            },
+        }
+        render(empty_state, line)
+        assert empty_state.elements[0].text == "● line one\n  line two\n  line three"
+
+    def test_empty_text(self, empty_state: ScreenState) -> None:
+        line = {
+            "type": "assistant",
+            "requestId": "req_003",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": ""}],
+            },
+        }
+        render(empty_state, line)
+        assert empty_state.elements[0].text == "●"
+
+    def test_markdown_passthrough(self, empty_state: ScreenState) -> None:
+        line = {
+            "type": "assistant",
+            "requestId": "req_004",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "**bold** and `code`"}],
+            },
+        }
+        render(empty_state, line)
+        assert empty_state.elements[0].text == "● **bold** and `code`"
+
+    def test_same_request_id_continuation(self, empty_state: ScreenState) -> None:
+        """Two blocks with same requestId share current_request_id."""
+        line1 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "part 1"}],
+            },
+        }
+        line2 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "part 2"}],
+            },
+        }
+        render(empty_state, line1)
+        render(empty_state, line2)
+        assert len(empty_state.elements) == 2
+        assert empty_state.elements[0].request_id == "req_001"
+        assert empty_state.elements[1].request_id == "req_001"
+        assert empty_state.current_request_id == "req_001"
+
+    def test_request_id_reset_by_user_input(self, empty_state: ScreenState) -> None:
+        """User input between assistant blocks resets current_request_id."""
+        assistant_line = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "response"}],
+            },
+        }
+        user_line = {
+            "type": "user",
+            "isMeta": False,
+            "message": {"role": "user", "content": "next question"},
+        }
+        render(empty_state, assistant_line)
+        assert empty_state.current_request_id == "req_001"
+        render(empty_state, user_line)
+        assert empty_state.current_request_id is None
+
+
+class TestRenderAssistantTextIntegration:
+    """Integration tests for assistant text rendering with to_markdown."""
+
+    def test_user_then_assistant_markdown(self, empty_state: ScreenState) -> None:
+        """User → assistant produces correct markdown with blank line."""
+        user_line = {
+            "type": "user",
+            "isMeta": False,
+            "message": {"role": "user", "content": "hello"},
+        }
+        assistant_line = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "world"}],
+            },
+        }
+        render(empty_state, user_line)
+        render(empty_state, assistant_line)
+        md = empty_state.to_markdown()
+        assert md == "❯ hello\n\n● world"
+
+    def test_two_assistant_same_rid_markdown(self, empty_state: ScreenState) -> None:
+        """Two assistant blocks with same requestId: no blank line in markdown."""
+        line1 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "first"}],
+            },
+        }
+        line2 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "second"}],
+            },
+        }
+        render(empty_state, line1)
+        render(empty_state, line2)
+        md = empty_state.to_markdown()
+        assert md == "● first\n● second"
+
+    def test_full_conversation_markdown(self, empty_state: ScreenState) -> None:
+        """User → assistant(req_1) → assistant(req_1) → user → assistant(req_2)."""
+        lines = [
+            {
+                "type": "user",
+                "isMeta": False,
+                "message": {"role": "user", "content": "question 1"},
+            },
+            {
+                "type": "assistant",
+                "requestId": "req_001",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "answer part 1"}],
+                },
+            },
+            {
+                "type": "assistant",
+                "requestId": "req_001",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "answer part 2"}],
+                },
+            },
+            {
+                "type": "user",
+                "isMeta": False,
+                "message": {"role": "user", "content": "question 2"},
+            },
+            {
+                "type": "assistant",
+                "requestId": "req_002",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "answer 2"}],
+                },
+            },
+        ]
+        for line in lines:
+            render(empty_state, line)
+        md = empty_state.to_markdown()
+        expected = "❯ question 1\n\n● answer part 1\n● answer part 2\n\n❯ question 2\n\n● answer 2"
+        assert md == expected
 
 
 class TestRenderIntegration:
