@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from claude_session_player.formatter import format_element, format_user_text, to_markdown
+from claude_session_player.formatter import (
+    format_assistant_text,
+    format_element,
+    format_user_text,
+    to_markdown,
+)
 from claude_session_player.models import (
     AssistantText,
     ScreenState,
@@ -37,6 +42,36 @@ class TestFormatUserText:
         assert result == "❯ **bold** and `code`"
 
 
+class TestFormatAssistantText:
+    """Tests for format_assistant_text."""
+
+    def test_single_line(self) -> None:
+        assert format_assistant_text("hello") == "● hello"
+
+    def test_multiline(self) -> None:
+        result = format_assistant_text("line one\nline two\nline three")
+        assert result == "● line one\n  line two\n  line three"
+
+    def test_empty_string(self) -> None:
+        assert format_assistant_text("") == "●"
+
+    def test_markdown_bold(self) -> None:
+        result = format_assistant_text("**bold** text")
+        assert result == "● **bold** text"
+
+    def test_markdown_list(self) -> None:
+        result = format_assistant_text("Here:\n- item 1\n- item 2")
+        assert result == "● Here:\n  - item 1\n  - item 2"
+
+    def test_markdown_code_block(self) -> None:
+        result = format_assistant_text("Code:\n```python\nx = 1\n```")
+        assert result == "● Code:\n  ```python\n  x = 1\n  ```"
+
+    def test_special_characters(self) -> None:
+        result = format_assistant_text("<tag> & \"quotes\" ñ 日本語")
+        assert result == "● <tag> & \"quotes\" ñ 日本語"
+
+
 class TestFormatElement:
     """Tests for format_element."""
 
@@ -52,9 +87,13 @@ class TestFormatElement:
         elem = ThinkingIndicator()
         assert format_element(elem) == ""
 
-    def test_assistant_text_empty_for_now(self) -> None:
-        elem = AssistantText(text="response")
-        assert format_element(elem) == ""
+    def test_assistant_text(self) -> None:
+        elem = AssistantText(text="● response")
+        assert format_element(elem) == "● response"
+
+    def test_assistant_text_with_request_id(self) -> None:
+        elem = AssistantText(text="● response", request_id="req_001")
+        assert format_element(elem) == "● response"
 
 
 class TestToMarkdown:
@@ -102,3 +141,88 @@ class TestToMarkdown:
         """Verify ScreenState.to_markdown() uses formatter."""
         state = ScreenState(elements=[UserMessage(text="❯ via method")])
         assert state.to_markdown() == "❯ via method"
+
+
+class TestToMarkdownRequestIdGrouping:
+    """Tests for request_id-based grouping in to_markdown."""
+
+    def test_same_request_id_no_blank_line(self) -> None:
+        """Two assistant texts with same requestId have no blank line."""
+        state = ScreenState(
+            elements=[
+                AssistantText(text="● first", request_id="req_001"),
+                AssistantText(text="● second", request_id="req_001"),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "● first\n● second"
+
+    def test_different_request_ids_blank_line(self) -> None:
+        """Two assistant texts with different requestIds have blank line."""
+        state = ScreenState(
+            elements=[
+                AssistantText(text="● first", request_id="req_001"),
+                AssistantText(text="● second", request_id="req_002"),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "● first\n\n● second"
+
+    def test_user_then_assistant_blank_line(self) -> None:
+        """User message then assistant text have blank line."""
+        state = ScreenState(
+            elements=[
+                UserMessage(text="❯ hello"),
+                AssistantText(text="● response", request_id="req_001"),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "❯ hello\n\n● response"
+
+    def test_user_assistant_assistant_same_rid(self) -> None:
+        """User → assistant(req_1) → assistant(req_1): blank before first, none between."""
+        state = ScreenState(
+            elements=[
+                UserMessage(text="❯ hello"),
+                AssistantText(text="● part 1", request_id="req_001"),
+                AssistantText(text="● part 2", request_id="req_001"),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "❯ hello\n\n● part 1\n● part 2"
+
+    def test_user_assistant_user_assistant(self) -> None:
+        """User → assistant(req_1) → user → assistant(req_2): proper spacing."""
+        state = ScreenState(
+            elements=[
+                UserMessage(text="❯ first"),
+                AssistantText(text="● resp 1", request_id="req_001"),
+                UserMessage(text="❯ second"),
+                AssistantText(text="● resp 2", request_id="req_002"),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "❯ first\n\n● resp 1\n\n❯ second\n\n● resp 2"
+
+    def test_three_blocks_same_request_id(self) -> None:
+        """Three assistant blocks with same requestId: no blank lines between any."""
+        state = ScreenState(
+            elements=[
+                AssistantText(text="● a", request_id="req_001"),
+                AssistantText(text="● b", request_id="req_001"),
+                AssistantText(text="● c", request_id="req_001"),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "● a\n● b\n● c"
+
+    def test_none_request_id_treated_as_different(self) -> None:
+        """Elements with None request_id always get blank line separator."""
+        state = ScreenState(
+            elements=[
+                AssistantText(text="● first", request_id=None),
+                AssistantText(text="● second", request_id=None),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "● first\n\n● second"
