@@ -13,6 +13,7 @@ from claude_session_player.models import (
     ScreenState,
     SystemOutput,
     ThinkingIndicator,
+    ToolCall,
     UserMessage,
 )
 
@@ -94,6 +95,14 @@ class TestFormatElement:
     def test_assistant_text_with_request_id(self) -> None:
         elem = AssistantText(text="● response", request_id="req_001")
         assert format_element(elem) == "● response"
+
+    def test_tool_call_basic(self) -> None:
+        elem = ToolCall(tool_name="Bash", tool_use_id="t1", label="ls -la")
+        assert format_element(elem) == "\u25cf Bash(ls -la)"
+
+    def test_tool_call_with_request_id(self) -> None:
+        elem = ToolCall(tool_name="Read", tool_use_id="t2", label="file.py", request_id="req_001")
+        assert format_element(elem) == "\u25cf Read(file.py)"
 
 
 class TestToMarkdown:
@@ -226,3 +235,25 @@ class TestToMarkdownRequestIdGrouping:
         )
         result = to_markdown(state)
         assert result == "● first\n\n● second"
+
+    def test_tool_call_grouped_by_request_id(self) -> None:
+        """ToolCall elements with same requestId grouped without blank line."""
+        state = ScreenState(
+            elements=[
+                ToolCall(tool_name="Bash", tool_use_id="t1", label="ls", request_id="req_001"),
+                ToolCall(tool_name="Read", tool_use_id="t2", label="f.py", request_id="req_001"),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "\u25cf Bash(ls)\n\u25cf Read(f.py)"
+
+    def test_text_and_tool_call_same_rid(self) -> None:
+        """AssistantText + ToolCall with same requestId: no blank line."""
+        state = ScreenState(
+            elements=[
+                AssistantText(text="\u25cf checking", request_id="req_001"),
+                ToolCall(tool_name="Bash", tool_use_id="t1", label="ls", request_id="req_001"),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "\u25cf checking\n\u25cf Bash(ls)"
