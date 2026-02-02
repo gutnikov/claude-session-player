@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from .formatter import format_assistant_text, format_user_text
-from .models import AssistantText, ScreenState, SystemOutput, UserMessage
-from .parser import LineType, classify_line, get_local_command_text, get_request_id, get_user_text
+from .models import AssistantText, ScreenState, SystemOutput, ToolCall, UserMessage
+from .parser import LineType, classify_line, get_local_command_text, get_request_id, get_tool_use_info, get_user_text
+from .tools import abbreviate_tool_input
 
 
 def render(state: ScreenState, line: dict) -> ScreenState:
@@ -25,6 +26,8 @@ def render(state: ScreenState, line: dict) -> ScreenState:
         _render_local_command(state, line)
     elif line_type is LineType.ASSISTANT_TEXT:
         _render_assistant_text(state, line)
+    elif line_type is LineType.TOOL_USE:
+        _render_tool_use(state, line)
     # INVISIBLE and unhandled types: do nothing (future issues add more cases)
 
     return state
@@ -57,4 +60,21 @@ def _render_assistant_text(state: ScreenState, line: dict) -> None:
 
     formatted = format_assistant_text(text)
     state.elements.append(AssistantText(text=formatted, request_id=request_id))
+    state.current_request_id = request_id
+
+
+def _render_tool_use(state: ScreenState, line: dict) -> None:
+    """Render a tool_use assistant block."""
+    tool_name, tool_use_id, input_dict = get_tool_use_info(line)
+    label = abbreviate_tool_input(tool_name, input_dict)
+    request_id = get_request_id(line)
+
+    tool_call = ToolCall(
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
+        label=label,
+        request_id=request_id,
+    )
+    state.elements.append(tool_call)
+    state.tool_calls[tool_use_id] = len(state.elements) - 1
     state.current_request_id = request_id

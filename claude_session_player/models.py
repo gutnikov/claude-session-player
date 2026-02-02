@@ -31,6 +31,7 @@ class ToolCall:
     result: str | None = None
     is_error: bool = False
     progress_text: str | None = None
+    request_id: str | None = None
 
 
 @dataclass

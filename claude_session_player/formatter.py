@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .models import AssistantText, ScreenState, SystemOutput, UserMessage
+from .models import AssistantText, ScreenState, SystemOutput, ToolCall, UserMessage
 
 
 def format_user_text(text: str) -> str:
@@ -42,6 +42,14 @@ def format_element(element: object) -> str:
         return element.text
     if isinstance(element, AssistantText):
         return element.text
+    if isinstance(element, ToolCall):
+        line = f"\u25cf {element.tool_name}({element.label})"
+        if element.progress_text is not None:
+            line += f"\n  \u2514 {element.progress_text}"
+        if element.result is not None:
+            prefix = "  \u2717 " if element.is_error else "  \u2514 "
+            line += f"\n{prefix}{element.result}"
+        return line
     return ""
 
 
