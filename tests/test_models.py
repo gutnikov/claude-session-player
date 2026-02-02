@@ -151,9 +151,8 @@ class TestTypeNarrowing:
         assert not isinstance(msg, ToolCall)
 
 
-class TestToMarkdownNotImplemented:
-    """Test that to_markdown raises NotImplementedError."""
+class TestToMarkdownImplemented:
+    """Test that to_markdown works on empty state."""
 
-    def test_to_markdown_raises(self, empty_state: ScreenState) -> None:
-        with pytest.raises(NotImplementedError):
-            empty_state.to_markdown()
+    def test_to_markdown_empty(self, empty_state: ScreenState) -> None:
+        assert empty_state.to_markdown() == ""
