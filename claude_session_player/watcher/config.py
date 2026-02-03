@@ -132,6 +132,89 @@ class BotConfig:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# BackupConfig dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BackupConfig:
+    """Configuration for database backups."""
+
+    enabled: bool = False
+    path: str = "~/.claude-session-player/backups"
+    keep_count: int = 3
+
+    def to_dict(self) -> dict:
+        """Serialize to dict for YAML storage."""
+        return {
+            "enabled": self.enabled,
+            "path": self.path,
+            "keep_count": self.keep_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> BackupConfig:
+        """Deserialize from dict."""
+        return cls(
+            enabled=data.get("enabled", False),
+            path=data.get("path", "~/.claude-session-player/backups"),
+            keep_count=data.get("keep_count", 3),
+        )
+
+    def get_backup_dir(self) -> Path:
+        """Get expanded backup directory path."""
+        return Path(self.path).expanduser().resolve()
+
+
+# ---------------------------------------------------------------------------
+# DatabaseConfig dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DatabaseConfig:
+    """Configuration for SQLite database settings."""
+
+    state_dir: str = "~/.claude-session-player/state"
+    checkpoint_interval: int = 300  # seconds, 0 = auto
+    vacuum_on_startup: bool = False
+    backup: BackupConfig = field(default_factory=BackupConfig)
+
+    def to_dict(self) -> dict:
+        """Serialize to dict for YAML storage."""
+        return {
+            "state_dir": self.state_dir,
+            "checkpoint_interval": self.checkpoint_interval,
+            "vacuum_on_startup": self.vacuum_on_startup,
+            "backup": self.backup.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> DatabaseConfig:
+        """Deserialize from dict."""
+        backup_data = data.get("backup", {})
+        return cls(
+            state_dir=data.get("state_dir", "~/.claude-session-player/state"),
+            checkpoint_interval=data.get("checkpoint_interval", 300),
+            vacuum_on_startup=data.get("vacuum_on_startup", False),
+            backup=BackupConfig.from_dict(backup_data),
+        )
+
+    def get_state_dir(self) -> Path:
+        """Get expanded state directory path."""
+        return Path(self.state_dir).expanduser().resolve()
+
+    def get_backup_dir(self) -> Path:
+        """Get expanded backup directory path."""
+        return self.backup.get_backup_dir()
+
+
+# ---------------------------------------------------------------------------
+# IndexConfig dataclass
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class IndexConfig:
     """Configuration for session indexing."""
@@ -295,7 +378,7 @@ def _migrate_old_format(old_sessions: list[dict]) -> dict:
 def migrate_config(config: dict[str, Any]) -> dict[str, Any]:
     """Migrate config from older versions to current format.
 
-    Adds default index and search config sections if missing.
+    Adds default index, search, and database config sections if missing.
     Updates telegram config with mode field if missing.
 
     Args:
@@ -323,6 +406,19 @@ def migrate_config(config: dict[str, Any]) -> dict[str, Any]:
             "state_ttl_seconds": 300,
         }
 
+    # Add default database config if missing
+    if "database" not in config:
+        config["database"] = {
+            "state_dir": "~/.claude-session-player/state",
+            "checkpoint_interval": 300,
+            "vacuum_on_startup": False,
+            "backup": {
+                "enabled": False,
+                "path": "~/.claude-session-player/backups",
+                "keep_count": 3,
+            },
+        }
+
     # Migrate telegram config - add mode if missing
     if "bots" in config and "telegram" in config["bots"]:
         tg = config["bots"]["telegram"]
@@ -339,6 +435,8 @@ def apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
     - CLAUDE_INDEX_PATHS: Comma-separated list of index paths
     - CLAUDE_INDEX_REFRESH_INTERVAL: Refresh interval in seconds
     - TELEGRAM_WEBHOOK_URL: Telegram webhook URL
+    - CLAUDE_STATE_DIR: Override state directory for database
+    - CLAUDE_DB_CHECKPOINT_INTERVAL: WAL checkpoint interval in seconds
 
     Args:
         config: Config dict to apply overrides to.
@@ -365,6 +463,19 @@ def apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
     if env_webhook := os.environ.get("TELEGRAM_WEBHOOK_URL"):
         config.setdefault("bots", {}).setdefault("telegram", {})
         config["bots"]["telegram"]["webhook_url"] = env_webhook
+
+    # Database state_dir override
+    if env_state_dir := os.environ.get("CLAUDE_STATE_DIR"):
+        config.setdefault("database", {})
+        config["database"]["state_dir"] = env_state_dir
+
+    # Database checkpoint_interval override
+    if env_checkpoint := os.environ.get("CLAUDE_DB_CHECKPOINT_INTERVAL"):
+        try:
+            config.setdefault("database", {})
+            config["database"]["checkpoint_interval"] = int(env_checkpoint)
+        except ValueError:
+            pass  # Ignore invalid values
 
     return config
 
@@ -399,6 +510,7 @@ class ConfigManager:
         self._bot_config: BotConfig = BotConfig()
         self._index_config: IndexConfig = IndexConfig()
         self._search_config: SearchConfig = SearchConfig()
+        self._database_config: DatabaseConfig = DatabaseConfig()
 
     @property
     def config_path(self) -> Path:
@@ -410,7 +522,7 @@ class ConfigManager:
 
         Automatically migrates old format to new format in memory.
         Applies environment variable overrides after loading.
-        Bot, index, and search configs are cached and available via getters.
+        Bot, index, search, and database configs are cached and available via getters.
 
         Returns:
             List of SessionConfig objects. Empty list if file doesn't exist.
@@ -419,6 +531,7 @@ class ConfigManager:
             self._bot_config = BotConfig()
             self._index_config = IndexConfig()
             self._search_config = SearchConfig()
+            self._database_config = DatabaseConfig()
             return []
 
         with open(self._config_path, encoding="utf-8") as f:
@@ -428,13 +541,14 @@ class ConfigManager:
             self._bot_config = BotConfig()
             self._index_config = IndexConfig()
             self._search_config = SearchConfig()
+            self._database_config = DatabaseConfig()
             return []
 
         # Check if old format and migrate
         if _is_old_format(data):
             data = _migrate_old_format(data["sessions"])
 
-        # Apply config migration (adds default index/search if missing)
+        # Apply config migration (adds default index/search/database if missing)
         data = migrate_config(data)
 
         # Apply environment variable overrides
@@ -457,6 +571,12 @@ class ConfigManager:
             self._search_config = SearchConfig.from_dict(data["search"])
         else:
             self._search_config = SearchConfig()
+
+        # Load database config
+        if "database" in data:
+            self._database_config = DatabaseConfig.from_dict(data["database"])
+        else:
+            self._database_config = DatabaseConfig()
 
         # Handle case with no sessions key (but we still loaded configs)
         if "sessions" not in data:
@@ -481,6 +601,7 @@ class ConfigManager:
             "bots": self._bot_config.to_dict(),
             "index": self._index_config.to_dict(),
             "search": self._search_config.to_dict(),
+            "database": self._database_config.to_dict(),
             "sessions": {s.session_id: s.to_new_dict() for s in sessions},
         }
 
@@ -558,6 +679,24 @@ class ConfigManager:
             search_config: New search configuration.
         """
         self._search_config = search_config
+
+    def get_database_config(self) -> DatabaseConfig:
+        """Return the current database configuration.
+
+        Note: Call load() first to ensure database config is up to date.
+
+        Returns:
+            DatabaseConfig with database settings.
+        """
+        return self._database_config
+
+    def set_database_config(self, database_config: DatabaseConfig) -> None:
+        """Set the database configuration (in memory only, call save() to persist).
+
+        Args:
+            database_config: New database configuration.
+        """
+        self._database_config = database_config
 
     def add(self, session_id: str, path: Path) -> None:
         """Add a new session to the watch list.

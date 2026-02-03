@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 
 from claude_session_player.watcher.config import (
+    BackupConfig,
     BotConfig,
     ConfigManager,
+    DatabaseConfig,
     IndexConfig,
     SearchConfig,
     SessionConfig,
@@ -2266,3 +2268,606 @@ class TestConfigFullRoundtrip:
         assert search_config.max_limit == 25
         assert search_config.default_sort == "size"
         assert search_config.state_ttl_seconds == 600
+
+
+# ---------------------------------------------------------------------------
+# BackupConfig tests
+# ---------------------------------------------------------------------------
+
+
+class TestBackupConfig:
+    """Tests for BackupConfig dataclass."""
+
+    def test_create_with_defaults(self) -> None:
+        """BackupConfig has correct default values."""
+        config = BackupConfig()
+        assert config.enabled is False
+        assert config.path == "~/.claude-session-player/backups"
+        assert config.keep_count == 3
+
+    def test_create_with_custom_values(self) -> None:
+        """Can create BackupConfig with custom values."""
+        config = BackupConfig(
+            enabled=True,
+            path="/custom/backup/path",
+            keep_count=5,
+        )
+        assert config.enabled is True
+        assert config.path == "/custom/backup/path"
+        assert config.keep_count == 5
+
+    def test_to_dict(self) -> None:
+        """to_dict returns expected structure."""
+        config = BackupConfig(
+            enabled=True,
+            path="/backup/path",
+            keep_count=10,
+        )
+        result = config.to_dict()
+        assert result == {
+            "enabled": True,
+            "path": "/backup/path",
+            "keep_count": 10,
+        }
+
+    def test_from_dict(self) -> None:
+        """from_dict reconstructs BackupConfig correctly."""
+        data = {
+            "enabled": True,
+            "path": "/custom/path",
+            "keep_count": 7,
+        }
+        config = BackupConfig.from_dict(data)
+        assert config.enabled is True
+        assert config.path == "/custom/path"
+        assert config.keep_count == 7
+
+    def test_from_dict_with_defaults(self) -> None:
+        """from_dict uses defaults for missing keys."""
+        config = BackupConfig.from_dict({})
+        assert config.enabled is False
+        assert config.path == "~/.claude-session-player/backups"
+        assert config.keep_count == 3
+
+    def test_from_dict_partial(self) -> None:
+        """from_dict handles partial config."""
+        config = BackupConfig.from_dict({"enabled": True})
+        assert config.enabled is True
+        assert config.path == "~/.claude-session-player/backups"
+        assert config.keep_count == 3
+
+    def test_roundtrip(self) -> None:
+        """to_dict/from_dict round-trip preserves data."""
+        original = BackupConfig(
+            enabled=True,
+            path="/path/to/backups",
+            keep_count=5,
+        )
+        restored = BackupConfig.from_dict(original.to_dict())
+        assert restored.enabled == original.enabled
+        assert restored.path == original.path
+        assert restored.keep_count == original.keep_count
+
+    def test_get_backup_dir(self) -> None:
+        """get_backup_dir expands ~ and resolves path."""
+        config = BackupConfig(path="~/.claude-session-player/backups")
+        result = config.get_backup_dir()
+        assert "~" not in str(result)
+        assert result.is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# DatabaseConfig tests
+# ---------------------------------------------------------------------------
+
+
+class TestDatabaseConfig:
+    """Tests for DatabaseConfig dataclass."""
+
+    def test_create_with_defaults(self) -> None:
+        """DatabaseConfig has correct default values."""
+        config = DatabaseConfig()
+        assert config.state_dir == "~/.claude-session-player/state"
+        assert config.checkpoint_interval == 300
+        assert config.vacuum_on_startup is False
+        assert config.backup.enabled is False
+        assert config.backup.path == "~/.claude-session-player/backups"
+        assert config.backup.keep_count == 3
+
+    def test_create_with_custom_values(self) -> None:
+        """Can create DatabaseConfig with custom values."""
+        backup = BackupConfig(enabled=True, path="/backup", keep_count=5)
+        config = DatabaseConfig(
+            state_dir="/custom/state",
+            checkpoint_interval=600,
+            vacuum_on_startup=True,
+            backup=backup,
+        )
+        assert config.state_dir == "/custom/state"
+        assert config.checkpoint_interval == 600
+        assert config.vacuum_on_startup is True
+        assert config.backup.enabled is True
+        assert config.backup.path == "/backup"
+        assert config.backup.keep_count == 5
+
+    def test_to_dict(self) -> None:
+        """to_dict returns expected structure."""
+        config = DatabaseConfig(
+            state_dir="/state",
+            checkpoint_interval=120,
+            vacuum_on_startup=True,
+            backup=BackupConfig(enabled=True, path="/backup", keep_count=2),
+        )
+        result = config.to_dict()
+        assert result == {
+            "state_dir": "/state",
+            "checkpoint_interval": 120,
+            "vacuum_on_startup": True,
+            "backup": {
+                "enabled": True,
+                "path": "/backup",
+                "keep_count": 2,
+            },
+        }
+
+    def test_from_dict(self) -> None:
+        """from_dict reconstructs DatabaseConfig correctly."""
+        data = {
+            "state_dir": "/custom/state",
+            "checkpoint_interval": 60,
+            "vacuum_on_startup": True,
+            "backup": {
+                "enabled": True,
+                "path": "/custom/backup",
+                "keep_count": 10,
+            },
+        }
+        config = DatabaseConfig.from_dict(data)
+        assert config.state_dir == "/custom/state"
+        assert config.checkpoint_interval == 60
+        assert config.vacuum_on_startup is True
+        assert config.backup.enabled is True
+        assert config.backup.path == "/custom/backup"
+        assert config.backup.keep_count == 10
+
+    def test_from_dict_with_defaults(self) -> None:
+        """from_dict uses defaults for missing keys."""
+        config = DatabaseConfig.from_dict({})
+        assert config.state_dir == "~/.claude-session-player/state"
+        assert config.checkpoint_interval == 300
+        assert config.vacuum_on_startup is False
+        assert config.backup.enabled is False
+
+    def test_from_dict_partial(self) -> None:
+        """from_dict handles partial config."""
+        config = DatabaseConfig.from_dict({"checkpoint_interval": 60})
+        assert config.state_dir == "~/.claude-session-player/state"
+        assert config.checkpoint_interval == 60
+        assert config.vacuum_on_startup is False
+
+    def test_from_dict_partial_backup(self) -> None:
+        """from_dict handles partial backup config."""
+        config = DatabaseConfig.from_dict({"backup": {"enabled": True}})
+        assert config.backup.enabled is True
+        assert config.backup.path == "~/.claude-session-player/backups"
+        assert config.backup.keep_count == 3
+
+    def test_roundtrip(self) -> None:
+        """to_dict/from_dict round-trip preserves data."""
+        original = DatabaseConfig(
+            state_dir="/path/to/state",
+            checkpoint_interval=180,
+            vacuum_on_startup=True,
+            backup=BackupConfig(enabled=True, path="/backup", keep_count=7),
+        )
+        restored = DatabaseConfig.from_dict(original.to_dict())
+        assert restored.state_dir == original.state_dir
+        assert restored.checkpoint_interval == original.checkpoint_interval
+        assert restored.vacuum_on_startup == original.vacuum_on_startup
+        assert restored.backup.enabled == original.backup.enabled
+        assert restored.backup.path == original.backup.path
+        assert restored.backup.keep_count == original.backup.keep_count
+
+    def test_get_state_dir(self) -> None:
+        """get_state_dir expands ~ and resolves path."""
+        config = DatabaseConfig(state_dir="~/.claude-session-player/state")
+        result = config.get_state_dir()
+        assert "~" not in str(result)
+        assert result.is_absolute()
+
+    def test_get_backup_dir(self) -> None:
+        """get_backup_dir delegates to backup config."""
+        config = DatabaseConfig(
+            backup=BackupConfig(path="~/.custom/backups")
+        )
+        result = config.get_backup_dir()
+        assert "~" not in str(result)
+        assert result.is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# migrate_config database tests
+# ---------------------------------------------------------------------------
+
+
+class TestMigrateConfigDatabase:
+    """Tests for migrate_config function with database config."""
+
+    def test_adds_database_config_if_missing(self) -> None:
+        """migrate_config adds default database config when missing."""
+        from claude_session_player.watcher.config import migrate_config
+
+        config: dict = {"bots": {}, "sessions": {}}
+        result = migrate_config(config)
+
+        assert "database" in result
+        assert result["database"]["state_dir"] == "~/.claude-session-player/state"
+        assert result["database"]["checkpoint_interval"] == 300
+        assert result["database"]["vacuum_on_startup"] is False
+        assert result["database"]["backup"]["enabled"] is False
+        assert result["database"]["backup"]["path"] == "~/.claude-session-player/backups"
+        assert result["database"]["backup"]["keep_count"] == 3
+
+    def test_preserves_existing_database_config(self) -> None:
+        """migrate_config preserves existing database config."""
+        from claude_session_player.watcher.config import migrate_config
+
+        config: dict = {
+            "bots": {},
+            "sessions": {},
+            "database": {
+                "state_dir": "/custom/state",
+                "checkpoint_interval": 60,
+                "vacuum_on_startup": True,
+                "backup": {
+                    "enabled": True,
+                    "path": "/custom/backup",
+                    "keep_count": 5,
+                },
+            },
+        }
+        result = migrate_config(config)
+
+        assert result["database"]["state_dir"] == "/custom/state"
+        assert result["database"]["checkpoint_interval"] == 60
+        assert result["database"]["vacuum_on_startup"] is True
+        assert result["database"]["backup"]["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# apply_env_overrides database tests
+# ---------------------------------------------------------------------------
+
+
+class TestApplyEnvOverridesDatabase:
+    """Tests for apply_env_overrides function with database config."""
+
+    def test_overrides_state_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CLAUDE_STATE_DIR overrides state_dir."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("CLAUDE_STATE_DIR", "/env/state")
+
+        config: dict = {"database": {"state_dir": "~/.claude-session-player/state"}}
+        result = apply_env_overrides(config)
+
+        assert result["database"]["state_dir"] == "/env/state"
+
+    def test_overrides_checkpoint_interval(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CLAUDE_DB_CHECKPOINT_INTERVAL overrides checkpoint_interval."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("CLAUDE_DB_CHECKPOINT_INTERVAL", "60")
+
+        config: dict = {"database": {"checkpoint_interval": 300}}
+        result = apply_env_overrides(config)
+
+        assert result["database"]["checkpoint_interval"] == 60
+
+    def test_ignores_invalid_checkpoint_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Invalid CLAUDE_DB_CHECKPOINT_INTERVAL is ignored."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("CLAUDE_DB_CHECKPOINT_INTERVAL", "not-a-number")
+
+        config: dict = {"database": {"checkpoint_interval": 300}}
+        result = apply_env_overrides(config)
+
+        # Should keep original value
+        assert result["database"]["checkpoint_interval"] == 300
+
+    def test_creates_database_section_if_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CLAUDE_STATE_DIR creates database section if missing."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("CLAUDE_STATE_DIR", "/env/state")
+
+        config: dict = {}
+        result = apply_env_overrides(config)
+
+        assert result["database"]["state_dir"] == "/env/state"
+
+
+# ---------------------------------------------------------------------------
+# ConfigManager database config tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigManagerDatabaseConfig:
+    """Tests for ConfigManager database configuration methods."""
+
+    def test_get_database_config_defaults(
+        self, config_manager: ConfigManager
+    ) -> None:
+        """get_database_config returns defaults when no file."""
+        config_manager.load()
+        database_config = config_manager.get_database_config()
+        assert database_config.state_dir == "~/.claude-session-player/state"
+        assert database_config.checkpoint_interval == 300
+        assert database_config.vacuum_on_startup is False
+        assert database_config.backup.enabled is False
+
+    def test_get_database_config_from_file(
+        self, config_manager: ConfigManager, tmp_config_path: Path
+    ) -> None:
+        """get_database_config returns values from config file."""
+        yaml_content = """database:
+  state_dir: "/custom/state"
+  checkpoint_interval: 60
+  vacuum_on_startup: true
+  backup:
+    enabled: true
+    path: "/custom/backup"
+    keep_count: 5
+sessions: {}
+"""
+        tmp_config_path.write_text(yaml_content)
+        config_manager.load()
+
+        database_config = config_manager.get_database_config()
+        assert database_config.state_dir == "/custom/state"
+        assert database_config.checkpoint_interval == 60
+        assert database_config.vacuum_on_startup is True
+        assert database_config.backup.enabled is True
+        assert database_config.backup.path == "/custom/backup"
+        assert database_config.backup.keep_count == 5
+
+    def test_set_database_config(
+        self, config_manager: ConfigManager
+    ) -> None:
+        """set_database_config updates in-memory config."""
+        new_config = DatabaseConfig(
+            state_dir="/new/state",
+            checkpoint_interval=120,
+            vacuum_on_startup=True,
+        )
+        config_manager.set_database_config(new_config)
+
+        database_config = config_manager.get_database_config()
+        assert database_config.state_dir == "/new/state"
+        assert database_config.checkpoint_interval == 120
+        assert database_config.vacuum_on_startup is True
+
+    def test_database_config_persists_on_save(
+        self,
+        config_manager: ConfigManager,
+        sample_session_file: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """Database config is persisted when save() is called."""
+        config_manager.set_database_config(
+            DatabaseConfig(
+                state_dir="/custom/state",
+                checkpoint_interval=60,
+                backup=BackupConfig(enabled=True, keep_count=5),
+            )
+        )
+        config_manager.save(
+            [SessionConfig(session_id="test", path=sample_session_file)]
+        )
+
+        # Create new manager and load
+        new_manager = ConfigManager(tmp_config_path)
+        new_manager.load()
+        database_config = new_manager.get_database_config()
+        assert database_config.state_dir == "/custom/state"
+        assert database_config.checkpoint_interval == 60
+        assert database_config.backup.enabled is True
+        assert database_config.backup.keep_count == 5
+
+
+# ---------------------------------------------------------------------------
+# ConfigManager database migration integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigManagerDatabaseMigration:
+    """Tests for ConfigManager database config migration during load."""
+
+    def test_load_adds_database_defaults_when_missing(
+        self, config_manager: ConfigManager, tmp_config_path: Path
+    ) -> None:
+        """load() adds default database config when file has none."""
+        yaml_content = """bots:
+  telegram:
+    token: "BOT_TOKEN"
+sessions: {}
+"""
+        tmp_config_path.write_text(yaml_content)
+        config_manager.load()
+
+        # Database config should have defaults
+        database_config = config_manager.get_database_config()
+        assert database_config.state_dir == "~/.claude-session-player/state"
+        assert database_config.checkpoint_interval == 300
+        assert database_config.vacuum_on_startup is False
+        assert database_config.backup.enabled is False
+
+    def test_load_with_database_env_override(
+        self,
+        config_manager: ConfigManager,
+        tmp_config_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """load() applies database environment variable overrides."""
+        yaml_content = """database:
+  state_dir: "~/.claude-session-player/state"
+  checkpoint_interval: 300
+sessions: {}
+"""
+        tmp_config_path.write_text(yaml_content)
+        monkeypatch.setenv("CLAUDE_STATE_DIR", "/env/state")
+        monkeypatch.setenv("CLAUDE_DB_CHECKPOINT_INTERVAL", "60")
+
+        config_manager.load()
+
+        database_config = config_manager.get_database_config()
+        assert database_config.state_dir == "/env/state"
+        assert database_config.checkpoint_interval == 60
+
+    def test_load_all_sections_with_database(
+        self, config_manager: ConfigManager, tmp_config_path: Path
+    ) -> None:
+        """load() correctly loads all config sections including database."""
+        yaml_content = """bots:
+  telegram:
+    token: "BOT_TOKEN"
+    mode: polling
+index:
+  paths:
+    - "/custom/path"
+search:
+  default_limit: 7
+database:
+  state_dir: "/custom/state"
+  checkpoint_interval: 120
+  vacuum_on_startup: true
+  backup:
+    enabled: true
+    path: "/custom/backup"
+    keep_count: 5
+sessions:
+  test-session:
+    path: "/path/to/session.jsonl"
+    destinations:
+      telegram: []
+      slack: []
+"""
+        tmp_config_path.write_text(yaml_content)
+        sessions = config_manager.load()
+
+        # Verify all sections loaded
+        assert len(sessions) == 1
+
+        database_config = config_manager.get_database_config()
+        assert database_config.state_dir == "/custom/state"
+        assert database_config.checkpoint_interval == 120
+        assert database_config.vacuum_on_startup is True
+        assert database_config.backup.enabled is True
+        assert database_config.backup.path == "/custom/backup"
+        assert database_config.backup.keep_count == 5
+
+    def test_save_includes_database_section(
+        self,
+        config_manager: ConfigManager,
+        sample_session_file: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """save() includes database config section in output."""
+        config_manager.set_database_config(
+            DatabaseConfig(
+                state_dir="/custom/state",
+                checkpoint_interval=60,
+                vacuum_on_startup=True,
+                backup=BackupConfig(enabled=True, path="/backup", keep_count=5),
+            )
+        )
+        config_manager.save(
+            [SessionConfig(session_id="test", path=sample_session_file)]
+        )
+
+        content = tmp_config_path.read_text()
+        assert "database:" in content
+        assert "/custom/state" in content
+        assert "checkpoint_interval: 60" in content
+        assert "vacuum_on_startup: true" in content
+        assert "backup:" in content
+        assert "enabled: true" in content
+
+
+# ---------------------------------------------------------------------------
+# Integration: Full config file round-trip with database
+# ---------------------------------------------------------------------------
+
+
+class TestConfigDatabaseFullRoundtrip:
+    """Tests for full config file round-trip with database section."""
+
+    def test_full_config_roundtrip_with_database(
+        self,
+        tmp_config_path: Path,
+        sample_session_file: Path,
+    ) -> None:
+        """Full config with database section survives load/save round-trip."""
+        # Create config with all sections including database
+        manager1 = ConfigManager(tmp_config_path)
+        manager1.set_bot_config(
+            BotConfig(
+                telegram_token="BOT_TOKEN",
+                slack_token="xoxb-token",
+            )
+        )
+        manager1.set_index_config(
+            IndexConfig(
+                paths=["/path/one"],
+                refresh_interval=120,
+            )
+        )
+        manager1.set_search_config(
+            SearchConfig(
+                default_limit=8,
+                max_limit=25,
+            )
+        )
+        manager1.set_database_config(
+            DatabaseConfig(
+                state_dir="/custom/state",
+                checkpoint_interval=60,
+                vacuum_on_startup=True,
+                backup=BackupConfig(
+                    enabled=True,
+                    path="/custom/backup",
+                    keep_count=7,
+                ),
+            )
+        )
+
+        # Save with a session
+        sessions = [
+            SessionConfig(
+                session_id="test-session",
+                path=sample_session_file,
+            )
+        ]
+        manager1.save(sessions)
+
+        # Load with new manager
+        manager2 = ConfigManager(tmp_config_path)
+        loaded_sessions = manager2.load()
+
+        # Verify sessions
+        assert len(loaded_sessions) == 1
+        assert loaded_sessions[0].session_id == "test-session"
+
+        # Verify database config
+        database_config = manager2.get_database_config()
+        assert database_config.state_dir == "/custom/state"
+        assert database_config.checkpoint_interval == 60
+        assert database_config.vacuum_on_startup is True
+        assert database_config.backup.enabled is True
+        assert database_config.backup.path == "/custom/backup"
+        assert database_config.backup.keep_count == 7
