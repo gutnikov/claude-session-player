@@ -6,6 +6,11 @@ This module provides:
 
 The database is a CACHE - it can be fully rebuilt from session files at any time.
 The source of truth is the session .jsonl files on disk.
+
+Features:
+- Full-text search with FTS5 (graceful fallback if unavailable)
+- Efficient filtering by project, date range
+- Incremental updates based on file mtime
 """
 
 from __future__ import annotations
@@ -143,6 +148,39 @@ CREATE TABLE IF NOT EXISTS file_mtimes (
 CREATE INDEX IF NOT EXISTS idx_file_mtimes_mtime ON file_mtimes(mtime_ns DESC);
 """
 
+FTS_SCHEMA = """
+-- FTS5 virtual table (content-sync mode)
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    session_id,
+    summary,
+    project_display_name,
+    content='sessions',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+
+-- Triggers to keep FTS in sync with main table
+CREATE TRIGGER IF NOT EXISTS sessions_fts_insert
+AFTER INSERT ON sessions BEGIN
+    INSERT INTO sessions_fts(rowid, session_id, summary, project_display_name)
+    VALUES (new.rowid, new.session_id, new.summary, new.project_display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_delete
+AFTER DELETE ON sessions BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, session_id, summary, project_display_name)
+    VALUES ('delete', old.rowid, old.session_id, old.summary, old.project_display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_update
+AFTER UPDATE ON sessions BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, session_id, summary, project_display_name)
+    VALUES ('delete', old.rowid, old.session_id, old.summary, old.project_display_name);
+    INSERT INTO sessions_fts(rowid, session_id, summary, project_display_name)
+    VALUES (new.rowid, new.session_id, new.summary, new.project_display_name);
+END;
+"""
+
 
 # ---------------------------------------------------------------------------
 # SearchDatabase Class
@@ -184,6 +222,104 @@ class SearchDatabase:
         self.state_dir = Path(state_dir)
         self.db_path = self.state_dir / "search.db"
         self._connection: aiosqlite.Connection | None = None
+        self._fts_available: bool | None = None
+
+    # ================================================================
+    # FTS5 Support
+    # ================================================================
+
+    @staticmethod
+    def _check_fts5_available() -> bool:
+        """Check if FTS5 extension is available.
+
+        Returns:
+            True if FTS5 is available, False otherwise.
+        """
+        try:
+            conn = sqlite3.connect(":memory:")
+            conn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+            conn.close()
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    @property
+    def fts_available(self) -> bool:
+        """Check if FTS5 is available (cached after first check).
+
+        Returns:
+            True if FTS5 is available, False otherwise.
+        """
+        if self._fts_available is None:
+            self._fts_available = self._check_fts5_available()
+        return self._fts_available
+
+    def _build_fts_query(self, query: str) -> str:
+        """Convert user query to FTS5 query syntax.
+
+        Converts a user-friendly query into FTS5 syntax:
+        - "auth bug" -> "auth OR bug" (multiple terms OR'd)
+        - '"auth bug"' -> '"auth bug"' (exact phrase preserved)
+        - 'fix "auth bug"' -> 'fix OR "auth bug"' (mixed)
+
+        Args:
+            query: The user's search query.
+
+        Returns:
+            FTS5-compatible query string.
+        """
+        tokens: list[str] = []
+        current: list[str] = []
+        in_quote = False
+
+        for char in query:
+            if char == '"':
+                if in_quote:
+                    # End quote - create quoted phrase
+                    phrase = "".join(current)
+                    if phrase:  # Only add non-empty phrases
+                        tokens.append('"' + phrase + '"')
+                    current = []
+                in_quote = not in_quote
+            elif char == " " and not in_quote:
+                if current:
+                    tokens.append("".join(current))
+                    current = []
+            else:
+                current.append(char)
+
+        # Handle remaining characters
+        if current:
+            word = "".join(current)
+            if in_quote:
+                # Unclosed quote - treat as regular word
+                tokens.append(word)
+            else:
+                tokens.append(word)
+
+        # Filter out empty tokens
+        tokens = [t for t in tokens if t.strip()]
+
+        # Join with OR for multi-word queries
+        return " OR ".join(tokens) if tokens else "*"
+
+    async def _setup_fts(self) -> None:
+        """Setup FTS5 virtual table and triggers.
+
+        Creates the FTS5 virtual table and sync triggers.
+        If FTS5 is not available, this method does nothing.
+        """
+        if not self.fts_available:
+            return
+
+        conn = await self._get_connection()
+        try:
+            await conn.executescript(FTS_SCHEMA)
+            await conn.commit()
+            logger.info("FTS5 search enabled")
+        except sqlite3.OperationalError as e:
+            logger.warning(f"Failed to create FTS5 table: {e}")
+            self._fts_available = False
 
     # ================================================================
     # Lifecycle
@@ -194,6 +330,7 @@ class SearchDatabase:
 
         Creates the state directory if it doesn't exist,
         opens the connection, sets pragmas, and creates tables.
+        Also sets up FTS5 if available.
         """
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -208,6 +345,14 @@ class SearchDatabase:
         # Create schema
         await conn.executescript(CORE_SCHEMA)
         await conn.commit()
+
+        # Setup FTS5 if available
+        if self.fts_available:
+            await self._setup_fts()
+            await self._set_metadata("fts_available", "1")
+        else:
+            await self._set_metadata("fts_available", "0")
+            logger.warning("FTS5 not available - using LIKE fallback for search")
 
         logger.info(f"SearchDatabase initialized at {self.db_path}")
 
@@ -447,11 +592,18 @@ class SearchDatabase:
     async def clear_all(self) -> None:
         """Clear all indexed data (for rebuild).
 
-        Deletes all data from sessions and file_mtimes tables.
+        Deletes all data from sessions, file_mtimes, and sessions_fts tables.
         """
         conn = await self._get_connection()
         await conn.execute("DELETE FROM sessions")
         await conn.execute("DELETE FROM file_mtimes")
+        # Clear FTS table if it exists
+        if self.fts_available:
+            try:
+                await conn.execute("DELETE FROM sessions_fts")
+            except sqlite3.OperationalError:
+                # FTS table may not exist
+                pass
         await conn.commit()
         logger.info("SearchDatabase cleared all data")
 

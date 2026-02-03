@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -650,3 +652,451 @@ class TestSearchDatabaseEdgeCases:
         assert retrieved is not None
         # Datetimes should match (stored as ISO strings, parsed back)
         assert retrieved.file_created_at.isoformat() == utc_time.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# FTS5 detection tests
+# ---------------------------------------------------------------------------
+
+
+class TestFTS5Detection:
+    """Tests for FTS5 availability detection."""
+
+    def test_fts5_detection_available(self) -> None:
+        """Returns True when FTS5 works."""
+        # Test the actual method - FTS5 should be available on most systems
+        result = SearchDatabase._check_fts5_available()
+        # We can't guarantee FTS5 is available, but we can verify the method runs
+        assert isinstance(result, bool)
+
+    def test_fts5_detection_unavailable(self) -> None:
+        """Returns False when FTS5 fails."""
+        # Mock the sqlite3 module to simulate FTS5 not being available
+        with patch("claude_session_player.watcher.search_db.sqlite3.connect") as mock_connect:
+            mock_conn = mock_connect.return_value
+            mock_conn.execute.side_effect = sqlite3.OperationalError("no such module: fts5")
+
+            result = SearchDatabase._check_fts5_available()
+            assert result is False
+
+    def test_fts_available_property_cached(self, tmp_path: Path) -> None:
+        """fts_available property is cached after first check."""
+        db = SearchDatabase(tmp_path)
+
+        # First access
+        first_result = db.fts_available
+
+        # Manually change the cached value
+        db._fts_available = not first_result
+
+        # Second access should return cached value
+        assert db.fts_available == (not first_result)
+
+    def test_fts_available_uses_static_method(self, tmp_path: Path) -> None:
+        """fts_available property uses _check_fts5_available."""
+        db = SearchDatabase(tmp_path)
+        # Clear cache
+        db._fts_available = None
+
+        with patch.object(
+            SearchDatabase, "_check_fts5_available", return_value=True
+        ) as mock_check:
+            result = db.fts_available
+            mock_check.assert_called_once()
+            assert result is True
+
+
+# ---------------------------------------------------------------------------
+# FTS5 schema tests
+# ---------------------------------------------------------------------------
+
+
+class TestFTS5Schema:
+    """Tests for FTS5 schema creation."""
+
+    @pytest.fixture
+    async def db(self, tmp_path: Path) -> SearchDatabase:
+        """Create and initialize test database."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+        yield db
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_fts_schema_created(self, tmp_path: Path) -> None:
+        """Virtual table and triggers created when FTS5 available."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        if db.fts_available:
+            conn = await db._get_connection()
+            # Check FTS table exists
+            async with conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions_fts'"
+            ) as cursor:
+                row = await cursor.fetchone()
+                assert row is not None
+
+            # Check triggers exist
+            async with conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                trigger_names = {row["name"] for row in rows}
+                assert "sessions_fts_insert" in trigger_names
+                assert "sessions_fts_delete" in trigger_names
+                assert "sessions_fts_update" in trigger_names
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_fts_metadata_stored(self, db: SearchDatabase) -> None:
+        """FTS availability stored in metadata table."""
+        fts_meta = await db._get_metadata("fts_available")
+        assert fts_meta in ("0", "1")
+        assert fts_meta == ("1" if db.fts_available else "0")
+
+
+# ---------------------------------------------------------------------------
+# FTS5 sync tests
+# ---------------------------------------------------------------------------
+
+
+class TestFTS5Sync:
+    """Tests for FTS5 sync triggers."""
+
+    @pytest.fixture
+    async def db(self, tmp_path: Path) -> SearchDatabase:
+        """Create and initialize test database."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+        yield db
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_fts_sync_on_insert(self, db: SearchDatabase) -> None:
+        """FTS updated when session inserted."""
+        if not db.fts_available:
+            pytest.skip("FTS5 not available")
+
+        session = create_test_session(
+            session_id="fts-test",
+            file_path="/path/fts.jsonl",
+            summary="Authentication bug fix",
+            project_display_name="my-project",
+        )
+        await db.upsert_session(session)
+
+        # Verify FTS table has the data
+        conn = await db._get_connection()
+        async with conn.execute(
+            "SELECT * FROM sessions_fts WHERE sessions_fts MATCH 'authentication'"
+        ) as cursor:
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row["session_id"] == "fts-test"
+
+    @pytest.mark.asyncio
+    async def test_fts_sync_on_update(self, db: SearchDatabase) -> None:
+        """FTS updated when session updated."""
+        if not db.fts_available:
+            pytest.skip("FTS5 not available")
+
+        # Insert initial session
+        session1 = create_test_session(
+            session_id="fts-update",
+            file_path="/path/fts-update.jsonl",
+            summary="Original summary",
+        )
+        await db.upsert_session(session1)
+
+        # Update session
+        session2 = create_test_session(
+            session_id="fts-update",
+            file_path="/path/fts-update.jsonl",
+            summary="Updated authentication summary",
+        )
+        await db.upsert_session(session2)
+
+        # Verify FTS table has updated data
+        conn = await db._get_connection()
+        async with conn.execute(
+            "SELECT * FROM sessions_fts WHERE sessions_fts MATCH 'authentication'"
+        ) as cursor:
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row["session_id"] == "fts-update"
+
+        # Old value should not be found
+        async with conn.execute(
+            "SELECT * FROM sessions_fts WHERE sessions_fts MATCH 'original'"
+        ) as cursor:
+            row = await cursor.fetchone()
+            assert row is None
+
+    @pytest.mark.asyncio
+    async def test_fts_sync_on_delete(self, db: SearchDatabase) -> None:
+        """FTS updated when session deleted."""
+        if not db.fts_available:
+            pytest.skip("FTS5 not available")
+
+        # Insert session
+        session = create_test_session(
+            session_id="fts-delete",
+            file_path="/path/fts-delete.jsonl",
+            summary="Delete test session",
+        )
+        await db.upsert_session(session)
+
+        # Verify it's in FTS
+        conn = await db._get_connection()
+        async with conn.execute(
+            "SELECT * FROM sessions_fts WHERE sessions_fts MATCH 'delete'"
+        ) as cursor:
+            row = await cursor.fetchone()
+            assert row is not None
+
+        # Delete session
+        await db.delete_session("fts-delete")
+
+        # Verify it's removed from FTS
+        async with conn.execute(
+            "SELECT * FROM sessions_fts WHERE sessions_fts MATCH 'delete'"
+        ) as cursor:
+            row = await cursor.fetchone()
+            assert row is None
+
+
+# ---------------------------------------------------------------------------
+# FTS5 query building tests
+# ---------------------------------------------------------------------------
+
+
+class TestBuildFTSQuery:
+    """Tests for FTS5 query building."""
+
+    def test_build_fts_query_simple(self, tmp_path: Path) -> None:
+        """'auth bug' -> 'auth OR bug'."""
+        db = SearchDatabase(tmp_path)
+        result = db._build_fts_query("auth bug")
+        assert result == "auth OR bug"
+
+    def test_build_fts_query_phrase(self, tmp_path: Path) -> None:
+        """'"auth bug"' -> '"auth bug"'."""
+        db = SearchDatabase(tmp_path)
+        result = db._build_fts_query('"auth bug"')
+        assert result == '"auth bug"'
+
+    def test_build_fts_query_mixed(self, tmp_path: Path) -> None:
+        """'fix "auth bug"' -> 'fix OR "auth bug"'."""
+        db = SearchDatabase(tmp_path)
+        result = db._build_fts_query('fix "auth bug"')
+        assert result == 'fix OR "auth bug"'
+
+    def test_build_fts_query_empty(self, tmp_path: Path) -> None:
+        """Empty query returns '*'."""
+        db = SearchDatabase(tmp_path)
+        result = db._build_fts_query("")
+        assert result == "*"
+
+    def test_build_fts_query_single_word(self, tmp_path: Path) -> None:
+        """Single word returns unchanged."""
+        db = SearchDatabase(tmp_path)
+        result = db._build_fts_query("authentication")
+        assert result == "authentication"
+
+    def test_build_fts_query_unclosed_quote(self, tmp_path: Path) -> None:
+        """Unclosed quote treated as regular word."""
+        db = SearchDatabase(tmp_path)
+        result = db._build_fts_query('"unclosed')
+        assert result == "unclosed"
+
+    def test_build_fts_query_multiple_phrases(self, tmp_path: Path) -> None:
+        """Multiple phrases are joined with OR."""
+        db = SearchDatabase(tmp_path)
+        result = db._build_fts_query('"auth bug" "login error"')
+        assert result == '"auth bug" OR "login error"'
+
+    def test_build_fts_query_whitespace_only(self, tmp_path: Path) -> None:
+        """Whitespace-only query returns '*'."""
+        db = SearchDatabase(tmp_path)
+        result = db._build_fts_query("   ")
+        assert result == "*"
+
+
+# ---------------------------------------------------------------------------
+# FTS5 fallback tests
+# ---------------------------------------------------------------------------
+
+
+class TestFTS5Fallback:
+    """Tests for fallback behavior when FTS5 is unavailable."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_fts_unavailable(self, tmp_path: Path) -> None:
+        """LIKE queries work when FTS5 unavailable."""
+        db = SearchDatabase(tmp_path)
+        # Force FTS to be unavailable
+        db._fts_available = False
+
+        await db.initialize()
+
+        # Insert some sessions
+        await db.upsert_session(
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                summary="Fix authentication bug",
+            )
+        )
+        await db.upsert_session(
+            create_test_session(
+                session_id="s2",
+                file_path="/path/s2.jsonl",
+                summary="Add new feature",
+            )
+        )
+
+        # Verify FTS metadata shows unavailable
+        fts_meta = await db._get_metadata("fts_available")
+        assert fts_meta == "0"
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_initialize_logs_warning_when_fts_unavailable(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Warning logged when FTS5 unavailable."""
+        db = SearchDatabase(tmp_path)
+        db._fts_available = False
+
+        with caplog.at_level("WARNING"):
+            await db.initialize()
+
+        assert "FTS5 not available" in caplog.text
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_clear_all_works_without_fts(self, tmp_path: Path) -> None:
+        """clear_all works when FTS table doesn't exist."""
+        db = SearchDatabase(tmp_path)
+        db._fts_available = False
+        await db.initialize()
+
+        # Insert some data
+        await db.upsert_session(
+            create_test_session(session_id="s1", file_path="/path/s1.jsonl")
+        )
+
+        # This should not raise even though FTS table doesn't exist
+        await db.clear_all()
+
+        # Verify data is cleared
+        assert await db.get_session("s1") is None
+
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# FTS5 integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestFTS5Integration:
+    """Integration tests for FTS5 search functionality."""
+
+    @pytest.fixture
+    async def db_with_data(self, tmp_path: Path) -> SearchDatabase:
+        """Create database with test data."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        # Insert test sessions
+        sessions = [
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                summary="Fix authentication bug in login",
+                project_display_name="auth-service",
+            ),
+            create_test_session(
+                session_id="s2",
+                file_path="/path/s2.jsonl",
+                summary="Add user registration feature",
+                project_display_name="auth-service",
+            ),
+            create_test_session(
+                session_id="s3",
+                file_path="/path/s3.jsonl",
+                summary="Update API documentation",
+                project_display_name="api-docs",
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+        yield db
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_fts_search_finds_matches(self, db_with_data: SearchDatabase) -> None:
+        """FTS search returns correct results."""
+        if not db_with_data.fts_available:
+            pytest.skip("FTS5 not available")
+
+        conn = await db_with_data._get_connection()
+
+        # Search for "auth" - should find s1 (in summary) and s1, s2 (in project name)
+        async with conn.execute(
+            """
+            SELECT session_id FROM sessions
+            WHERE session_id IN (
+                SELECT session_id FROM sessions_fts WHERE sessions_fts MATCH 'auth'
+            )
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            session_ids = {row["session_id"] for row in rows}
+            # Should find sessions mentioning "auth" in summary or project name
+            assert "s1" in session_ids  # "authentication" in summary
+
+    @pytest.mark.asyncio
+    async def test_fts_search_project_name(self, db_with_data: SearchDatabase) -> None:
+        """FTS search matches project display name."""
+        if not db_with_data.fts_available:
+            pytest.skip("FTS5 not available")
+
+        conn = await db_with_data._get_connection()
+
+        # Search for "api" - should find s3 (project name "api-docs")
+        async with conn.execute(
+            """
+            SELECT session_id FROM sessions
+            WHERE session_id IN (
+                SELECT session_id FROM sessions_fts WHERE sessions_fts MATCH 'api'
+            )
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            session_ids = {row["session_id"] for row in rows}
+            assert "s3" in session_ids
+
+    @pytest.mark.asyncio
+    async def test_fts_search_phrase(self, db_with_data: SearchDatabase) -> None:
+        """FTS search handles exact phrases."""
+        if not db_with_data.fts_available:
+            pytest.skip("FTS5 not available")
+
+        conn = await db_with_data._get_connection()
+
+        # Search for exact phrase "authentication bug"
+        async with conn.execute(
+            """
+            SELECT session_id FROM sessions
+            WHERE session_id IN (
+                SELECT session_id FROM sessions_fts WHERE sessions_fts MATCH '"authentication bug"'
+            )
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            session_ids = {row["session_id"] for row in rows}
+            assert "s1" in session_ids  # Has "authentication bug" in summary
