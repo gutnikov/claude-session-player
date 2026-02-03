@@ -1163,3 +1163,547 @@ class TestRenderCompactBoundary:
         assert state.elements == []
         assert state.tool_calls == {}
         assert state.current_request_id is None
+
+
+# ---------------------------------------------------------------------------
+# Issue 08: Progress Message Rendering Tests
+# ---------------------------------------------------------------------------
+
+
+class TestRenderBashProgress:
+    """Tests for bash_progress rendering."""
+
+    def test_bash_progress_updates_tool_call(self, empty_state: ScreenState) -> None:
+        """bash_progress with valid parentToolUseID → updates ToolCall.progress_text."""
+        # First create a tool call
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "npm run build"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        # Now send bash_progress
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "bash_progress",
+                "fullOutput": "Building...\nStep 1/12: FROM python:3.11-slim",
+            },
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress)
+
+        assert len(empty_state.elements) == 1
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.progress_text == "Step 1/12: FROM python:3.11-slim"
+
+    def test_bash_progress_unknown_parent_ignored(self, empty_state: ScreenState) -> None:
+        """bash_progress with unknown parentToolUseID → ignored, state unchanged."""
+        # Create a tool call with different ID
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_other", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        # bash_progress with non-matching ID
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "bash_progress",
+                "fullOutput": "some output",
+            },
+            "parentToolUseID": "toolu_unknown",
+        }
+        render(empty_state, progress)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.progress_text is None
+
+    def test_bash_progress_empty_fulloutput(self, empty_state: ScreenState) -> None:
+        """bash_progress with empty fullOutput → 'running…'."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "long task"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "bash_progress",
+                "fullOutput": "",
+            },
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.progress_text == "running…"
+
+    def test_bash_progress_long_line_truncated(self, empty_state: ScreenState) -> None:
+        """bash_progress with line > 76 chars → truncated at 75 + …."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "build"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        long_line = "A" * 100
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "bash_progress",
+                "fullOutput": long_line,
+            },
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert len(element.progress_text) == 76  # 75 chars + …
+        assert element.progress_text.endswith("…")
+
+    def test_bash_progress_multiline_takes_last(self, empty_state: ScreenState) -> None:
+        """bash_progress with multi-line fullOutput → last non-empty line."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "build"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "bash_progress",
+                "fullOutput": "Line 1\nLine 2\nLine 3\n\n",  # trailing empty lines
+            },
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.progress_text == "Line 3"
+
+
+class TestRenderHookProgress:
+    """Tests for hook_progress rendering."""
+
+    def test_hook_progress_updates_tool_call(self, empty_state: ScreenState) -> None:
+        """hook_progress → updates ToolCall with Hook: {hookName}."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_002", "name": "Read", "input": {"file_path": "/a.py"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "hook_progress",
+                "hookEvent": "PostToolUse",
+                "hookName": "PostToolUse:Read",
+            },
+            "parentToolUseID": "toolu_002",
+        }
+        render(empty_state, progress)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.progress_text == "Hook: PostToolUse:Read"
+
+
+class TestRenderAgentProgress:
+    """Tests for agent_progress rendering."""
+
+    def test_agent_progress_fixed_text(self, empty_state: ScreenState) -> None:
+        """agent_progress → fixed 'Agent: working…' text."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_003", "name": "Task", "input": {"description": "Explore codebase"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress = {
+            "type": "progress",
+            "data": {"type": "agent_progress"},
+            "parentToolUseID": "toolu_003",
+        }
+        render(empty_state, progress)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.progress_text == "Agent: working…"
+
+
+class TestRenderQueryUpdate:
+    """Tests for query_update (WebSearch) rendering."""
+
+    def test_query_update_updates_tool_call(self, empty_state: ScreenState) -> None:
+        """query_update → Searching: {query}."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_004", "name": "WebSearch", "input": {"query": "Claude hooks"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "query_update",
+                "query": "Claude Code hooks 2026",
+            },
+            "parentToolUseID": "toolu_004",
+        }
+        render(empty_state, progress)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.progress_text == "Searching: Claude Code hooks 2026"
+
+
+class TestRenderSearchResults:
+    """Tests for search_results_received rendering."""
+
+    def test_search_results_updates_tool_call(self, empty_state: ScreenState) -> None:
+        """search_results_received → {resultCount} results."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_004", "name": "WebSearch", "input": {"query": "Claude hooks"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "search_results_received",
+                "resultCount": 10,
+                "query": "Claude Code hooks 2026",
+            },
+            "parentToolUseID": "toolu_004",
+        }
+        render(empty_state, progress)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.progress_text == "10 results"
+
+
+class TestRenderWaitingForTask:
+    """Tests for waiting_for_task rendering."""
+
+    def test_waiting_for_task_with_matching_parent(self, empty_state: ScreenState) -> None:
+        """waiting_for_task with matching parentToolUseID → updates tool call."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_005", "name": "Task", "input": {"description": "Debug"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "waiting_for_task",
+                "taskDescription": "Debug socat bridge from inside Docker container",
+            },
+            "parentToolUseID": "toolu_005",
+        }
+        render(empty_state, progress)
+
+        assert len(empty_state.elements) == 1
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.progress_text == "Waiting: Debug socat bridge from inside Docker container"
+
+    def test_waiting_for_task_no_parent_creates_system_output(self, empty_state: ScreenState) -> None:
+        """waiting_for_task without parentToolUseID → standalone SystemOutput."""
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "waiting_for_task",
+                "taskDescription": "Explore codebase structure",
+            },
+        }
+        render(empty_state, progress)
+
+        assert len(empty_state.elements) == 1
+        element = empty_state.elements[0]
+        assert isinstance(element, SystemOutput)
+        assert element.text == "└ Waiting: Explore codebase structure"
+
+    def test_waiting_for_task_unknown_parent_creates_system_output(self, empty_state: ScreenState) -> None:
+        """waiting_for_task with unknown parentToolUseID → standalone SystemOutput."""
+        progress = {
+            "type": "progress",
+            "data": {
+                "type": "waiting_for_task",
+                "taskDescription": "Some task",
+            },
+            "parentToolUseID": "toolu_nonexistent",
+        }
+        render(empty_state, progress)
+
+        assert len(empty_state.elements) == 1
+        element = empty_state.elements[0]
+        assert isinstance(element, SystemOutput)
+        assert element.text == "└ Waiting: Some task"
+
+
+class TestProgressOverwrites:
+    """Tests for progress message overwriting behavior."""
+
+    def test_multiple_progress_last_one_wins(self, empty_state: ScreenState) -> None:
+        """Multiple progress messages for same tool call → last one wins."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "build"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        # First progress
+        progress1 = {
+            "type": "progress",
+            "data": {"type": "bash_progress", "fullOutput": "Step 1"},
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress1)
+        assert empty_state.elements[0].progress_text == "Step 1"
+
+        # Second progress overwrites
+        progress2 = {
+            "type": "progress",
+            "data": {"type": "bash_progress", "fullOutput": "Step 2"},
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress2)
+        assert empty_state.elements[0].progress_text == "Step 2"
+
+
+class TestProgressVsResultPriority:
+    """Tests for result taking priority over progress in format_element."""
+
+    def test_progress_only_shows_in_markdown(self, empty_state: ScreenState) -> None:
+        """Tool call with progress_text → shows progress in markdown."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "Build"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress = {
+            "type": "progress",
+            "data": {"type": "bash_progress", "fullOutput": "Building..."},
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress)
+
+        md = empty_state.to_markdown()
+        assert md == "● Bash(Build)\n  └ Building..."
+
+    def test_result_takes_priority_over_progress(self, empty_state: ScreenState) -> None:
+        """Tool call with both progress and result → shows result (not progress)."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "Build"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        # First: progress
+        progress = {
+            "type": "progress",
+            "data": {"type": "bash_progress", "fullOutput": "Building..."},
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress)
+
+        # Then: result
+        result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_001", "content": "Build succeeded", "is_error": False}],
+            },
+        }
+        render(empty_state, result)
+
+        # Progress is still there, but result takes priority in output
+        element = empty_state.elements[0]
+        assert element.progress_text == "Building..."
+        assert element.result == "Build succeeded"
+
+        md = empty_state.to_markdown()
+        assert md == "● Bash(Build)\n  └ Build succeeded"
+        assert "Building..." not in md
+
+    def test_no_progress_no_result_just_tool_line(self, empty_state: ScreenState) -> None:
+        """Tool call with neither progress nor result → just the ● Tool(label) line."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "Check"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        md = empty_state.to_markdown()
+        assert md == "● Bash(Check)"
+        assert "└" not in md
+
+
+class TestProgressFullFlow:
+    """Full flow integration tests with progress messages."""
+
+    def test_tool_use_progress_progress_result_shows_result(self, empty_state: ScreenState) -> None:
+        """Tool_use → bash_progress → bash_progress → tool_result → markdown shows result."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "Build app"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress1 = {
+            "type": "progress",
+            "data": {"type": "bash_progress", "fullOutput": "Step 1"},
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress1)
+
+        progress2 = {
+            "type": "progress",
+            "data": {"type": "bash_progress", "fullOutput": "Step 2"},
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress2)
+
+        result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_001", "content": "Build complete", "is_error": False}],
+            },
+        }
+        render(empty_state, result)
+
+        md = empty_state.to_markdown()
+        assert md == "● Bash(Build app)\n  └ Build complete"
+        assert "Step" not in md
+
+    def test_tool_use_progress_shows_progress(self, empty_state: ScreenState) -> None:
+        """Tool_use → bash_progress → markdown shows progress (no result yet)."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "Build app"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        progress = {
+            "type": "progress",
+            "data": {"type": "bash_progress", "fullOutput": "Compiling..."},
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, progress)
+
+        md = empty_state.to_markdown()
+        assert md == "● Bash(Build app)\n  └ Compiling..."
+
+    def test_tool_use_hook_progress_result_shows_result(self, empty_state: ScreenState) -> None:
+        """Tool_use → hook_progress → tool_result → markdown shows result."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Read", "input": {"file_path": "/a.py"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        hook_progress = {
+            "type": "progress",
+            "data": {"type": "hook_progress", "hookName": "PostToolUse:Read"},
+            "parentToolUseID": "toolu_001",
+        }
+        render(empty_state, hook_progress)
+
+        result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_001", "content": "file contents", "is_error": False}],
+            },
+        }
+        render(empty_state, result)
+
+        md = empty_state.to_markdown()
+        assert md == "● Read(a.py)\n  └ file contents"
+        assert "Hook:" not in md

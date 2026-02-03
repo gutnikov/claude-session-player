@@ -260,78 +260,100 @@ def system_local_command_line() -> dict:
 
 @pytest.fixture
 def bash_progress_line() -> dict:
+    """Bash progress with fullOutput field (per issue spec)."""
     return {
         "type": "progress",
         "data": {
             "type": "bash_progress",
-            "parentToolUseID": "toolu_001",
-            "toolUseID": "bash-progress-0",
-            "content": "running...",
+            "output": "",
+            "fullOutput": "Building...\nStep 1/12: FROM python:3.11-slim",
+            "elapsedTimeSeconds": 2,
+            "totalLines": 0,
         },
+        "toolUseID": "bash-progress-0",
+        "parentToolUseID": "toolu_001",
     }
 
 
 @pytest.fixture
 def hook_progress_line() -> dict:
+    """Hook progress with hookName and hookEvent fields."""
     return {
         "type": "progress",
         "data": {
             "type": "hook_progress",
-            "parentToolUseID": "toolu_002",
-            "toolUseID": "hook-progress-0",
-            "hookName": "pre-commit",
+            "hookEvent": "PostToolUse",
+            "hookName": "PostToolUse:Read",
+            "command": "callback",
         },
+        "parentToolUseID": "toolu_002",
+        "toolUseID": "toolu_002",
     }
 
 
 @pytest.fixture
 def agent_progress_line() -> dict:
+    """Agent progress (fixed text output)."""
     return {
         "type": "progress",
         "data": {
             "type": "agent_progress",
-            "parentToolUseID": "toolu_003",
-            "toolUseID": "agent-progress-0",
-            "content": "working...",
         },
+        "toolUseID": "agent-progress-0",
+        "parentToolUseID": "toolu_003",
     }
 
 
 @pytest.fixture
 def query_update_line() -> dict:
+    """WebSearch query update progress."""
     return {
         "type": "progress",
         "data": {
             "type": "query_update",
-            "parentToolUseID": "toolu_004",
-            "toolUseID": "query-update-0",
-            "query": "Claude hooks 2026",
+            "query": "Claude Code hooks feature 2026",
         },
+        "parentToolUseID": "toolu_004",
     }
 
 
 @pytest.fixture
 def search_results_line() -> dict:
+    """WebSearch results received progress."""
     return {
         "type": "progress",
         "data": {
             "type": "search_results_received",
-            "parentToolUseID": "toolu_004",
-            "toolUseID": "search-results-0",
-            "resultCount": 5,
+            "resultCount": 10,
+            "query": "Claude Code hooks feature 2026",
         },
+        "parentToolUseID": "toolu_004",
     }
 
 
 @pytest.fixture
 def waiting_for_task_line() -> dict:
+    """Waiting for task progress with taskDescription."""
     return {
         "type": "progress",
         "data": {
             "type": "waiting_for_task",
-            "parentToolUseID": "toolu_005",
-            "toolUseID": "waiting-0",
-            "taskDescription": "Explore codebase",
+            "taskDescription": "Debug socat bridge from inside Docker container",
+            "taskType": "local_bash",
+        },
+        "parentToolUseID": "toolu_005",
+    }
+
+
+@pytest.fixture
+def waiting_for_task_no_parent_line() -> dict:
+    """Waiting for task without parentToolUseID (standalone)."""
+    return {
+        "type": "progress",
+        "data": {
+            "type": "waiting_for_task",
+            "taskDescription": "Explore codebase structure",
+            "taskType": "local_bash",
         },
     }
 

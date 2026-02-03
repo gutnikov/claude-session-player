@@ -273,9 +273,12 @@ def get_progress_data(line: dict) -> dict:
 
 
 def get_parent_tool_use_id(line: dict) -> str | None:
-    """Extract parentToolUseID from a progress message."""
-    data = line.get("data") or {}
-    return data.get("parentToolUseID")
+    """Extract parentToolUseID from a progress message.
+
+    parentToolUseID is at the top level of the progress message,
+    not inside the data dict.
+    """
+    return line.get("parentToolUseID")
 
 
 def get_local_command_text(line: dict) -> str:

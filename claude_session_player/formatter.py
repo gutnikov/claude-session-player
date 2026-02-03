@@ -80,8 +80,7 @@ def format_element(element: object) -> str:
         return element.text
     if isinstance(element, ToolCall):
         line = f"\u25cf {element.tool_name}({element.label})"
-        if element.progress_text is not None:
-            line += f"\n  \u2514 {element.progress_text}"
+        # Result takes priority over progress (result is the final state)
         if element.result is not None:
             prefix = "  \u2717 " if element.is_error else "  \u2514 "
             result_lines = element.result.split("\n")
@@ -89,6 +88,8 @@ def format_element(element: object) -> str:
             # Subsequent lines indented with 4 spaces to align with text after └/✗
             for result_line in result_lines[1:]:
                 line += f"\n    {result_line}"
+        elif element.progress_text is not None:
+            line += f"\n  \u2514 {element.progress_text}"
         return line
     if isinstance(element, ThinkingIndicator):
         return "\u2731 Thinking\u2026"
