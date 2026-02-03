@@ -1,0 +1,290 @@
+"""Destination manager for attach/detach lifecycle."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Literal
+
+from claude_session_player.watcher.config import (
+    ConfigManager,
+    SlackDestination,
+    TelegramDestination,
+)
+
+
+@dataclass
+class AttachedDestination:
+    """A single attached destination."""
+
+    type: Literal["telegram", "slack"]
+    identifier: str  # chat_id for telegram, channel for slack
+    attached_at: datetime
+
+
+@dataclass
+class DestinationManager:
+    """Manages the lifecycle of messaging destinations attached to sessions.
+
+    Tracks which destinations are attached to which sessions, manages the
+    keep-alive timer for file watching, and coordinates with ConfigManager
+    for persistence.
+    """
+
+    _config: ConfigManager
+    _on_session_start: Callable[[str, Path], Awaitable[None]]
+    _on_session_stop: Callable[[str], Awaitable[None]]
+    _keep_alive_seconds: int = 300  # 5 minutes
+
+    # Runtime state (in-memory)
+    _destinations: dict[str, list[AttachedDestination]] = field(
+        default_factory=dict, init=False
+    )
+    _keep_alive_tasks: dict[str, asyncio.Task[None]] = field(
+        default_factory=dict, init=False
+    )
+
+    def _find_destination(
+        self, session_id: str, destination_type: str, identifier: str
+    ) -> AttachedDestination | None:
+        """Find a destination by session, type, and identifier.
+
+        Args:
+            session_id: Session identifier.
+            destination_type: "telegram" or "slack".
+            identifier: chat_id or channel.
+
+        Returns:
+            AttachedDestination if found, None otherwise.
+        """
+        destinations = self._destinations.get(session_id, [])
+        for dest in destinations:
+            if dest.type == destination_type and dest.identifier == identifier:
+                return dest
+        return None
+
+    async def attach(
+        self,
+        session_id: str,
+        path: Path | None,
+        destination_type: str,
+        identifier: str,
+    ) -> bool:
+        """Attach a destination to a session.
+
+        Args:
+            session_id: Session identifier.
+            path: Path to JSONL file (required if session not yet known).
+            destination_type: "telegram" or "slack".
+            identifier: chat_id or channel.
+
+        Returns:
+            True if newly attached, False if already attached (idempotent).
+
+        Raises:
+            ValueError: If session unknown and path not provided.
+            ValueError: If destination_type invalid.
+        """
+        # Validate destination_type
+        if destination_type not in ("telegram", "slack"):
+            raise ValueError(f"Invalid destination_type: {destination_type}")
+
+        # 1. Check if already attached (idempotent)
+        existing = self._find_destination(session_id, destination_type, identifier)
+        if existing:
+            return False  # Already attached
+
+        # 2. Cancel keep-alive timer if running (session is still being watched)
+        has_keep_alive_running = session_id in self._keep_alive_tasks
+        if has_keep_alive_running:
+            self._keep_alive_tasks[session_id].cancel()
+            try:
+                await self._keep_alive_tasks[session_id]
+            except asyncio.CancelledError:
+                pass
+            del self._keep_alive_tasks[session_id]
+
+        # 3. If first destination for this session, start file watching
+        # Note: if keep-alive was running, session is already being watched
+        is_first = (
+            session_id not in self._destinations
+            or not self._destinations[session_id]
+        ) and not has_keep_alive_running
+        if is_first:
+            if path is None:
+                # Try to get from config
+                session_config = self._config.get(session_id)
+                if not session_config:
+                    raise ValueError(
+                        f"Session {session_id} unknown and no path provided"
+                    )
+                path = session_config.path
+            await self._on_session_start(session_id, path)
+
+        # 4. Add destination to runtime state
+        dest = AttachedDestination(
+            type=destination_type,  # type: ignore[arg-type]
+            identifier=identifier,
+            attached_at=datetime.now(),
+        )
+        self._destinations.setdefault(session_id, []).append(dest)
+
+        # 5. Persist to config
+        if destination_type == "telegram":
+            config_dest = TelegramDestination(chat_id=identifier)
+        else:
+            config_dest = SlackDestination(channel=identifier)
+        self._config.add_destination(session_id, config_dest, path)
+
+        return True
+
+    async def detach(
+        self,
+        session_id: str,
+        destination_type: str,
+        identifier: str,
+    ) -> bool:
+        """Detach a destination from a session.
+
+        Args:
+            session_id: Session identifier.
+            destination_type: "telegram" or "slack".
+            identifier: chat_id or channel.
+
+        Returns:
+            True if detached, False if not found.
+        """
+        # 1. Find and remove destination
+        destinations = self._destinations.get(session_id, [])
+        dest = self._find_destination(session_id, destination_type, identifier)
+        if not dest:
+            return False
+
+        destinations.remove(dest)
+
+        # 2. Remove from config
+        if destination_type == "telegram":
+            config_dest = TelegramDestination(chat_id=identifier)
+        else:
+            config_dest = SlackDestination(channel=identifier)
+        self._config.remove_destination(session_id, config_dest)
+
+        # 3. If no more destinations, start keep-alive timer
+        if not destinations:
+            self._start_keep_alive(session_id)
+
+        return True
+
+    def get_destinations(
+        self,
+        session_id: str,
+    ) -> list[AttachedDestination]:
+        """Get all attached destinations for a session.
+
+        Args:
+            session_id: Session identifier.
+
+        Returns:
+            List of AttachedDestination objects.
+        """
+        return list(self._destinations.get(session_id, []))
+
+    def get_destinations_by_type(
+        self,
+        session_id: str,
+        destination_type: str,
+    ) -> list[AttachedDestination]:
+        """Get destinations of a specific type.
+
+        Args:
+            session_id: Session identifier.
+            destination_type: "telegram" or "slack".
+
+        Returns:
+            List of AttachedDestination objects of the given type.
+        """
+        return [
+            d
+            for d in self._destinations.get(session_id, [])
+            if d.type == destination_type
+        ]
+
+    async def restore_from_config(self) -> None:
+        """Restore destinations from persisted config on startup.
+
+        Called by WatcherService during initialization.
+        """
+        sessions = self._config.load()
+        for session in sessions:
+            has_telegram = bool(session.destinations.telegram)
+            has_slack = bool(session.destinations.slack)
+            if has_telegram or has_slack:
+                # Start file watching
+                await self._on_session_start(session.session_id, session.path)
+
+                # Populate runtime state
+                self._destinations[session.session_id] = []
+                for tg in session.destinations.telegram:
+                    self._destinations[session.session_id].append(
+                        AttachedDestination(
+                            type="telegram",
+                            identifier=tg.chat_id,
+                            attached_at=datetime.now(),
+                        )
+                    )
+                for slack in session.destinations.slack:
+                    self._destinations[session.session_id].append(
+                        AttachedDestination(
+                            type="slack",
+                            identifier=slack.channel,
+                            attached_at=datetime.now(),
+                        )
+                    )
+
+    def has_destinations(self, session_id: str) -> bool:
+        """Check if session has any attached destinations.
+
+        Args:
+            session_id: Session identifier.
+
+        Returns:
+            True if session has at least one attached destination.
+        """
+        destinations = self._destinations.get(session_id, [])
+        return len(destinations) > 0
+
+    def _start_keep_alive(self, session_id: str) -> None:
+        """Start keep-alive timer. After expiry, stop file watching.
+
+        Args:
+            session_id: Session identifier.
+        """
+
+        async def _keep_alive_expired() -> None:
+            await asyncio.sleep(self._keep_alive_seconds)
+            # Check again in case new destination attached
+            if not self.has_destinations(session_id):
+                await self._on_session_stop(session_id)
+                if session_id in self._destinations:
+                    del self._destinations[session_id]
+            # Clean up task reference
+            if session_id in self._keep_alive_tasks:
+                del self._keep_alive_tasks[session_id]
+
+        self._keep_alive_tasks[session_id] = asyncio.create_task(
+            _keep_alive_expired()
+        )
+
+    async def shutdown(self) -> None:
+        """Cancel all keep-alive tasks on shutdown."""
+        for task in self._keep_alive_tasks.values():
+            task.cancel()
+        # Wait for all tasks to complete
+        if self._keep_alive_tasks:
+            await asyncio.gather(
+                *self._keep_alive_tasks.values(), return_exceptions=True
+            )
+        self._keep_alive_tasks.clear()
