@@ -535,7 +535,7 @@ Claude Session Player implements the Claude Code Session Protocol (v2.0.76 – v
 
 ## Session Watcher Service
 
-The Session Watcher Service is an optional component that watches Claude Code session files for changes and streams processed events to subscribers via Server-Sent Events (SSE). It enables real-time session monitoring for building integrations like Slack bots or custom UIs.
+The Session Watcher Service is an optional component that watches Claude Code session files for changes and streams processed events to subscribers via Server-Sent Events (SSE). It also supports sending notifications to Telegram and Slack channels.
 
 ### Installation
 
@@ -545,6 +545,16 @@ pip install "claude-session-player[watcher]"
 
 # Or install dependencies directly
 pip install pyyaml watchfiles aiohttp
+```
+
+For messaging support (Telegram and Slack):
+
+```bash
+# Install with messaging dependencies
+pip install "claude-session-player[messaging]"
+
+# Or install dependencies directly
+pip install aiogram slack-sdk
 ```
 
 ### Running the Service
@@ -569,42 +579,148 @@ Command-line options:
 - `--state-dir`: Directory for state files (default: `state`)
 - `--log-level`: Logging level (default: `INFO`)
 
+### Configuration
+
+The service uses a YAML configuration file:
+
+```yaml
+# config.yaml
+
+# Bot credentials (optional)
+bots:
+  telegram:
+    token: "123456:ABC-DEF..."  # From @BotFather
+  slack:
+    token: "xoxb-..."           # Bot User OAuth Token
+
+# Sessions and their destinations (persisted across restarts)
+sessions:
+  my-session:
+    path: "/path/to/session.jsonl"
+    destinations:
+      telegram:
+        - chat_id: "123456789"
+      slack:
+        - channel: "C0123456789"
+```
+
+### Messaging Integration
+
+The watcher service can send session events to Telegram and Slack channels in addition to SSE.
+
+#### Telegram Setup
+
+1. Create a bot via [@BotFather](https://t.me/botfather):
+   - Send `/newbot` and follow the prompts
+   - Copy the bot token
+
+2. Add the token to your config:
+   ```yaml
+   # config.yaml
+   bots:
+     telegram:
+       token: "123456:ABC-DEF..."
+   ```
+
+3. Add the bot to your target chat/group
+
+4. Get your chat ID:
+   - For private chats: message the bot, then check `https://api.telegram.org/bot<TOKEN>/getUpdates`
+   - For groups: temporarily add [@userinfobot](https://t.me/userinfobot)
+
+#### Slack Setup
+
+1. Create a Slack App at [api.slack.com/apps](https://api.slack.com/apps)
+   - Click "Create New App" → "From scratch"
+   - Name your app and select your workspace
+
+2. Configure permissions:
+   - Go to "OAuth & Permissions"
+   - Add Bot Token Scopes: `chat:write`, `chat:write.public`
+   - Click "Install to Workspace"
+
+3. Copy the Bot User OAuth Token (`xoxb-...`) to your config:
+   ```yaml
+   bots:
+     slack:
+       token: "xoxb-..."
+   ```
+
+4. For private channels, invite the bot: `/invite @your-bot-name`
+
 ### API Endpoints
 
-#### POST /watch
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/attach` | POST | Attach a messaging destination to a session |
+| `/detach` | POST | Detach a messaging destination |
+| `/sessions` | GET | List all sessions and their destinations |
+| `/sessions/{id}/events` | GET | SSE stream of session events |
+| `/health` | GET | Health check with bot status |
 
-Add a session file to the watch list.
+#### POST /attach
+
+Attach a messaging destination to a session.
 
 ```bash
-curl -X POST http://localhost:8080/watch \
+# Attach a Telegram chat
+curl -X POST http://localhost:8080/attach \
     -H "Content-Type: application/json" \
     -d '{
-        "session_id": "my-session-01",
-        "path": "/home/user/.claude/projects/abc123/sessions/014d9d94.jsonl"
+        "session_id": "my-session",
+        "path": "/path/to/session.jsonl",
+        "destination": {"type": "telegram", "chat_id": "123456789"}
+    }'
+
+# Attach a Slack channel
+curl -X POST http://localhost:8080/attach \
+    -H "Content-Type: application/json" \
+    -d '{
+        "session_id": "my-session",
+        "destination": {"type": "slack", "channel": "C0123456789"}
     }'
 ```
+
+Request body:
+- `session_id` (required): Unique identifier for the session
+- `path` (required on first attach): Absolute path to the JSONL file
+- `destination` (required): Destination object with `type` and identifier
+- `replay_count` (optional): Number of past events to replay on attach (default: 0)
 
 Response (201 Created):
 ```json
 {
-    "session_id": "my-session-01",
-    "status": "watching"
+    "attached": true,
+    "session_id": "my-session",
+    "destination": {"type": "telegram", "chat_id": "123456789"},
+    "replayed_events": 0
 }
 ```
 
-#### DELETE /unwatch/{session_id}
+Error responses:
+- 400: Invalid request (missing fields, invalid destination type)
+- 401: Bot token not configured
+- 403: Bot credential validation failed
+- 404: Session path not found
 
-Remove a session from the watch list.
+#### POST /detach
+
+Detach a messaging destination from a session.
 
 ```bash
-curl -X DELETE http://localhost:8080/unwatch/my-session-01
+curl -X POST http://localhost:8080/detach \
+    -H "Content-Type: application/json" \
+    -d '{
+        "session_id": "my-session",
+        "destination": {"type": "telegram", "chat_id": "123456789"}
+    }'
 ```
 
 Response: 204 No Content
 
 #### GET /sessions
 
-List all watched sessions.
+List all sessions and their destinations.
 
 ```bash
 curl http://localhost:8080/sessions
@@ -615,11 +731,13 @@ Response:
 {
     "sessions": [
         {
-            "session_id": "my-session-01",
-            "path": "/home/user/.claude/projects/abc123/sessions/014d9d94.jsonl",
-            "status": "watching",
-            "file_position": 12345,
-            "last_event_id": "evt_042"
+            "session_id": "my-session",
+            "path": "/path/to/session.jsonl",
+            "sse_clients": 2,
+            "destinations": {
+                "telegram": [{"chat_id": "123456789"}],
+                "slack": [{"channel": "C0123456789"}]
+            }
         }
     ]
 }
@@ -631,19 +749,19 @@ Subscribe to SSE events for a session.
 
 ```bash
 curl -N -H "Accept: text/event-stream" \
-    http://localhost:8080/sessions/my-session-01/events
+    http://localhost:8080/sessions/my-session/events
 ```
 
 Optional header for replay:
 ```bash
 curl -N -H "Accept: text/event-stream" \
     -H "Last-Event-ID: evt_020" \
-    http://localhost:8080/sessions/my-session-01/events
+    http://localhost:8080/sessions/my-session/events
 ```
 
 #### GET /health
 
-Health check endpoint.
+Health check endpoint with bot status.
 
 ```bash
 curl http://localhost:8080/health
@@ -654,7 +772,11 @@ Response:
 {
     "status": "healthy",
     "sessions_watched": 3,
-    "uptime_seconds": 3600
+    "uptime_seconds": 3600,
+    "bots": {
+        "telegram": "configured",
+        "slack": "not_configured"
+    }
 }
 ```
 
@@ -684,11 +806,13 @@ Event types:
 - `add_block` — New block added (user message, assistant text, tool call, etc.)
 - `update_block` — Existing block updated (tool result, progress update)
 - `clear_all` — Context compaction occurred, all previous content cleared
-- `session_ended` — Session file deleted or unwatched
+- `session_ended` — Session file deleted or detached
 
 ### Reconnection and Replay
 
 The service maintains a buffer of the last 20 events per session. When a client reconnects with the `Last-Event-ID` header, events after that ID are replayed. If the ID is unknown or evicted, all buffered events are replayed.
+
+When attaching a messaging destination with `replay_count`, the last N events are sent as a batched catch-up message.
 
 ### State Persistence
 
@@ -712,8 +836,39 @@ async def subscribe_to_session(session_id: str):
                     data = line[5:].strip()
                     print(f"Received: {data}")
 
-asyncio.run(subscribe_to_session("my-session-01"))
+asyncio.run(subscribe_to_session("my-session"))
 ```
+
+### Troubleshooting
+
+#### Bot Not Responding
+
+- **Telegram**: Ensure the bot is added to the chat and has permission to send messages. For groups, the bot may need admin permissions.
+- **Slack**: Ensure the bot is invited to the channel. For private channels, use `/invite @bot-name`.
+
+#### Rate Limits
+
+The service automatically rate-limits message updates to stay within platform limits:
+- Telegram: Updates debounced to ~2/second per chat
+- Slack: Updates debounced to ~0.5/second per channel
+
+#### Missing Messages After Restart
+
+Message state (which Telegram/Slack messages to update) is ephemeral and not persisted. After a service restart, new events will create new messages rather than updating existing ones.
+
+## Breaking Changes
+
+### v0.5.0
+
+- **API Change**: `/watch` and `/unwatch` endpoints removed
+  - Use `/attach` and `/detach` instead
+  - New endpoints support messaging destinations (Telegram, Slack)
+  - `path` is now required only on first attach
+
+- **Config Change**: `config.yaml` format updated
+  - New `bots` section for Telegram/Slack credentials
+  - Sessions now include `destinations` field
+  - Old format auto-migrated on first load
 
 ## License
 
