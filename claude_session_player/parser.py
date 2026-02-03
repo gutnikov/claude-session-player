@@ -302,3 +302,35 @@ def get_local_command_text(line: dict) -> str:
         return ""
     match = _LOCAL_COMMAND_RE.search(content)
     return match.group(1) if match else ""
+
+
+def get_ask_user_question_data(line: dict) -> list[dict] | None:
+    """Extract questions from an AskUserQuestion tool_use.
+
+    Returns a list of question dicts if this is an AskUserQuestion tool call,
+    None otherwise.
+    """
+    message = line.get("message") or {}
+    content = message.get("content") or []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            if block.get("name") == "AskUserQuestion":
+                input_data = block.get("input") or {}
+                questions = input_data.get("questions")
+                if isinstance(questions, list):
+                    return questions
+    return None
+
+
+def get_tool_use_result_answers(line: dict) -> dict[str, str] | None:
+    """Extract answers from a tool_result's toolUseResult.
+
+    Returns the answers dict if present (for AskUserQuestion responses),
+    None otherwise.
+    """
+    tool_use_result = line.get("toolUseResult")
+    if isinstance(tool_use_result, dict):
+        answers = tool_use_result.get("answers")
+        if isinstance(answers, dict):
+            return answers
+    return None

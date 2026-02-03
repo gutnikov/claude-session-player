@@ -21,6 +21,7 @@ class BlockType(Enum):
     USER = "user"
     ASSISTANT = "assistant"
     TOOL_CALL = "tool_call"
+    QUESTION = "question"
     THINKING = "thinking"
     DURATION = "duration"
     SYSTEM = "system"
@@ -76,11 +77,39 @@ class SystemContent:
     text: str
 
 
+@dataclass
+class QuestionOption:
+    """A single option for a question."""
+
+    label: str
+    description: str
+
+
+@dataclass
+class Question:
+    """A single question with options."""
+
+    question: str
+    header: str
+    options: list[QuestionOption]
+    multi_select: bool = False
+
+
+@dataclass
+class QuestionContent:
+    """Content for AskUserQuestion tool blocks."""
+
+    tool_use_id: str
+    questions: list[Question]
+    answers: dict[str, str] | None = None
+
+
 # Union type for all block content types
 BlockContent = Union[
     UserContent,
     AssistantContent,
     ToolCallContent,
+    QuestionContent,
     ThinkingContent,
     DurationContent,
     SystemContent,

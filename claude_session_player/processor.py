@@ -13,6 +13,9 @@ from .events import (
     DurationContent,
     Event,
     ProcessingContext,
+    Question,
+    QuestionContent,
+    QuestionOption,
     SystemContent,
     ThinkingContent,
     ToolCallContent,
@@ -23,6 +26,7 @@ from .formatter import truncate_result
 from .parser import (
     LineType,
     classify_line,
+    get_ask_user_question_data,
     get_duration_ms,
     get_local_command_text,
     get_parent_tool_use_id,
@@ -30,6 +34,7 @@ from .parser import (
     get_request_id,
     get_tool_result_info,
     get_tool_use_info,
+    get_tool_use_result_answers,
     get_user_text,
 )
 from .tools import abbreviate_tool_input
@@ -39,15 +44,25 @@ from .tools import abbreviate_tool_input
 # This stores the original ToolCallContent so we can create complete UpdateBlocks
 _tool_content_cache: dict[str, ToolCallContent] = {}
 
+# Module-level cache for question content (cleared on compact_boundary)
+# This stores the original QuestionContent so we can update with answers
+_question_content_cache: dict[str, QuestionContent] = {}
+
 
 def _store_tool_content(tool_use_id: str, content: ToolCallContent) -> None:
     """Store tool call content for later result/progress updates."""
     _tool_content_cache[tool_use_id] = content
 
 
+def _store_question_content(tool_use_id: str, content: QuestionContent) -> None:
+    """Store question content for later answer updates."""
+    _question_content_cache[tool_use_id] = content
+
+
 def _clear_tool_content_cache() -> None:
     """Clear the tool content cache."""
     _tool_content_cache.clear()
+    _question_content_cache.clear()
 
 
 def process_line(context: ProcessingContext, line: dict) -> list[Event]:
@@ -162,10 +177,19 @@ def _process_assistant_text(context: ProcessingContext, line: dict) -> list[Even
 
 
 def _process_tool_use(context: ProcessingContext, line: dict) -> list[Event]:
-    """Process TOOL_USE: create AddBlock(TOOL_CALL), store mapping."""
+    """Process TOOL_USE: create AddBlock(TOOL_CALL or QUESTION), store mapping."""
     tool_name, tool_use_id, input_dict = get_tool_use_info(line)
-    label = abbreviate_tool_input(tool_name, input_dict)
     request_id = get_request_id(line)
+
+    # Check if this is an AskUserQuestion tool
+    question_data = get_ask_user_question_data(line)
+    if question_data is not None:
+        return _process_ask_user_question(
+            context, tool_use_id, question_data, request_id
+        )
+
+    # Regular tool call
+    label = abbreviate_tool_input(tool_name, input_dict)
 
     content = ToolCallContent(
         tool_name=tool_name,
@@ -184,6 +208,56 @@ def _process_tool_use(context: ProcessingContext, line: dict) -> list[Event]:
     context.tool_use_id_to_block_id[tool_use_id] = block_id
     # Store content for later updates
     _store_tool_content(tool_use_id, content)
+    context.current_request_id = request_id
+    return [AddBlock(block=block)]
+
+
+def _process_ask_user_question(
+    context: ProcessingContext,
+    tool_use_id: str,
+    question_data: list[dict],
+    request_id: str | None,
+) -> list[Event]:
+    """Process AskUserQuestion tool_use: create AddBlock(QUESTION)."""
+    # Parse question data into Question objects
+    questions: list[Question] = []
+    for q in question_data:
+        if not isinstance(q, dict):
+            continue
+        options: list[QuestionOption] = []
+        for opt in q.get("options", []):
+            if isinstance(opt, dict):
+                options.append(
+                    QuestionOption(
+                        label=opt.get("label", ""),
+                        description=opt.get("description", ""),
+                    )
+                )
+        questions.append(
+            Question(
+                question=q.get("question", ""),
+                header=q.get("header", ""),
+                options=options,
+                multi_select=bool(q.get("multiSelect", False)),
+            )
+        )
+
+    content = QuestionContent(
+        tool_use_id=tool_use_id,
+        questions=questions,
+        answers=None,
+    )
+    block_id = _generate_block_id()
+    block = Block(
+        id=block_id,
+        type=BlockType.QUESTION,
+        content=content,
+        request_id=request_id,
+    )
+
+    # Store mapping for later answer updates
+    context.tool_use_id_to_block_id[tool_use_id] = block_id
+    _store_question_content(tool_use_id, content)
     context.current_request_id = request_id
     return [AddBlock(block=block)]
 
@@ -264,10 +338,27 @@ def _process_tool_result(context: ProcessingContext, line: dict) -> list[Event]:
     # Check for Task tool result special handling
     task_result_text = _get_task_result_text(line)
 
+    # Check for AskUserQuestion answers
+    answers = get_tool_use_result_answers(line)
+
     for tool_use_id, content_text, is_error in results:
         if tool_use_id in context.tool_use_id_to_block_id:
-            # Found matching tool call - create UpdateBlock
             block_id = context.tool_use_id_to_block_id[tool_use_id]
+
+            # Check if this is a question response
+            question_original = _question_content_cache.get(tool_use_id)
+            if question_original is not None:
+                # Update QuestionContent with answers
+                updated_content = QuestionContent(
+                    tool_use_id=question_original.tool_use_id,
+                    questions=question_original.questions,
+                    answers=answers,
+                )
+                _store_question_content(tool_use_id, updated_content)
+                events.append(UpdateBlock(block_id=block_id, content=updated_content))
+                continue
+
+            # Regular tool call result
             result_text = truncate_result(content_text)
 
             # Get original content from cache to create complete UpdateBlock
