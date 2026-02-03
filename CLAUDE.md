@@ -175,6 +175,18 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `claude_session_player/tools.py` - Tool input abbreviation rules
 - `claude_session_player/cli.py` - CLI entry point
 
+### Watcher Module
+- `claude_session_player/watcher/__init__.py` - Public exports
+- `claude_session_player/watcher/__main__.py` - CLI entry point for watcher service
+- `claude_session_player/watcher/service.py` - Main WatcherService orchestration
+- `claude_session_player/watcher/api.py` - REST API endpoints (aiohttp)
+- `claude_session_player/watcher/sse.py` - SSE connection management
+- `claude_session_player/watcher/event_buffer.py` - Per-session event ring buffer
+- `claude_session_player/watcher/transformer.py` - Stateless line-to-event transformer
+- `claude_session_player/watcher/file_watcher.py` - File change detection (watchfiles)
+- `claude_session_player/watcher/config.py` - Session config management (YAML)
+- `claude_session_player/watcher/state.py` - Processing state persistence (JSON)
+
 ### Tests
 - `tests/test_parser.py` - Parser tests
 - `tests/test_processor.py` - Processor tests
@@ -183,6 +195,8 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `tests/test_tools.py` - Tool abbreviation tests
 - `tests/test_integration.py` - Full session replay tests
 - `tests/test_stress.py` - Stress tests with large sessions
+- `tests/watcher/test_*.py` - Watcher module tests
+- `tests/watcher/test_e2e.py` - End-to-end watcher tests
 
 ### Example Data
 - `examples/projects/*/sessions/*.jsonl` - Real session files
@@ -235,6 +249,89 @@ for i, line in enumerate(read_session("session.jsonl")):
 
 print(consumer.to_markdown())
 ```
+
+### Running the Watcher Service
+
+```bash
+# Start with defaults
+python -m claude_session_player.watcher
+
+# Custom configuration
+python -m claude_session_player.watcher \
+    --host 0.0.0.0 \
+    --port 9000 \
+    --config /path/to/config.yaml \
+    --state-dir /path/to/state \
+    --log-level DEBUG
+```
+
+### Adding a Session to Watch (via API)
+
+```bash
+curl -X POST http://localhost:8080/watch \
+    -H "Content-Type: application/json" \
+    -d '{"session_id": "my-session", "path": "/path/to/session.jsonl"}'
+```
+
+### Subscribing to Session Events
+
+```bash
+curl -N -H "Accept: text/event-stream" \
+    http://localhost:8080/sessions/my-session/events
+```
+
+## Watcher Architecture
+
+The watcher service uses a layered architecture:
+
+```
+HTTP Request → WatcherAPI → WatcherService → Components
+                                   ↓
+                    ┌──────────────┼──────────────┐
+                    ↓              ↓              ↓
+              ConfigManager   FileWatcher   StateManager
+                    │              │              │
+                    └──────────────┼──────────────┘
+                                   ↓
+                             transformer()
+                                   ↓
+                          EventBufferManager
+                                   ↓
+                            SSEManager → Clients
+```
+
+### Event Flow (File Change → SSE)
+
+```python
+# FileWatcher detects change
+await on_file_change(session_id, lines)
+    ↓
+# Load processing context from state
+state = state_manager.load(session_id)
+context = state.processing_context
+    ↓
+# Transform lines to events
+events, new_context = transform(lines, context)
+    ↓
+# Save updated state
+state_manager.save(session_id, new_state)
+    ↓
+# Buffer events and broadcast
+for event in events:
+    event_id = event_buffer.add_event(session_id, event)
+    await sse_manager.broadcast(session_id, event_id, event)
+```
+
+### Key Components
+
+- **WatcherService**: Orchestrates all components, handles lifecycle
+- **WatcherAPI**: REST endpoints (POST /watch, DELETE /unwatch, GET /sessions, etc.)
+- **FileWatcher**: Uses `watchfiles` for cross-platform file change detection
+- **transformer()**: Stateless function that converts JSONL lines to events
+- **EventBufferManager**: Per-session ring buffer (last 20 events) for replay
+- **SSEManager**: Manages SSE connections, broadcasts events, handles keepalive
+- **ConfigManager**: Persists watched sessions to `config.yaml`
+- **StateManager**: Persists processing context and file position per session
 
 ## Known Limitations
 
