@@ -25,14 +25,29 @@ class ScreenStateConsumer:
 
     This consumer accumulates blocks from events, providing backwards
     compatibility with the existing CLI and replay-session.sh.
+
+    Implements the Consumer protocol from protocol.py for use with EventEmitter.
     """
 
     def __init__(self) -> None:
         self.blocks: list[Block] = []
         self._block_index: dict[str, int] = {}  # block_id → index in blocks
 
+    async def on_event(self, event: Event) -> None:
+        """Process a single event (async protocol method).
+
+        This method implements the Consumer protocol for use with EventEmitter.
+        Internally delegates to the synchronous handle() method.
+
+        Args:
+            event: An AddBlock, UpdateBlock, or ClearAll event.
+        """
+        self.handle(event)
+
     def handle(self, event: Event) -> None:
-        """Process a single event.
+        """Process a single event (synchronous method).
+
+        This method provides backward compatibility with existing code.
 
         Args:
             event: An AddBlock, UpdateBlock, or ClearAll event.
@@ -53,6 +68,20 @@ class ScreenStateConsumer:
         elif isinstance(event, ClearAll):
             self.blocks.clear()
             self._block_index.clear()
+
+    def render_block(self, block: Block) -> str:
+        """Render a block to its markdown string representation.
+
+        This method implements the Consumer protocol. It delegates to the
+        module-level format_block() function for the actual formatting.
+
+        Args:
+            block: The block to render.
+
+        Returns:
+            Markdown string representation of the block.
+        """
+        return format_block(block)
 
     def to_markdown(self) -> str:
         """Render all blocks as markdown.
