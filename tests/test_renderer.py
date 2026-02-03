@@ -1707,3 +1707,493 @@ class TestProgressFullFlow:
         md = empty_state.to_markdown()
         assert md == "● Read(a.py)\n  └ file contents"
         assert "Hook:" not in md
+
+
+# ---------------------------------------------------------------------------
+# Issue 09: Compaction, Sub-Agents & Edge Cases Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCompactionFlow:
+    """Tests for context compaction handling."""
+
+    def test_compaction_clears_state_and_allows_rebuild(self, empty_state: ScreenState) -> None:
+        """Build state → compact_boundary → state empty → can rebuild."""
+        # Build some initial state
+        user1 = {"type": "user", "isMeta": False, "message": {"role": "user", "content": "first question"}}
+        assistant1 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "first answer"}]},
+        }
+        render(empty_state, user1)
+        render(empty_state, assistant1)
+        assert len(empty_state.elements) == 2
+
+        # Compact boundary clears everything
+        compact = {"type": "system", "subtype": "compact_boundary"}
+        render(empty_state, compact)
+        assert len(empty_state.elements) == 0
+
+        # Can rebuild state after compaction
+        user2 = {"type": "user", "isMeta": False, "message": {"role": "user", "content": "new question"}}
+        render(empty_state, user2)
+        assert len(empty_state.elements) == 1
+        assert empty_state.to_markdown() == "❯ new question"
+
+    def test_multiple_compactions_only_last_content_visible(self, empty_state: ScreenState) -> None:
+        """Double compaction → only content after last compaction visible."""
+        # First conversation
+        user1 = {"type": "user", "isMeta": False, "message": {"role": "user", "content": "q1"}}
+        render(empty_state, user1)
+
+        # First compaction
+        compact1 = {"type": "system", "subtype": "compact_boundary"}
+        render(empty_state, compact1)
+
+        # Second conversation
+        user2 = {"type": "user", "isMeta": False, "message": {"role": "user", "content": "q2"}}
+        render(empty_state, user2)
+
+        # Second compaction
+        compact2 = {"type": "system", "subtype": "compact_boundary"}
+        render(empty_state, compact2)
+
+        # Third conversation (only this should be visible)
+        user3 = {"type": "user", "isMeta": False, "message": {"role": "user", "content": "q3"}}
+        render(empty_state, user3)
+
+        assert len(empty_state.elements) == 1
+        assert empty_state.to_markdown() == "❯ q3"
+
+    def test_tool_call_before_compaction_result_after_becomes_orphan(self, empty_state: ScreenState) -> None:
+        """Tool call before compaction → tool result after compaction → orphan result."""
+        # Create tool call
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_before_compact", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        }
+        render(empty_state, tool_use)
+        assert "toolu_before_compact" in empty_state.tool_calls
+
+        # Compaction clears tool_calls
+        compact = {"type": "system", "subtype": "compact_boundary"}
+        render(empty_state, compact)
+        assert "toolu_before_compact" not in empty_state.tool_calls
+
+        # Tool result after compaction → orphan (becomes SystemOutput)
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_before_compact", "content": "orphan output", "is_error": False}],
+            },
+        }
+        render(empty_state, tool_result)
+
+        assert len(empty_state.elements) == 1
+        assert isinstance(empty_state.elements[0], SystemOutput)
+        assert empty_state.elements[0].text == "orphan output"
+
+    def test_summary_before_compaction_invisible(self, empty_state: ScreenState) -> None:
+        """Summary messages are invisible (not rendered)."""
+        summary = {"type": "summary", "summary": "Phase 5 complete", "leafUuid": "abc123"}
+        render(empty_state, summary)
+        assert len(empty_state.elements) == 0
+
+    def test_full_compaction_flow(self, empty_state: ScreenState) -> None:
+        """Simulate full compaction flow: messages → summary → compact_boundary → fresh start."""
+        # Pre-compaction content
+        user_old = {"type": "user", "isMeta": False, "message": {"role": "user", "content": "old"}}
+        render(empty_state, user_old)
+
+        # Summary (invisible per spec)
+        summary = {"type": "summary", "summary": "Session summary"}
+        render(empty_state, summary)
+
+        # Compact boundary clears state
+        compact = {"type": "system", "subtype": "compact_boundary"}
+        render(empty_state, compact)
+
+        # Post-compaction content
+        user_new = {"type": "user", "isMeta": False, "message": {"role": "user", "content": "fresh start"}}
+        render(empty_state, user_new)
+
+        # Only post-compaction content visible
+        md = empty_state.to_markdown()
+        assert "old" not in md
+        assert "Session summary" not in md
+        assert md == "❯ fresh start"
+
+
+class TestTaskToolResults:
+    """Tests for Task (sub-agent) tool result rendering."""
+
+    def test_task_tool_use_renders_description(self, empty_state: ScreenState) -> None:
+        """Task tool_use → renders as ● Task(description…)."""
+        task_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_task_001", "name": "Task", "input": {"description": "Explore codebase"}}],
+            },
+        }
+        render(empty_state, task_use)
+        md = empty_state.to_markdown()
+        assert md == "● Task(Explore codebase)"
+
+    def test_task_result_with_tool_use_result_content(self, empty_state: ScreenState) -> None:
+        """Task tool_result with toolUseResult.content → collapsed result text."""
+        # Create Task tool call
+        task_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_task_001", "name": "Task", "input": {"description": "Analyze code"}}],
+            },
+        }
+        render(empty_state, task_use)
+
+        # Task result with toolUseResult structure
+        task_result = {
+            "type": "user",
+            "isMeta": False,
+            "toolUseResult": {
+                "status": "completed",
+                "agentId": "ab97f57",
+                "content": [{"type": "text", "text": "There are still 114 errors remaining in the codebase."}],
+                "totalDurationMs": 785728,
+                "totalTokens": 126186,
+                "totalToolUseCount": 77,
+            },
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_task_001", "content": "fallback content", "is_error": False}],
+            },
+        }
+        render(empty_state, task_result)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        # Should use toolUseResult.content text, not the fallback
+        assert element.result == "There are still 114 errors remaining in the codebase."
+
+    def test_task_result_text_over_80_chars_truncated(self, empty_state: ScreenState) -> None:
+        """Task result text > 80 chars → truncated at 79 + …."""
+        task_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_task_001", "name": "Task", "input": {"description": "Long task"}}],
+            },
+        }
+        render(empty_state, task_use)
+
+        long_text = "A" * 100  # 100 chars
+        task_result = {
+            "type": "user",
+            "isMeta": False,
+            "toolUseResult": {
+                "status": "completed",
+                "agentId": "xyz",
+                "content": [{"type": "text", "text": long_text}],
+            },
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_task_001", "content": "", "is_error": False}],
+            },
+        }
+        render(empty_state, task_result)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert len(element.result) == 80  # 79 chars + …
+        assert element.result.endswith("…")
+
+    def test_task_result_empty_content_falls_back_to_normal(self, empty_state: ScreenState) -> None:
+        """Task result with empty toolUseResult.content → falls back to normal result handling."""
+        task_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_task_001", "name": "Task", "input": {"description": "Empty task"}}],
+            },
+        }
+        render(empty_state, task_use)
+
+        task_result = {
+            "type": "user",
+            "isMeta": False,
+            "toolUseResult": {
+                "status": "completed",
+                "agentId": "xyz",
+                "content": [],  # Empty content list
+            },
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_task_001", "content": "fallback text", "is_error": False}],
+            },
+        }
+        render(empty_state, task_result)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        # Falls back to normal result because toolUseResult.content is empty
+        assert element.result == "fallback text"
+
+    def test_task_result_missing_tool_use_result_falls_back(self, empty_state: ScreenState) -> None:
+        """Task result without toolUseResult → falls back to normal result handling."""
+        task_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_task_001", "name": "Task", "input": {"description": "No TUR"}}],
+            },
+        }
+        render(empty_state, task_use)
+
+        task_result = {
+            "type": "user",
+            "isMeta": False,
+            # No toolUseResult field
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_task_001", "content": "normal result", "is_error": False}],
+            },
+        }
+        render(empty_state, task_result)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        # Falls back to normal result truncation
+        assert element.result == "normal result"
+
+    def test_non_task_tool_ignores_tool_use_result(self, empty_state: ScreenState) -> None:
+        """Non-Task tool with toolUseResult → ignores toolUseResult, uses normal content."""
+        bash_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_bash_001", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        }
+        render(empty_state, bash_use)
+
+        # Even if toolUseResult exists (shouldn't happen for Bash, but defensive)
+        bash_result = {
+            "type": "user",
+            "isMeta": False,
+            "toolUseResult": {
+                "status": "completed",
+                "content": [{"type": "text", "text": "should be ignored"}],
+            },
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_bash_001", "content": "file1.txt", "is_error": False}],
+            },
+        }
+        render(empty_state, bash_result)
+
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        # Bash tool uses normal result, not toolUseResult
+        assert element.result == "file1.txt"
+
+
+class TestUserMessageContentVariations:
+    """Tests for user messages with different content types."""
+
+    def test_user_string_content(self, empty_state: ScreenState) -> None:
+        """User message with string content → normal rendering."""
+        line = {"type": "user", "isMeta": False, "message": {"role": "user", "content": "simple text"}}
+        render(empty_state, line)
+        assert empty_state.to_markdown() == "❯ simple text"
+
+    def test_user_list_content_single_text_block(self, empty_state: ScreenState) -> None:
+        """User message with list content (single text block) → extracted text."""
+        line = {
+            "type": "user",
+            "isMeta": False,
+            "message": {"role": "user", "content": [{"type": "text", "text": "implement this"}]},
+        }
+        render(empty_state, line)
+        assert empty_state.to_markdown() == "❯ implement this"
+
+    def test_user_list_content_multiple_text_blocks(self, empty_state: ScreenState) -> None:
+        """User message with list content (multiple text blocks) → joined with newlines."""
+        line = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first part"},
+                    {"type": "text", "text": "second part"},
+                ],
+            },
+        }
+        render(empty_state, line)
+        # Joined with newline, then formatted
+        assert empty_state.to_markdown() == "❯ first part\n  second part"
+
+
+class TestToolResultContentVariations:
+    """Tests for tool results with different content types."""
+
+    def test_tool_result_string_content(self, empty_state: ScreenState) -> None:
+        """Tool result with string content → normal rendering."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_001", "content": "file.txt", "is_error": False}],
+            },
+        }
+        render(empty_state, tool_result)
+        assert empty_state.elements[0].result == "file.txt"
+
+    def test_tool_result_list_content(self, empty_state: ScreenState) -> None:
+        """Tool result with list content → extracted text from text blocks."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Read", "input": {"file_path": "/a.py"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": [
+                            {"type": "text", "text": "line 1"},
+                            {"type": "text", "text": "line 2"},
+                        ],
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, tool_result)
+        assert empty_state.elements[0].result == "line 1\nline 2"
+
+    def test_tool_result_null_content(self, empty_state: ScreenState) -> None:
+        """Tool result with null content → '(no output)'."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Write", "input": {"file_path": "/a.py"}}],
+            },
+        }
+        render(empty_state, tool_use)
+
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_001", "content": None, "is_error": False}],
+            },
+        }
+        render(empty_state, tool_result)
+        assert empty_state.elements[0].result == "(no output)"
+
+
+class TestDefensiveEdgeCases:
+    """Tests for defensive handling of malformed/edge case input."""
+
+    def test_empty_content_list_on_assistant_no_crash(self, empty_state: ScreenState) -> None:
+        """Assistant with empty content list → no crash, no element added."""
+        line = {"type": "assistant", "message": {"role": "assistant", "content": []}}
+        render(empty_state, line)
+        assert len(empty_state.elements) == 0
+
+    def test_unknown_content_block_type_no_crash(self, empty_state: ScreenState) -> None:
+        """Assistant with unknown content block type → no crash (INVISIBLE)."""
+        line = {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "unknown_block_type", "data": "foo"}]},
+        }
+        render(empty_state, line)
+        assert len(empty_state.elements) == 0
+
+    def test_missing_message_field_invisible(self, empty_state: ScreenState) -> None:
+        """Line with missing message field → INVISIBLE (no crash)."""
+        # User type without message
+        line = {"type": "user", "isMeta": False}
+        render(empty_state, line)
+        # Should not crash and should produce valid output
+        assert len(empty_state.elements) == 1  # Still renders but with empty text
+        assert "❯" in empty_state.to_markdown()
+
+    def test_is_sidechain_true_user_invisible(self, empty_state: ScreenState) -> None:
+        """User message with isSidechain=true → INVISIBLE."""
+        line = {
+            "type": "user",
+            "isSidechain": True,
+            "isMeta": False,
+            "message": {"role": "user", "content": "sidechain user message"},
+        }
+        render(empty_state, line)
+        assert len(empty_state.elements) == 0
+
+    def test_is_sidechain_true_assistant_invisible(self, empty_state: ScreenState) -> None:
+        """Assistant message with isSidechain=true → INVISIBLE."""
+        line = {
+            "type": "assistant",
+            "isSidechain": True,
+            "requestId": "req_001",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "sidechain response"}]},
+        }
+        render(empty_state, line)
+        assert len(empty_state.elements) == 0
+
+    def test_completely_unknown_type_invisible(self, empty_state: ScreenState) -> None:
+        """Completely unknown message type → INVISIBLE."""
+        line = {"type": "totally_made_up_type", "data": "foo"}
+        render(empty_state, line)
+        assert len(empty_state.elements) == 0
+
+    def test_queue_operation_invisible(self, empty_state: ScreenState) -> None:
+        """Queue operation messages are invisible."""
+        line = {"type": "queue-operation", "operation": "enqueue", "content": "queued message"}
+        render(empty_state, line)
+        assert len(empty_state.elements) == 0
+
+    def test_pr_link_invisible(self, empty_state: ScreenState) -> None:
+        """PR link messages are invisible."""
+        line = {"type": "pr-link", "url": "https://github.com/org/repo/pull/123"}
+        render(empty_state, line)
+        assert len(empty_state.elements) == 0

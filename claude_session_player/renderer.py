@@ -100,6 +100,29 @@ def _render_tool_use(state: ScreenState, line: dict) -> None:
     state.current_request_id = request_id
 
 
+def _get_task_result_text(line: dict) -> str | None:
+    """Extract collapsed result text for Task tool results.
+
+    Task tool results have a special structure with toolUseResult containing
+    status, agentId, content, totalDurationMs, etc. Extract and truncate
+    the first 80 chars of the content text.
+
+    Returns None if this isn't a Task result or content isn't available.
+    """
+    tur = line.get("toolUseResult", {})
+    if isinstance(tur, dict) and "content" in tur:
+        content_list = tur.get("content", [])
+        if content_list and isinstance(content_list, list) and len(content_list) > 0:
+            first_block = content_list[0]
+            if isinstance(first_block, dict):
+                text = first_block.get("text", "")
+                if text:
+                    if len(text) > 80:
+                        return text[:79] + "…"
+                    return text
+    return None
+
+
 def _render_tool_result(state: ScreenState, line: dict) -> None:
     """Render tool result(s) by matching to existing tool calls.
 
@@ -108,9 +131,14 @@ def _render_tool_result(state: ScreenState, line: dict) -> None:
       element with the truncated result and is_error flag.
     - If no match found (orphan result), append a SystemOutput with the content.
 
+    For Task tool results, uses collapsed rendering (first 80 chars of content).
+
     Tool results break assistant grouping, so current_request_id is reset to None.
     """
     results = get_tool_result_info(line)
+
+    # Check for Task tool result special handling
+    task_result_text = _get_task_result_text(line)
 
     for tool_use_id, content, is_error in results:
         if tool_use_id in state.tool_calls:
@@ -118,7 +146,11 @@ def _render_tool_result(state: ScreenState, line: dict) -> None:
             index = state.tool_calls[tool_use_id]
             element = state.elements[index]
             if isinstance(element, ToolCall):
-                element.result = truncate_result(content)
+                # Use task result text if this is a Task tool result
+                if element.tool_name == "Task" and task_result_text is not None:
+                    element.result = task_result_text
+                else:
+                    element.result = truncate_result(content)
                 element.is_error = is_error
         else:
             # Orphan result - render as system output

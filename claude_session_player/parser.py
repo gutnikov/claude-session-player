@@ -98,6 +98,11 @@ def classify_line(line: dict) -> LineType:
     if msg_type is None:
         return LineType.INVISIBLE
 
+    # isSidechain messages in main session should be invisible
+    # (we render collapsed sub-agents, not their internal messages)
+    if line.get("isSidechain") and msg_type in ("user", "assistant"):
+        return LineType.INVISIBLE
+
     # Always-invisible types
     if msg_type in _INVISIBLE_TYPES:
         return LineType.INVISIBLE
@@ -234,7 +239,13 @@ def get_tool_use_info(line: dict) -> tuple[str, str, dict]:
 
 
 def get_tool_result_info(line: dict) -> list[tuple[str, str, bool]]:
-    """Extract [(tool_use_id, content, is_error)] from a tool_result message."""
+    """Extract [(tool_use_id, content, is_error)] from a tool_result message.
+
+    Handles content variations:
+    - String content → uses directly
+    - List content → extracts text from text-type blocks, joins with newlines
+    - None/null content → returns empty string (will be rendered as "(no output)")
+    """
     message = line.get("message") or {}
     content = message.get("content") or []
     results: list[tuple[str, str, bool]] = []
@@ -242,17 +253,19 @@ def get_tool_result_info(line: dict) -> list[tuple[str, str, bool]]:
         if isinstance(block, dict) and block.get("type") == "tool_result":
             tool_use_id = block.get("tool_use_id", "")
             is_error = bool(block.get("is_error", False))
-            block_content = block.get("content", "")
-            if isinstance(block_content, str):
+            block_content = block.get("content")
+            if block_content is None:
+                text = ""
+            elif isinstance(block_content, str):
                 text = block_content
             elif isinstance(block_content, list):
                 text_parts = []
                 for part in block_content:
-                    if isinstance(part, dict):
+                    if isinstance(part, dict) and part.get("type") == "text":
                         text_parts.append(part.get("text", ""))
                 text = "\n".join(text_parts)
             else:
-                text = str(block_content)
+                text = ""  # Unknown content type
             results.append((tool_use_id, text, is_error))
     return results
 

@@ -403,3 +403,191 @@ class TestLineTypeEnum:
         }
         actual = {lt.name for lt in LineType}
         assert actual == expected
+
+
+# ===================================================================
+# Issue 09: isSidechain and edge case classification tests
+# ===================================================================
+
+
+class TestIsSidechainClassification:
+    """Tests for isSidechain message handling."""
+
+    def test_is_sidechain_user_invisible(self) -> None:
+        """User message with isSidechain=true → INVISIBLE."""
+        line = {
+            "type": "user",
+            "isSidechain": True,
+            "isMeta": False,
+            "message": {"role": "user", "content": "sidechain user message"},
+        }
+        assert classify_line(line) == LineType.INVISIBLE
+
+    def test_is_sidechain_assistant_invisible(self) -> None:
+        """Assistant message with isSidechain=true → INVISIBLE."""
+        line = {
+            "type": "assistant",
+            "isSidechain": True,
+            "requestId": "req_001",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "sidechain response"}]},
+        }
+        assert classify_line(line) == LineType.INVISIBLE
+
+    def test_is_sidechain_false_user_not_invisible(self) -> None:
+        """User message with isSidechain=false → still USER_INPUT."""
+        line = {
+            "type": "user",
+            "isSidechain": False,
+            "isMeta": False,
+            "message": {"role": "user", "content": "normal user message"},
+        }
+        assert classify_line(line) == LineType.USER_INPUT
+
+    def test_is_sidechain_on_system_type_ignored(self) -> None:
+        """System message with isSidechain=true → still classified normally."""
+        line = {
+            "type": "system",
+            "subtype": "turn_duration",
+            "isSidechain": True,
+            "durationMs": 5000,
+        }
+        # isSidechain check only applies to user/assistant
+        assert classify_line(line) == LineType.TURN_DURATION
+
+
+class TestToolResultContentVariations:
+    """Tests for get_tool_result_info content handling."""
+
+    def test_string_content(self) -> None:
+        """String content → extracted as-is."""
+        line = {
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "hello", "is_error": False}]
+            }
+        }
+        results = get_tool_result_info(line)
+        assert results[0][1] == "hello"
+
+    def test_list_content_extracts_text(self) -> None:
+        """List content → extracts text from text blocks."""
+        line = {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [
+                            {"type": "text", "text": "part 1"},
+                            {"type": "text", "text": "part 2"},
+                        ],
+                        "is_error": False,
+                    }
+                ]
+            }
+        }
+        results = get_tool_result_info(line)
+        assert results[0][1] == "part 1\npart 2"
+
+    def test_list_content_ignores_non_text_blocks(self) -> None:
+        """List content with non-text blocks → only extracts text blocks."""
+        line = {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [
+                            {"type": "text", "text": "text block"},
+                            {"type": "image", "data": "base64..."},  # Should be ignored
+                        ],
+                        "is_error": False,
+                    }
+                ]
+            }
+        }
+        results = get_tool_result_info(line)
+        assert results[0][1] == "text block"
+
+    def test_null_content_returns_empty_string(self) -> None:
+        """Null content → returns empty string (will become '(no output)')."""
+        line = {
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": None, "is_error": False}]
+            }
+        }
+        results = get_tool_result_info(line)
+        assert results[0][1] == ""
+
+    def test_missing_content_returns_empty_string(self) -> None:
+        """Missing content key → returns empty string."""
+        line = {
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": False}]
+            }
+        }
+        results = get_tool_result_info(line)
+        assert results[0][1] == ""
+
+
+class TestUserTextContentVariations:
+    """Tests for get_user_text with different content types."""
+
+    def test_list_content_single_block(self) -> None:
+        """List content with single text block."""
+        line = {"message": {"content": [{"type": "text", "text": "single block"}]}}
+        assert get_user_text(line) == "single block"
+
+    def test_list_content_multiple_blocks(self) -> None:
+        """List content with multiple text blocks → joined with newlines."""
+        line = {
+            "message": {
+                "content": [
+                    {"type": "text", "text": "block 1"},
+                    {"type": "text", "text": "block 2"},
+                    {"type": "text", "text": "block 3"},
+                ]
+            }
+        }
+        assert get_user_text(line) == "block 1\nblock 2\nblock 3"
+
+    def test_list_content_skips_empty_text(self) -> None:
+        """List content with empty text → skipped."""
+        line = {
+            "message": {
+                "content": [
+                    {"type": "text", "text": "has text"},
+                    {"type": "text", "text": ""},  # Empty, skipped
+                    {"type": "text", "text": "more text"},
+                ]
+            }
+        }
+        assert get_user_text(line) == "has text\nmore text"
+
+    def test_list_content_handles_strings_in_list(self) -> None:
+        """List content can include plain strings."""
+        line = {"message": {"content": ["string element", {"type": "text", "text": "dict element"}]}}
+        assert get_user_text(line) == "string element\ndict element"
+
+
+class TestDefensiveClassification:
+    """Tests for defensive edge cases in classification."""
+
+    def test_assistant_with_non_dict_content_block(self) -> None:
+        """Assistant with non-dict content block → INVISIBLE."""
+        line = {"type": "assistant", "message": {"role": "assistant", "content": ["string block"]}}
+        assert classify_line(line) == LineType.INVISIBLE
+
+    def test_assistant_with_missing_block_type(self) -> None:
+        """Assistant content block missing 'type' key → INVISIBLE."""
+        line = {"type": "assistant", "message": {"role": "assistant", "content": [{"text": "no type"}]}}
+        assert classify_line(line) == LineType.INVISIBLE
+
+    def test_progress_without_data(self) -> None:
+        """Progress message without data → INVISIBLE."""
+        line = {"type": "progress"}
+        assert classify_line(line) == LineType.INVISIBLE
+
+    def test_system_without_subtype(self) -> None:
+        """System message without subtype → INVISIBLE."""
+        line = {"type": "system"}
+        assert classify_line(line) == LineType.INVISIBLE
