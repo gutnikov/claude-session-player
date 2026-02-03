@@ -76,6 +76,8 @@ class BotConfig:
     """Bot credentials configuration."""
 
     telegram_token: str | None = None
+    telegram_mode: str = "webhook"  # "webhook" or "polling"
+    telegram_webhook_url: str | None = None
     slack_token: str | None = None
     slack_signing_secret: str | None = None
 
@@ -83,7 +85,12 @@ class BotConfig:
         """Serialize to dict for YAML storage."""
         result: dict = {}
         if self.telegram_token is not None:
-            result["telegram"] = {"token": self.telegram_token}
+            telegram_config: dict = {"token": self.telegram_token}
+            if self.telegram_mode != "webhook":
+                telegram_config["mode"] = self.telegram_mode
+            if self.telegram_webhook_url is not None:
+                telegram_config["webhook_url"] = self.telegram_webhook_url
+            result["telegram"] = telegram_config
         if self.slack_token is not None or self.slack_signing_secret is not None:
             slack_config: dict = {}
             if self.slack_token is not None:
@@ -97,17 +104,23 @@ class BotConfig:
     def from_dict(cls, data: dict) -> BotConfig:
         """Deserialize from dict."""
         telegram_token = None
+        telegram_mode = "webhook"
+        telegram_webhook_url = None
         slack_token = None
         slack_signing_secret = None
 
         if "telegram" in data and data["telegram"]:
             telegram_token = data["telegram"].get("token")
+            telegram_mode = data["telegram"].get("mode", "webhook")
+            telegram_webhook_url = data["telegram"].get("webhook_url")
         if "slack" in data and data["slack"]:
             slack_token = data["slack"].get("token")
             slack_signing_secret = data["slack"].get("signing_secret")
 
         return cls(
             telegram_token=telegram_token,
+            telegram_mode=telegram_mode,
+            telegram_webhook_url=telegram_webhook_url,
             slack_token=slack_token,
             slack_signing_secret=slack_signing_secret,
         )
