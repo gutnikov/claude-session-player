@@ -7,6 +7,7 @@ from claude_session_player.formatter import (
     format_element,
     format_user_text,
     to_markdown,
+    truncate_result,
 )
 from claude_session_player.models import (
     AssistantText,
@@ -16,6 +17,40 @@ from claude_session_player.models import (
     ToolCall,
     UserMessage,
 )
+
+
+class TestTruncateResult:
+    """Tests for truncate_result."""
+
+    def test_empty_returns_no_output(self) -> None:
+        assert truncate_result("") == "(no output)"
+
+    def test_single_line_no_truncation(self) -> None:
+        assert truncate_result("hello") == "hello"
+
+    def test_five_lines_no_truncation(self) -> None:
+        text = "line1\nline2\nline3\nline4\nline5"
+        assert truncate_result(text) == text
+
+    def test_six_lines_truncated(self) -> None:
+        text = "line1\nline2\nline3\nline4\nline5\nline6"
+        result = truncate_result(text)
+        assert result == "line1\nline2\nline3\nline4\n…"
+
+    def test_ten_lines_truncated(self) -> None:
+        lines = [f"line{i}" for i in range(1, 11)]
+        text = "\n".join(lines)
+        result = truncate_result(text)
+        assert result == "line1\nline2\nline3\nline4\n…"
+
+    def test_custom_max_lines(self) -> None:
+        text = "a\nb\nc\nd\ne"
+        result = truncate_result(text, max_lines=3)
+        assert result == "a\nb\n…"
+
+    def test_whitespace_only_not_empty(self) -> None:
+        # Whitespace is not falsy for this purpose
+        assert truncate_result("   ") == "   "
 
 
 class TestFormatUserText:
@@ -103,6 +138,64 @@ class TestFormatElement:
     def test_tool_call_with_request_id(self) -> None:
         elem = ToolCall(tool_name="Read", tool_use_id="t2", label="file.py", request_id="req_001")
         assert format_element(elem) == "\u25cf Read(file.py)"
+
+    def test_tool_call_with_single_line_result(self) -> None:
+        elem = ToolCall(tool_name="Bash", tool_use_id="t1", label="ls", result="file.py")
+        result = format_element(elem)
+        assert result == "\u25cf Bash(ls)\n  \u2514 file.py"
+
+    def test_tool_call_with_multiline_result(self) -> None:
+        elem = ToolCall(
+            tool_name="Bash", tool_use_id="t1", label="git status",
+            result="On branch main\nYour branch is up to date\nChanges not staged:\n  modified: file.py"
+        )
+        result = format_element(elem)
+        expected = (
+            "\u25cf Bash(git status)\n"
+            "  \u2514 On branch main\n"
+            "    Your branch is up to date\n"
+            "    Changes not staged:\n"
+            "      modified: file.py"
+        )
+        assert result == expected
+
+    def test_tool_call_with_error_result(self) -> None:
+        elem = ToolCall(
+            tool_name="Bash", tool_use_id="t1", label="bad command",
+            result="command not found: bad", is_error=True
+        )
+        result = format_element(elem)
+        assert result == "\u25cf Bash(bad command)\n  \u2717 command not found: bad"
+
+    def test_tool_call_with_multiline_error(self) -> None:
+        elem = ToolCall(
+            tool_name="Bash", tool_use_id="t1", label="failing script",
+            result="error: failed\ndetails: something went wrong", is_error=True
+        )
+        result = format_element(elem)
+        expected = (
+            "\u25cf Bash(failing script)\n"
+            "  \u2717 error: failed\n"
+            "    details: something went wrong"
+        )
+        assert result == expected
+
+    def test_tool_call_with_truncated_result(self) -> None:
+        """Result is already truncated with … marker."""
+        elem = ToolCall(
+            tool_name="Bash", tool_use_id="t1", label="long output",
+            result="line1\nline2\nline3\nline4\n…"
+        )
+        result = format_element(elem)
+        expected = (
+            "\u25cf Bash(long output)\n"
+            "  \u2514 line1\n"
+            "    line2\n"
+            "    line3\n"
+            "    line4\n"
+            "    …"
+        )
+        assert result == expected
 
 
 class TestToMarkdown:

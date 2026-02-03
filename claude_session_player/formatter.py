@@ -5,6 +5,25 @@ from __future__ import annotations
 from .models import AssistantText, ScreenState, SystemOutput, ToolCall, UserMessage
 
 
+def truncate_result(text: str, max_lines: int = 5) -> str:
+    """Truncate tool result to max_lines. Add … if truncated.
+
+    Args:
+        text: The tool result text to truncate.
+        max_lines: Maximum number of lines to show. Defaults to 5.
+
+    Returns:
+        The truncated text with … on the last line if truncated,
+        or "(no output)" if text is empty.
+    """
+    if not text:
+        return "(no output)"
+    lines = text.split("\n")
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[: max_lines - 1]) + "\n…"
+
+
 def format_user_text(text: str) -> str:
     """Format user input text with ❯ prompt prefix.
 
@@ -48,7 +67,11 @@ def format_element(element: object) -> str:
             line += f"\n  \u2514 {element.progress_text}"
         if element.result is not None:
             prefix = "  \u2717 " if element.is_error else "  \u2514 "
-            line += f"\n{prefix}{element.result}"
+            result_lines = element.result.split("\n")
+            line += f"\n{prefix}{result_lines[0]}"
+            # Subsequent lines indented with 4 spaces to align with text after └/✗
+            for result_line in result_lines[1:]:
+                line += f"\n    {result_line}"
         return line
     return ""
 
