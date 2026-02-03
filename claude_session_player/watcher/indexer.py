@@ -4,6 +4,9 @@ This module provides:
 - SessionIndexer: Scans directories for session files and builds a searchable index
 - Path encoding/decoding: Handles Claude Code's project path encoding scheme
 - Metadata extraction: Extracts summaries and line counts from session files
+
+The indexer uses SearchDatabase (SQLite) for persistent storage, providing
+efficient incremental updates via mtime tracking and full-text search capabilities.
 """
 
 from __future__ import annotations
@@ -13,9 +16,19 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from claude_session_player.watcher.search_db import (
+        IndexedSession,
+        SearchDatabase,
+        SearchFilters,
+        SearchResult,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -735,3 +748,437 @@ class SessionIndexer:
                 or session_info.modified_at > project.latest_modified_at
             ):
                 project.latest_modified_at = session_info.modified_at
+
+
+# ---------------------------------------------------------------------------
+# SQLiteSessionIndexer - SearchDatabase-backed indexer
+# ---------------------------------------------------------------------------
+
+
+class SQLiteSessionIndexer:
+    """Indexes sessions from .claude/projects directories using SQLite.
+
+    This indexer uses SearchDatabase for persistent storage instead of JSON,
+    providing efficient incremental updates via mtime tracking and full-text
+    search capabilities.
+
+    The database is a CACHE - it can be fully rebuilt from session files at
+    any time. The source of truth is the session .jsonl files on disk.
+
+    Usage:
+        indexer = SQLiteSessionIndexer(
+            paths=[Path("~/.claude/projects")],
+            state_dir=Path("~/.claude-session-player/state"),
+            config=IndexConfig()
+        )
+        await indexer.initialize()
+
+        # Build full index (first time or rebuild)
+        count = await indexer.build_full_index()
+
+        # Incremental update (subsequent runs)
+        added, updated, removed = await indexer.incremental_update()
+
+        # Search
+        results, total = await indexer.search(SearchFilters(query="auth"))
+
+        await indexer.close()
+    """
+
+    def __init__(
+        self,
+        paths: list[Path],
+        state_dir: Path,
+        config: IndexConfig | None = None,
+    ) -> None:
+        """Initialize the SQLite-backed indexer.
+
+        Args:
+            paths: List of directories to scan for projects (e.g., ~/.claude/projects).
+            state_dir: Directory for the SQLite database.
+            config: Indexer configuration. Uses defaults if not provided.
+        """
+        self.paths = [Path(p).expanduser().resolve() for p in paths]
+        self.config = config or IndexConfig()
+        self.state_dir = Path(state_dir).expanduser().resolve()
+
+        # Lazy import to avoid circular dependency
+        from claude_session_player.watcher.search_db import SearchDatabase
+
+        self.db = SearchDatabase(self.state_dir)
+        self._initialized = False
+
+    async def initialize(self) -> None:
+        """Initialize the indexer and database.
+
+        Creates the state directory if needed, initializes the database
+        with schema, and sets up FTS5 if available.
+        """
+        await self.db.safe_initialize()
+        self._initialized = True
+        logger.info(f"SQLiteSessionIndexer initialized with {len(self.paths)} paths")
+
+    async def close(self) -> None:
+        """Close database connection."""
+        await self.db.close()
+        self._initialized = False
+
+    # ================================================================
+    # Index Building
+    # ================================================================
+
+    async def build_full_index(self) -> int:
+        """Full rebuild of the search index.
+
+        Clears all existing data and re-indexes all session files
+        from configured directories.
+
+        Returns:
+            Number of sessions indexed.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        await self.db.clear_all()
+
+        count = 0
+        batch: list[IndexedSession] = []
+        batch_mtimes: list[tuple[str, int]] = []  # (file_path, mtime_ns) pairs
+        batch_size = 100
+
+        for projects_dir in self.paths:
+            async for session in self._scan_directory(projects_dir):
+                batch.append(session)
+                # Store mtime for incremental updates
+                try:
+                    mtime_ns = Path(session.file_path).stat().st_mtime_ns
+                    batch_mtimes.append((session.file_path, mtime_ns))
+                except OSError:
+                    pass
+
+                if len(batch) >= batch_size:
+                    await self.db.upsert_sessions_batch(batch)
+                    # Store mtimes for all sessions in batch
+                    for file_path, mtime_ns in batch_mtimes:
+                        await self.db.set_file_mtime(file_path, mtime_ns)
+                    count += len(batch)
+                    batch = []
+                    batch_mtimes = []
+
+        if batch:
+            await self.db.upsert_sessions_batch(batch)
+            for file_path, mtime_ns in batch_mtimes:
+                await self.db.set_file_mtime(file_path, mtime_ns)
+            count += len(batch)
+
+        await self.db._set_metadata("last_full_index", datetime.now(timezone.utc).isoformat())
+
+        logger.info(f"Full index complete: {count} sessions indexed")
+        return count
+
+    async def incremental_update(self) -> tuple[int, int, int]:
+        """Incremental update based on file mtimes.
+
+        Only processes new or modified files. Removes entries for
+        deleted files.
+
+        Returns:
+            Tuple of (added, updated, removed) counts.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        added = updated = removed = 0
+        indexed_paths = await self.db.get_all_indexed_paths()
+        current_paths: set[str] = set()
+
+        for projects_dir in self.paths:
+            async for session in self._scan_directory(projects_dir):
+                file_path = session.file_path
+                current_paths.add(file_path)
+
+                stored_mtime = await self.db.get_file_mtime(file_path)
+                try:
+                    current_mtime = Path(file_path).stat().st_mtime_ns
+                except OSError:
+                    continue
+
+                if stored_mtime is None:
+                    # New file
+                    await self.db.upsert_session(session)
+                    await self.db.set_file_mtime(file_path, current_mtime)
+                    added += 1
+                elif stored_mtime != current_mtime:
+                    # Modified file
+                    await self.db.upsert_session(session)
+                    await self.db.set_file_mtime(file_path, current_mtime)
+                    updated += 1
+
+        # Remove deleted files
+        for path in indexed_paths - current_paths:
+            session = await self.db.get_session_by_path(path)
+            if session:
+                await self.db.delete_session(session.session_id)
+                removed += 1
+
+        await self.db._set_metadata(
+            "last_incremental_index", datetime.now(timezone.utc).isoformat()
+        )
+
+        logger.debug(f"Incremental update: +{added}, ~{updated}, -{removed}")
+        return added, updated, removed
+
+    # ================================================================
+    # Directory Scanning
+    # ================================================================
+
+    async def _scan_directory(self, projects_dir: Path) -> AsyncIterator[IndexedSession]:
+        """Scan a projects directory for session files.
+
+        Yields IndexedSession objects for each valid session file found.
+
+        Args:
+            projects_dir: Directory containing project subdirectories.
+
+        Yields:
+            IndexedSession for each valid session file.
+        """
+        if not projects_dir.exists():
+            logger.warning(f"Index path does not exist: {projects_dir}")
+            return
+
+        if not projects_dir.is_dir():
+            logger.warning(f"Index path is not a directory: {projects_dir}")
+            return
+
+        try:
+            for project_dir in projects_dir.iterdir():
+                if not project_dir.is_dir():
+                    continue
+                if project_dir.name.startswith("."):
+                    continue
+
+                project_encoded = project_dir.name
+                project_path = decode_project_path(project_encoded)
+                project_display_name = get_display_name(project_path)
+
+                # Main session files
+                for session_file in project_dir.glob("*.jsonl"):
+                    if self._should_skip(session_file):
+                        continue
+
+                    session = await self._index_session_file(
+                        session_file,
+                        project_encoded,
+                        project_display_name,
+                        project_path,
+                        is_subagent=False,
+                    )
+                    if session:
+                        # Check for subagents
+                        subagents_dir = project_dir / session.session_id / "subagents"
+                        if subagents_dir.exists():
+                            # Create a new session with has_subagents=True
+                            from claude_session_player.watcher.search_db import IndexedSession
+
+                            session = IndexedSession(
+                                session_id=session.session_id,
+                                project_encoded=session.project_encoded,
+                                project_display_name=session.project_display_name,
+                                project_path=session.project_path,
+                                summary=session.summary,
+                                file_path=session.file_path,
+                                file_created_at=session.file_created_at,
+                                file_modified_at=session.file_modified_at,
+                                indexed_at=session.indexed_at,
+                                size_bytes=session.size_bytes,
+                                line_count=session.line_count,
+                                duration_ms=session.duration_ms,
+                                has_subagents=True,
+                                is_subagent=session.is_subagent,
+                            )
+                        yield session
+
+                # Subagent sessions (if configured)
+                if self.config.include_subagents:
+                    for subagent_file in project_dir.glob("*/subagents/*.jsonl"):
+                        if self._should_skip(subagent_file):
+                            continue
+
+                        session = await self._index_session_file(
+                            subagent_file,
+                            project_encoded,
+                            project_display_name,
+                            project_path,
+                            is_subagent=True,
+                        )
+                        if session:
+                            yield session
+
+        except OSError as e:
+            logger.warning(f"Error scanning {projects_dir}: {e}")
+
+    async def _index_session_file(
+        self,
+        file_path: Path,
+        project_encoded: str,
+        project_display_name: str,
+        project_path: str,
+        is_subagent: bool,
+    ) -> IndexedSession | None:
+        """Extract metadata from a session file.
+
+        Args:
+            file_path: Path to the session JSONL file.
+            project_encoded: The encoded project directory name.
+            project_display_name: The human-readable project name.
+            project_path: The decoded project path.
+            is_subagent: Whether this is a subagent session.
+
+        Returns:
+            IndexedSession if successful, None on error.
+        """
+        from claude_session_player.watcher.search_db import IndexedSession
+
+        try:
+            stat = file_path.stat()
+            summary, line_count = extract_session_metadata(file_path)
+
+            # Get file timestamps
+            try:
+                # Try to get creation time (birth time) - macOS
+                created_at = datetime.fromtimestamp(
+                    getattr(stat, "st_birthtime", stat.st_mtime), tz=timezone.utc
+                )
+            except (AttributeError, OSError):
+                # Fallback to mtime if birthtime not available (Linux)
+                created_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+
+            return IndexedSession(
+                session_id=file_path.stem,
+                project_encoded=project_encoded,
+                project_display_name=project_display_name,
+                project_path=project_path,
+                summary=summary,
+                file_path=str(file_path),
+                file_created_at=created_at,
+                file_modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+                indexed_at=datetime.now(timezone.utc),
+                size_bytes=stat.st_size,
+                line_count=line_count,
+                duration_ms=None,  # Computed lazily when needed
+                has_subagents=False,  # Updated after scan for main sessions
+                is_subagent=is_subagent,
+            )
+        except OSError as e:
+            logger.warning(f"Failed to index {file_path}: {e}")
+            return None
+
+    def _should_skip(self, file_path: Path) -> bool:
+        """Check if file should be skipped during indexing.
+
+        Args:
+            file_path: Path to the file.
+
+        Returns:
+            True if the file should be skipped.
+        """
+        # Skip hidden files
+        if file_path.name.startswith("."):
+            return True
+        # Skip temp files
+        if file_path.suffix == ".tmp":
+            return True
+        # Skip files that don't end in .jsonl
+        if file_path.suffix != ".jsonl":
+            return True
+        return False
+
+    # ================================================================
+    # Session Retrieval
+    # ================================================================
+
+    async def get_session(self, session_id: str) -> IndexedSession | None:
+        """Get a session by ID.
+
+        Args:
+            session_id: The session identifier.
+
+        Returns:
+            IndexedSession if found, None otherwise.
+        """
+        return await self.db.get_session(session_id)
+
+    # ================================================================
+    # Search Delegation
+    # ================================================================
+
+    async def search(
+        self,
+        filters: SearchFilters,
+        sort: str = "recent",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[IndexedSession], int]:
+        """Search sessions with filters.
+
+        Delegates to SearchDatabase.search().
+
+        Args:
+            filters: Search filters to apply.
+            sort: Sort order (recent, oldest, size, duration, name).
+            limit: Maximum number of results.
+            offset: Number of results to skip.
+
+        Returns:
+            Tuple of (list of sessions, total count).
+        """
+        return await self.db.search(filters, sort=sort, limit=limit, offset=offset)
+
+    async def search_ranked(
+        self,
+        filters: SearchFilters,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> tuple[list[SearchResult], int]:
+        """Search sessions with relevance ranking.
+
+        Delegates to SearchDatabase.search_ranked().
+
+        Args:
+            filters: Search filters to apply.
+            limit: Maximum number of results.
+            offset: Number of results to skip.
+
+        Returns:
+            Tuple of (list of ranked results, total count).
+        """
+        return await self.db.search_ranked(filters, limit=limit, offset=offset)
+
+    async def get_projects(
+        self,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[dict]:
+        """Get all projects with session counts.
+
+        Delegates to SearchDatabase.get_projects().
+
+        Args:
+            since: Only include sessions modified after this date.
+            until: Only include sessions modified before this date.
+
+        Returns:
+            List of project dicts with aggregated statistics.
+        """
+        return await self.db.get_projects(since=since, until=until)
+
+    async def get_stats(self) -> dict:
+        """Get index statistics.
+
+        Delegates to SearchDatabase.get_stats().
+
+        Returns:
+            Dict with index statistics.
+        """
+        return await self.db.get_stats()

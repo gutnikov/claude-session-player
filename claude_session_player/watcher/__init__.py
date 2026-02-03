@@ -22,6 +22,7 @@ from claude_session_player.watcher.search_db import (
     SearchFilters,
     SearchResult,
 )
+from claude_session_player.watcher.indexer import SQLiteSessionIndexer
 from claude_session_player.watcher.debouncer import MessageDebouncer, PendingUpdate
 from claude_session_player.watcher.deps import check_slack_available, check_telegram_available
 from claude_session_player.watcher.destinations import AttachedDestination, DestinationManager
@@ -148,6 +149,7 @@ __all__ = [
     "SearchDatabase",
     "SearchFilters",
     "SearchResult",
+    "SQLiteSessionIndexer",
     "WatcherAPI",
     "WatcherService",
     "transform",
