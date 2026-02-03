@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from claude_session_player.watcher.api import WatcherAPI
 from claude_session_player.watcher.config import ConfigManager, SessionConfig
 from claude_session_player.watcher.event_buffer import EventBuffer, EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher, IncrementalReader
@@ -20,5 +21,6 @@ __all__ = [
     "SSEConnection",
     "SSEManager",
     "StateManager",
+    "WatcherAPI",
     "transform",
 ]
