@@ -3,6 +3,7 @@
 This module provides the main orchestration service that wires together:
 - ConfigManager: persistent session configuration
 - StateManager: processing state persistence
+- DestinationManager: messaging destination lifecycle
 - FileWatcher: file change detection
 - Transformer: line-to-event processing
 - EventBufferManager: per-session event buffering
@@ -23,6 +24,7 @@ from aiohttp import web
 from claude_session_player.events import ProcessingContext
 from claude_session_player.watcher.api import WatcherAPI
 from claude_session_player.watcher.config import ConfigManager
+from claude_session_player.watcher.destinations import DestinationManager
 from claude_session_player.watcher.event_buffer import EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher
 from claude_session_player.watcher.sse import SSEManager
@@ -49,6 +51,7 @@ class WatcherService:
     # Injected components (for testability)
     config_manager: ConfigManager | None = None
     state_manager: StateManager | None = None
+    destination_manager: DestinationManager | None = None
     file_watcher: FileWatcher | None = None
     event_buffer: EventBufferManager | None = None
     sse_manager: SSEManager | None = None
@@ -84,11 +87,17 @@ class WatcherService:
                 on_file_deleted_callback=self._on_file_deleted,
             )
 
+        if self.destination_manager is None:
+            self.destination_manager = DestinationManager(
+                _config=self.config_manager,
+                _on_session_start=self._on_destination_session_start,
+                _on_session_stop=self._on_destination_session_stop,
+            )
+
         if self.api is None:
             self.api = WatcherAPI(
                 config_manager=self.config_manager,
-                state_manager=self.state_manager,
-                file_watcher=self.file_watcher,
+                destination_manager=self.destination_manager,
                 event_buffer=self.event_buffer,
                 sse_manager=self.sse_manager,
             )
@@ -167,6 +176,10 @@ class WatcherService:
         # Save all session states
         await self._save_all_states()
         logger.info("All states saved")
+
+        # Shutdown destination manager (cancel keep-alive tasks)
+        await self.destination_manager.shutdown()
+        logger.info("Destination manager shutdown")
 
         # Close all SSE connections (send session_ended)
         sessions = self.config_manager.list_all()
@@ -411,3 +424,51 @@ class WatcherService:
             self.config_manager.remove(session_id)
         except KeyError:
             pass
+
+    async def _on_destination_session_start(self, session_id: str, path: Path) -> None:
+        """Handle session start callback from DestinationManager.
+
+        Called when the first destination is attached to a session.
+        Starts file watching for the session.
+
+        Args:
+            session_id: The session to start watching.
+            path: Path to the session JSONL file.
+        """
+        logger.info(f"Starting file watching for session: {session_id}")
+
+        # Add to config if not already present
+        if self.config_manager.get(session_id) is None:
+            self.config_manager.add(session_id, path)
+
+        # Add to file watcher (start from end of file)
+        file_size = path.stat().st_size
+        self.file_watcher.add(session_id, path, start_position=file_size)
+
+        # Process initial lines for context
+        await self.file_watcher.process_initial(session_id, last_n_lines=3)
+
+    async def _on_destination_session_stop(self, session_id: str) -> None:
+        """Handle session stop callback from DestinationManager.
+
+        Called when the keep-alive timer expires after the last destination
+        detaches from a session. Stops file watching and cleans up.
+
+        Args:
+            session_id: The session to stop watching.
+        """
+        logger.info(f"Stopping file watching for session: {session_id}")
+
+        # Emit session_ended event to SSE subscribers
+        await self.sse_manager.close_session(session_id, reason="no_destinations")
+
+        # Remove from file watcher
+        self.file_watcher.remove(session_id)
+
+        # Remove event buffer
+        self.event_buffer.remove_buffer(session_id)
+
+        # Delete state file
+        self.state_manager.delete(session_id)
+
+        # Note: config is not removed - session info persists
