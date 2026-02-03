@@ -77,14 +77,20 @@ class BotConfig:
 
     telegram_token: str | None = None
     slack_token: str | None = None
+    slack_signing_secret: str | None = None
 
     def to_dict(self) -> dict:
         """Serialize to dict for YAML storage."""
         result: dict = {}
         if self.telegram_token is not None:
             result["telegram"] = {"token": self.telegram_token}
-        if self.slack_token is not None:
-            result["slack"] = {"token": self.slack_token}
+        if self.slack_token is not None or self.slack_signing_secret is not None:
+            slack_config: dict = {}
+            if self.slack_token is not None:
+                slack_config["token"] = self.slack_token
+            if self.slack_signing_secret is not None:
+                slack_config["signing_secret"] = self.slack_signing_secret
+            result["slack"] = slack_config
         return result
 
     @classmethod
@@ -92,13 +98,19 @@ class BotConfig:
         """Deserialize from dict."""
         telegram_token = None
         slack_token = None
+        slack_signing_secret = None
 
         if "telegram" in data and data["telegram"]:
             telegram_token = data["telegram"].get("token")
         if "slack" in data and data["slack"]:
             slack_token = data["slack"].get("token")
+            slack_signing_secret = data["slack"].get("signing_secret")
 
-        return cls(telegram_token=telegram_token, slack_token=slack_token)
+        return cls(
+            telegram_token=telegram_token,
+            slack_token=slack_token,
+            slack_signing_secret=slack_signing_secret,
+        )
 
 
 # ---------------------------------------------------------------------------
