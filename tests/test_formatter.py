@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from claude_session_player.formatter import (
     format_assistant_text,
+    format_duration,
     format_element,
     format_user_text,
     to_markdown,
@@ -15,6 +16,7 @@ from claude_session_player.models import (
     SystemOutput,
     ThinkingIndicator,
     ToolCall,
+    TurnDuration,
     UserMessage,
 )
 
@@ -119,8 +121,25 @@ class TestFormatElement:
         elem = SystemOutput(text="some output")
         assert format_element(elem) == "some output"
 
-    def test_unknown_element(self) -> None:
+    def test_thinking_indicator(self) -> None:
         elem = ThinkingIndicator()
+        assert format_element(elem) == "\u2731 Thinking\u2026"
+
+    def test_thinking_indicator_with_request_id(self) -> None:
+        elem = ThinkingIndicator(request_id="req_001")
+        assert format_element(elem) == "\u2731 Thinking\u2026"
+
+    def test_turn_duration_seconds(self) -> None:
+        elem = TurnDuration(duration_ms=5000)
+        assert format_element(elem) == "\u2731 Crunched for 5s"
+
+    def test_turn_duration_minutes(self) -> None:
+        elem = TurnDuration(duration_ms=88947)
+        assert format_element(elem) == "\u2731 Crunched for 1m 28s"
+
+    def test_unknown_element(self) -> None:
+        # Use a simple object not in the known element types
+        elem = object()
         assert format_element(elem) == ""
 
     def test_assistant_text(self) -> None:
@@ -350,3 +369,40 @@ class TestToMarkdownRequestIdGrouping:
         )
         result = to_markdown(state)
         assert result == "\u25cf checking\n\u25cf Bash(ls)"
+
+    def test_thinking_and_text_same_rid_no_blank(self) -> None:
+        """ThinkingIndicator + AssistantText with same requestId: no blank line."""
+        state = ScreenState(
+            elements=[
+                ThinkingIndicator(request_id="req_001"),
+                AssistantText(text="\u25cf response", request_id="req_001"),
+            ]
+        )
+        result = to_markdown(state)
+        assert result == "\u2731 Thinking\u2026\n\u25cf response"
+
+
+class TestFormatDuration:
+    """Tests for format_duration."""
+
+    def test_zero_ms(self) -> None:
+        assert format_duration(0) == "0s"
+
+    def test_five_seconds(self) -> None:
+        assert format_duration(5000) == "5s"
+
+    def test_fifty_nine_seconds(self) -> None:
+        assert format_duration(59999) == "59s"
+
+    def test_sixty_seconds(self) -> None:
+        assert format_duration(60000) == "1m 0s"
+
+    def test_one_minute_five_seconds(self) -> None:
+        assert format_duration(65000) == "1m 5s"
+
+    def test_two_minutes_zero_seconds(self) -> None:
+        assert format_duration(120000) == "2m 0s"
+
+    def test_real_example_88947ms(self) -> None:
+        """88947ms = 88.947s → 1m 28s."""
+        assert format_duration(88947) == "1m 28s"

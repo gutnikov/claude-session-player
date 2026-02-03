@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from claude_session_player.models import AssistantText, ScreenState, SystemOutput, ToolCall, UserMessage
+from claude_session_player.models import AssistantText, ScreenState, SystemOutput, ThinkingIndicator, ToolCall, TurnDuration, UserMessage
 from claude_session_player.renderer import render
 
 
@@ -317,9 +317,9 @@ class TestRenderIntegration:
         assert "❯ hello world" in md
         assert "git status output here" in md
 
-    def test_unhandled_types_pass(self, empty_state: ScreenState, thinking_line: dict) -> None:
-        """Unhandled types (e.g., THINKING) don't crash and don't add elements."""
-        result = render(empty_state, thinking_line)
+    def test_unhandled_types_pass(self, empty_state: ScreenState, system_local_command_line: dict) -> None:
+        """Invisible types (system local_command) don't crash and don't add elements."""
+        result = render(empty_state, system_local_command_line)
         assert result is empty_state
         assert len(result.elements) == 0
 
@@ -1008,3 +1008,158 @@ class TestRenderToolResultFullFlow:
             "\u25cf Bash(cmd Y)\n  \u2514 Y output"
         )
         assert md == expected
+
+
+class TestRenderThinking:
+    """Tests for rendering thinking blocks."""
+
+    def test_thinking_block_creates_element(self, empty_state: ScreenState, thinking_line: dict) -> None:
+        result = render(empty_state, thinking_line)
+        assert len(result.elements) == 1
+        assert isinstance(result.elements[0], ThinkingIndicator)
+
+    def test_thinking_block_has_request_id(self, empty_state: ScreenState, thinking_line: dict) -> None:
+        render(empty_state, thinking_line)
+        assert empty_state.elements[0].request_id == "req_001"
+
+    def test_thinking_sets_current_request_id(self, empty_state: ScreenState, thinking_line: dict) -> None:
+        render(empty_state, thinking_line)
+        assert empty_state.current_request_id == "req_001"
+
+    def test_thinking_markdown_output(self, empty_state: ScreenState, thinking_line: dict) -> None:
+        render(empty_state, thinking_line)
+        md = empty_state.to_markdown()
+        assert md == "\u2731 Thinking\u2026"
+
+    def test_thinking_then_text_same_rid_no_blank(self, empty_state: ScreenState) -> None:
+        """Thinking → text with same requestId → no blank line between."""
+        thinking = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "Let me think..."}],
+            },
+        }
+        text = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Here is my answer."}],
+            },
+        }
+        render(empty_state, thinking)
+        render(empty_state, text)
+        md = empty_state.to_markdown()
+        assert md == "\u2731 Thinking\u2026\n\u25cf Here is my answer."
+
+
+class TestRenderTurnDuration:
+    """Tests for rendering turn_duration system messages."""
+
+    def test_turn_duration_creates_element(self, empty_state: ScreenState, turn_duration_line: dict) -> None:
+        result = render(empty_state, turn_duration_line)
+        assert len(result.elements) == 1
+        assert isinstance(result.elements[0], TurnDuration)
+        assert result.elements[0].duration_ms == 12500
+
+    def test_turn_duration_resets_request_id(self, turn_duration_line: dict) -> None:
+        state = ScreenState(current_request_id="req_old")
+        render(state, turn_duration_line)
+        assert state.current_request_id is None
+
+    def test_turn_duration_markdown_seconds(self, empty_state: ScreenState) -> None:
+        line = {"type": "system", "subtype": "turn_duration", "durationMs": 5000}
+        render(empty_state, line)
+        md = empty_state.to_markdown()
+        assert md == "\u2731 Crunched for 5s"
+
+    def test_turn_duration_markdown_minutes(self, empty_state: ScreenState) -> None:
+        line = {"type": "system", "subtype": "turn_duration", "durationMs": 88947}
+        render(empty_state, line)
+        md = empty_state.to_markdown()
+        assert md == "\u2731 Crunched for 1m 28s"
+
+    def test_user_assistant_turn_duration_flow(self, empty_state: ScreenState) -> None:
+        """User → assistant → turn_duration → correct markdown spacing."""
+        user = {
+            "type": "user",
+            "isMeta": False,
+            "message": {"role": "user", "content": "hello"},
+        }
+        assistant = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "world"}],
+            },
+        }
+        turn_dur = {"type": "system", "subtype": "turn_duration", "durationMs": 3500}
+        render(empty_state, user)
+        render(empty_state, assistant)
+        render(empty_state, turn_dur)
+        md = empty_state.to_markdown()
+        expected = "\u276f hello\n\n\u25cf world\n\n\u2731 Crunched for 3s"
+        assert md == expected
+
+
+class TestRenderCompactBoundary:
+    """Tests for rendering compact_boundary system messages."""
+
+    def test_compact_boundary_clears_elements(self, compact_boundary_line: dict) -> None:
+        state = ScreenState(elements=[UserMessage(text="\u276f old msg")])
+        render(state, compact_boundary_line)
+        assert len(state.elements) == 0
+
+    def test_compact_boundary_clears_tool_calls(self, compact_boundary_line: dict) -> None:
+        state = ScreenState(tool_calls={"toolu_001": 0})
+        render(state, compact_boundary_line)
+        assert len(state.tool_calls) == 0
+
+    def test_compact_boundary_resets_request_id(self, compact_boundary_line: dict) -> None:
+        state = ScreenState(current_request_id="req_old")
+        render(state, compact_boundary_line)
+        assert state.current_request_id is None
+
+    def test_messages_after_compact_boundary_rendered(self, empty_state: ScreenState, compact_boundary_line: dict) -> None:
+        """State with elements → compact_boundary → user → only user in output."""
+        # First add some state
+        old_user = {
+            "type": "user",
+            "isMeta": False,
+            "message": {"role": "user", "content": "old question"},
+        }
+        render(empty_state, old_user)
+        assert len(empty_state.elements) == 1
+
+        # Compact boundary clears everything
+        render(empty_state, compact_boundary_line)
+        assert len(empty_state.elements) == 0
+
+        # New user message after compaction
+        new_user = {
+            "type": "user",
+            "isMeta": False,
+            "message": {"role": "user", "content": "new question"},
+        }
+        render(empty_state, new_user)
+        assert len(empty_state.elements) == 1
+        md = empty_state.to_markdown()
+        assert md == "\u276f new question"
+
+    def test_full_state_cleared_by_compact_boundary(self, compact_boundary_line: dict) -> None:
+        """Complex state with elements, tool_calls, request_id → all cleared."""
+        state = ScreenState(
+            elements=[
+                UserMessage(text="\u276f q"),
+                AssistantText(text="\u25cf a", request_id="req_001"),
+            ],
+            tool_calls={"toolu_A": 0, "toolu_B": 1},
+            current_request_id="req_001",
+        )
+        render(state, compact_boundary_line)
+        assert state.elements == []
+        assert state.tool_calls == {}
+        assert state.current_request_id is None
