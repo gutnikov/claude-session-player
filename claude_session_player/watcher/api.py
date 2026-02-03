@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,6 +21,9 @@ if TYPE_CHECKING:
     from claude_session_player.watcher.destinations import DestinationManager
     from claude_session_player.watcher.event_buffer import EventBufferManager
     from claude_session_player.watcher.sse import SSEManager
+
+# Type alias for replay callback
+ReplayCallback = Callable[[str, str, str, int], Awaitable[int]]
 
 
 @dataclass
@@ -35,6 +39,9 @@ class WatcherAPI:
     destination_manager: DestinationManager
     event_buffer: EventBufferManager
     sse_manager: SSEManager
+
+    # Optional callback for replaying events (injected by WatcherService)
+    replay_callback: ReplayCallback | None = None
 
     _start_time: float = field(default_factory=time.time, repr=False)
 
@@ -249,7 +256,13 @@ class WatcherAPI:
         Returns:
             Number of events actually replayed.
         """
-        # Get events from buffer
+        # Use callback if provided (injected by WatcherService)
+        if self.replay_callback:
+            return await self.replay_callback(
+                session_id, destination_type, identifier, count
+            )
+
+        # Fallback: just count available events without sending
         buffer = self.event_buffer.get_buffer(session_id)
         events = buffer.get_since(None)
 
@@ -257,8 +270,6 @@ class WatcherAPI:
         if len(events) > count:
             events = events[-count:]
 
-        # TODO: In issue #76, this will be integrated with MessageStateTracker
-        # to properly format and send replay messages. For now, just return count.
         return len(events)
 
     async def handle_detach(self, request: web.Request) -> web.Response:

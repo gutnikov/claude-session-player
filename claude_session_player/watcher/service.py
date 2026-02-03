@@ -9,6 +9,10 @@ This module provides the main orchestration service that wires together:
 - EventBufferManager: per-session event buffering
 - SSEManager: SSE event broadcasting
 - WatcherAPI: HTTP API endpoints
+- TelegramPublisher: Telegram Bot API integration
+- SlackPublisher: Slack Web API integration
+- MessageStateTracker: turn-based message grouping
+- MessageDebouncer: rate-limiting message updates
 """
 
 from __future__ import annotations
@@ -21,14 +25,23 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
-from claude_session_player.events import ProcessingContext
+from claude_session_player.events import Event, ProcessingContext
 from claude_session_player.watcher.api import WatcherAPI
 from claude_session_player.watcher.config import ConfigManager
-from claude_session_player.watcher.destinations import DestinationManager
+from claude_session_player.watcher.debouncer import MessageDebouncer
+from claude_session_player.watcher.destinations import AttachedDestination, DestinationManager
 from claude_session_player.watcher.event_buffer import EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher
+from claude_session_player.watcher.message_state import (
+    MessageStateTracker,
+    NoAction,
+    SendNewMessage,
+    UpdateExistingMessage,
+)
+from claude_session_player.watcher.slack_publisher import SlackError, SlackPublisher
 from claude_session_player.watcher.sse import SSEManager
 from claude_session_player.watcher.state import SessionState, StateManager
+from claude_session_player.watcher.telegram_publisher import TelegramError, TelegramPublisher
 from claude_session_player.watcher.transformer import transform
 
 if TYPE_CHECKING:
@@ -42,7 +55,8 @@ class WatcherService:
     """Main service orchestrating all watcher components.
 
     Handles lifecycle management (startup, shutdown) and event flow coordination
-    between file watcher, transformer, event buffer, and SSE manager.
+    between file watcher, transformer, event buffer, SSE manager, and messaging
+    publishers (Telegram, Slack).
     """
 
     config_path: Path
@@ -56,6 +70,12 @@ class WatcherService:
     event_buffer: EventBufferManager | None = None
     sse_manager: SSEManager | None = None
     api: WatcherAPI | None = None
+
+    # Messaging components (optional, created based on bot config)
+    telegram_publisher: TelegramPublisher | None = None
+    slack_publisher: SlackPublisher | None = None
+    message_state: MessageStateTracker | None = None
+    message_debouncer: MessageDebouncer | None = None
 
     # HTTP server config
     host: str = "127.0.0.1"
@@ -94,12 +114,29 @@ class WatcherService:
                 _on_session_stop=self._on_destination_session_stop,
             )
 
+        # Initialize messaging components based on bot config
+        bot_config = self.config_manager.get_bot_config()
+
+        if self.telegram_publisher is None and bot_config.telegram_token:
+            self.telegram_publisher = TelegramPublisher(token=bot_config.telegram_token)
+
+        if self.slack_publisher is None and bot_config.slack_token:
+            self.slack_publisher = SlackPublisher(token=bot_config.slack_token)
+
+        # Always create message state and debouncer (they work without publishers)
+        if self.message_state is None:
+            self.message_state = MessageStateTracker()
+
+        if self.message_debouncer is None:
+            self.message_debouncer = MessageDebouncer()
+
         if self.api is None:
             self.api = WatcherAPI(
                 config_manager=self.config_manager,
                 destination_manager=self.destination_manager,
                 event_buffer=self.event_buffer,
                 sse_manager=self.sse_manager,
+                replay_callback=self.replay_to_destination,
             )
 
     @property
@@ -116,8 +153,9 @@ class WatcherService:
            - Load state (or create fresh if missing/corrupt)
            - Validate file exists (remove from config if not)
            - Add to FileWatcher with saved position
-        3. Start FileWatcher
-        4. Start HTTP server
+        3. Restore messaging destinations from config
+        4. Start FileWatcher
+        5. Start HTTP server
         """
         if self._running:
             logger.warning("Service already running")
@@ -127,6 +165,10 @@ class WatcherService:
 
         # Load existing config and resume sessions
         await self._load_and_resume_sessions()
+
+        # Restore messaging destinations from config
+        await self.destination_manager.restore_from_config()
+        logger.info("Messaging destinations restored from config")
 
         # Start file watcher
         await self.file_watcher.start()
@@ -147,11 +189,13 @@ class WatcherService:
 
         Shutdown sequence:
         1. Stop accepting new HTTP connections
-        2. Stop FileWatcher
-        3. Save all session states
-        4. Send session_ended to all SSE clients
-        5. Close all SSE connections
-        6. Exit
+        2. Flush pending message updates
+        3. Close messaging publishers
+        4. Stop FileWatcher
+        5. Save all session states
+        6. Send session_ended to all SSE clients
+        7. Close all SSE connections
+        8. Exit
         """
         if not self._running:
             return
@@ -168,6 +212,20 @@ class WatcherService:
             self._runner = None
 
         logger.info("HTTP server stopped")
+
+        # Flush pending message updates
+        if self.message_debouncer:
+            await self.message_debouncer.flush()
+            logger.info("Message debouncer flushed")
+
+        # Close messaging publishers
+        if self.telegram_publisher:
+            await self.telegram_publisher.close()
+            logger.info("Telegram publisher closed")
+
+        if self.slack_publisher:
+            await self.slack_publisher.close()
+            logger.info("Slack publisher closed")
 
         # Stop file watcher
         await self.file_watcher.stop()
@@ -354,6 +412,7 @@ class WatcherService:
         4. for event in events:
                EventBufferManager.add_event(session_id, event)
                SSEManager.broadcast(session_id, event_id, event)
+               Publish to messaging destinations
 
         Args:
             session_id: The session that changed.
@@ -391,10 +450,13 @@ class WatcherService:
         )
         self.state_manager.save(session_id, new_state)
 
-        # Buffer events and broadcast to SSE subscribers
+        # Buffer events and broadcast to SSE subscribers + messaging destinations
         for event in events:
             event_id = self.event_buffer.add_event(session_id, event)
             await self.sse_manager.broadcast(session_id, event_id, event)
+
+            # Publish to messaging destinations
+            await self._publish_to_messaging(session_id, event)
 
     async def _on_file_deleted(self, session_id: str) -> None:
         """Handle file deletion callback from FileWatcher.
@@ -459,6 +521,10 @@ class WatcherService:
         """
         logger.info(f"Stopping file watching for session: {session_id}")
 
+        # Clear message state for session
+        if self.message_state:
+            self.message_state.clear_session(session_id)
+
         # Emit session_ended event to SSE subscribers
         await self.sse_manager.close_session(session_id, reason="no_destinations")
 
@@ -472,3 +538,236 @@ class WatcherService:
         self.state_manager.delete(session_id)
 
         # Note: config is not removed - session info persists
+
+    # -------------------------------------------------------------------------
+    # Messaging Methods
+    # -------------------------------------------------------------------------
+
+    async def _publish_to_messaging(self, session_id: str, event: Event) -> None:
+        """Publish event to all attached messaging destinations.
+
+        Args:
+            session_id: The session identifier.
+            event: The event to publish.
+        """
+        if not self.destination_manager or not self.message_state:
+            return
+
+        destinations = self.destination_manager.get_destinations(session_id)
+        if not destinations:
+            return
+
+        # Determine action based on event
+        action = self.message_state.handle_event(session_id, event)
+
+        if isinstance(action, NoAction):
+            return
+
+        # Publish to each destination
+        for dest in destinations:
+            await self._publish_action_to_destination(session_id, dest, action)
+
+    async def _publish_action_to_destination(
+        self,
+        session_id: str,
+        destination: AttachedDestination,
+        action: SendNewMessage | UpdateExistingMessage,
+    ) -> None:
+        """Publish a message action to a single destination.
+
+        Args:
+            session_id: The session identifier.
+            destination: The destination to publish to.
+            action: The message action to perform.
+        """
+        if isinstance(action, SendNewMessage):
+            await self._send_new_message(session_id, destination, action)
+        elif isinstance(action, UpdateExistingMessage):
+            await self._update_message(session_id, destination, action)
+
+    async def _send_new_message(
+        self,
+        session_id: str,
+        destination: AttachedDestination,
+        action: SendNewMessage,
+    ) -> None:
+        """Send a new message to a destination.
+
+        Args:
+            session_id: The session identifier.
+            destination: The destination to send to.
+            action: The SendNewMessage action with content.
+        """
+        try:
+            if destination.type == "telegram" and self.telegram_publisher:
+                message_id = await self.telegram_publisher.send_message(
+                    chat_id=destination.identifier,
+                    text=action.content,
+                )
+                if self.message_state:
+                    self.message_state.record_message_id(
+                        session_id,
+                        action.turn_id,
+                        "telegram",
+                        destination.identifier,
+                        message_id,
+                    )
+
+            elif destination.type == "slack" and self.slack_publisher:
+                ts = await self.slack_publisher.send_message(
+                    channel=destination.identifier,
+                    text=action.text_fallback,
+                    blocks=action.blocks,
+                )
+                if self.message_state:
+                    self.message_state.record_message_id(
+                        session_id,
+                        action.turn_id,
+                        "slack",
+                        destination.identifier,
+                        ts,
+                    )
+
+        except (TelegramError, SlackError) as e:
+            logger.warning(f"Failed to send message to {destination}: {e}")
+
+    async def _update_message(
+        self,
+        session_id: str,
+        destination: AttachedDestination,
+        action: UpdateExistingMessage,
+    ) -> None:
+        """Update an existing message (debounced).
+
+        Args:
+            session_id: The session identifier.
+            destination: The destination to update.
+            action: The UpdateExistingMessage action with content.
+        """
+        if not self.message_state:
+            return
+
+        message_id = self.message_state.get_message_id(
+            session_id, action.turn_id, destination.type, destination.identifier
+        )
+
+        if not message_id:
+            # No existing message, send new instead
+            # (This can happen after restart)
+            await self._send_new_message(
+                session_id,
+                destination,
+                SendNewMessage(
+                    turn_id=action.turn_id,
+                    message_type="turn",
+                    content=action.content,
+                    blocks=action.blocks,
+                    text_fallback=action.text_fallback,
+                ),
+            )
+            return
+
+        # Schedule debounced update
+        async def do_update() -> None:
+            try:
+                if destination.type == "telegram" and self.telegram_publisher:
+                    await self.telegram_publisher.edit_message(
+                        chat_id=destination.identifier,
+                        message_id=int(message_id),
+                        text=action.content,
+                    )
+                elif destination.type == "slack" and self.slack_publisher:
+                    await self.slack_publisher.update_message(
+                        channel=destination.identifier,
+                        ts=str(message_id),
+                        text=action.text_fallback,
+                        blocks=action.blocks,
+                    )
+            except (TelegramError, SlackError) as e:
+                logger.warning(f"Failed to update message: {e}")
+
+        if self.message_debouncer:
+            await self.message_debouncer.schedule_update(
+                destination_type=destination.type,
+                identifier=destination.identifier,
+                message_id=str(message_id),
+                update_fn=do_update,
+                content=action,
+            )
+
+    async def replay_to_destination(
+        self,
+        session_id: str,
+        destination_type: str,
+        identifier: str,
+        count: int,
+    ) -> int:
+        """Replay recent events to a newly attached destination.
+
+        Args:
+            session_id: The session identifier.
+            destination_type: "telegram" or "slack".
+            identifier: chat_id for Telegram, channel for Slack.
+            count: Number of events to replay.
+
+        Returns:
+            Number of events replayed.
+        """
+        buffer = self.event_buffer.get_buffer(session_id)
+        events = buffer.get_since(None)
+
+        # Limit to requested count (take last N)
+        events_to_replay = events[-count:] if len(events) > count else events
+
+        if not events_to_replay or not self.message_state:
+            return 0
+
+        # Render as batched catch-up message
+        event_list = [e for _, e in events_to_replay]
+        content, blocks = self.message_state.render_replay(session_id, event_list)
+
+        if not content:
+            return 0
+
+        # Send catch-up message
+        try:
+            if destination_type == "telegram" and self.telegram_publisher:
+                await self.telegram_publisher.send_message(
+                    chat_id=identifier,
+                    text=content,
+                )
+            elif destination_type == "slack" and self.slack_publisher:
+                await self.slack_publisher.send_message(
+                    channel=identifier,
+                    text=f"Catching up ({len(events_to_replay)} events)",
+                    blocks=blocks,
+                )
+        except (TelegramError, SlackError) as e:
+            logger.warning(f"Failed to send replay: {e}")
+            return 0
+
+        return len(events_to_replay)
+
+    async def validate_destination(self, destination_type: str) -> None:
+        """Validate bot credentials for a destination type.
+
+        Args:
+            destination_type: "telegram" or "slack".
+
+        Raises:
+            TelegramError: If Telegram validation fails.
+            SlackError: If Slack validation fails.
+            ValueError: If destination type not configured.
+        """
+        from claude_session_player.watcher.telegram_publisher import TelegramAuthError
+        from claude_session_player.watcher.slack_publisher import SlackAuthError
+
+        if destination_type == "telegram":
+            if not self.telegram_publisher:
+                raise TelegramAuthError("Telegram bot token not configured")
+            await self.telegram_publisher.validate()
+
+        elif destination_type == "slack":
+            if not self.slack_publisher:
+                raise SlackAuthError("Slack bot token not configured")
+            await self.slack_publisher.validate()
