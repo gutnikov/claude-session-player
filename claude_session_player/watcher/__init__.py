@@ -6,10 +6,15 @@ from claude_session_player.watcher.api import WatcherAPI
 from claude_session_player.watcher.config import (
     BotConfig,
     ConfigManager,
+    IndexConfig,
+    SearchConfig,
     SessionConfig,
     SessionDestinations,
     SlackDestination,
     TelegramDestination,
+    apply_env_overrides,
+    expand_paths,
+    migrate_config,
 )
 from claude_session_player.watcher.debouncer import MessageDebouncer, PendingUpdate
 from claude_session_player.watcher.deps import check_slack_available, check_telegram_available
@@ -69,6 +74,7 @@ from claude_session_player.watcher.telegram_publisher import (
 from claude_session_player.watcher.transformer import transform
 
 __all__ = [
+    "apply_env_overrides",
     "AttachedDestination",
     "BotCommandDef",
     "BotConfig",
@@ -76,6 +82,9 @@ __all__ = [
     "check_slack_available",
     "check_telegram_available",
     "ConfigManager",
+    "expand_paths",
+    "IndexConfig",
+    "migrate_config",
     "delete_telegram_webhook",
     "DestinationManager",
     "MessageDebouncer",
@@ -101,6 +110,7 @@ __all__ = [
     "MessageAction",
     "MessageStateTracker",
     "NoAction",
+    "SearchConfig",
     "SendNewMessage",
     "SessionConfig",
     "SessionDestinations",

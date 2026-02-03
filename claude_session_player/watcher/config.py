@@ -6,6 +6,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -127,6 +128,85 @@ class BotConfig:
 
 
 # ---------------------------------------------------------------------------
+# IndexConfig dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IndexConfig:
+    """Configuration for session indexing."""
+
+    paths: list[str] = field(default_factory=lambda: ["~/.claude/projects"])
+    refresh_interval: int = 300  # seconds
+    max_sessions_per_project: int = 100
+    include_subagents: bool = False
+    persist: bool = True
+
+    def to_dict(self) -> dict:
+        """Serialize to dict for YAML storage."""
+        return {
+            "paths": self.paths,
+            "refresh_interval": self.refresh_interval,
+            "max_sessions_per_project": self.max_sessions_per_project,
+            "include_subagents": self.include_subagents,
+            "persist": self.persist,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> IndexConfig:
+        """Deserialize from dict."""
+        return cls(
+            paths=data.get("paths", ["~/.claude/projects"]),
+            refresh_interval=data.get("refresh_interval", 300),
+            max_sessions_per_project=data.get("max_sessions_per_project", 100),
+            include_subagents=data.get("include_subagents", False),
+            persist=data.get("persist", True),
+        )
+
+    def expand_paths(self) -> list[Path]:
+        """Expand ~ and resolve paths.
+
+        Returns:
+            List of expanded and resolved Path objects.
+        """
+        return [Path(p).expanduser().resolve() for p in self.paths]
+
+
+# ---------------------------------------------------------------------------
+# SearchConfig dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SearchConfig:
+    """Configuration for search settings."""
+
+    default_limit: int = 5
+    max_limit: int = 10
+    default_sort: str = "recent"
+    state_ttl_seconds: int = 300
+
+    def to_dict(self) -> dict:
+        """Serialize to dict for YAML storage."""
+        return {
+            "default_limit": self.default_limit,
+            "max_limit": self.max_limit,
+            "default_sort": self.default_sort,
+            "state_ttl_seconds": self.state_ttl_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SearchConfig:
+        """Deserialize from dict."""
+        return cls(
+            default_limit=data.get("default_limit", 5),
+            max_limit=data.get("max_limit", 10),
+            default_sort=data.get("default_sort", "recent"),
+            state_ttl_seconds=data.get("state_ttl_seconds", 300),
+        )
+
+
+# ---------------------------------------------------------------------------
 # SessionConfig dataclass
 # ---------------------------------------------------------------------------
 
@@ -212,12 +292,101 @@ def _migrate_old_format(old_sessions: list[dict]) -> dict:
     }
 
 
+def migrate_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Migrate config from older versions to current format.
+
+    Adds default index and search config sections if missing.
+    Updates telegram config with mode field if missing.
+
+    Args:
+        config: Raw config dict loaded from YAML.
+
+    Returns:
+        Migrated config dict with all required sections.
+    """
+    # Add default index config if missing
+    if "index" not in config:
+        config["index"] = {
+            "paths": ["~/.claude/projects"],
+            "refresh_interval": 300,
+            "max_sessions_per_project": 100,
+            "include_subagents": False,
+            "persist": True,
+        }
+
+    # Add default search config if missing
+    if "search" not in config:
+        config["search"] = {
+            "default_limit": 5,
+            "max_limit": 10,
+            "default_sort": "recent",
+            "state_ttl_seconds": 300,
+        }
+
+    # Migrate telegram config - add mode if missing
+    if "bots" in config and "telegram" in config["bots"]:
+        tg = config["bots"]["telegram"]
+        if tg and "mode" not in tg:
+            tg["mode"] = "webhook"
+
+    return config
+
+
+def apply_env_overrides(config: dict[str, Any]) -> dict[str, Any]:
+    """Apply environment variable overrides to config.
+
+    Supports the following environment variables:
+    - CLAUDE_INDEX_PATHS: Comma-separated list of index paths
+    - CLAUDE_INDEX_REFRESH_INTERVAL: Refresh interval in seconds
+    - TELEGRAM_WEBHOOK_URL: Telegram webhook URL
+
+    Args:
+        config: Config dict to apply overrides to.
+
+    Returns:
+        Config dict with environment overrides applied.
+    """
+    # Ensure index section exists
+    if "index" not in config:
+        config["index"] = {}
+
+    # Index paths override
+    if env_paths := os.environ.get("CLAUDE_INDEX_PATHS"):
+        config["index"]["paths"] = [p.strip() for p in env_paths.split(",")]
+
+    # Refresh interval override
+    if env_interval := os.environ.get("CLAUDE_INDEX_REFRESH_INTERVAL"):
+        try:
+            config["index"]["refresh_interval"] = int(env_interval)
+        except ValueError:
+            pass  # Ignore invalid values
+
+    # Telegram webhook URL override
+    if env_webhook := os.environ.get("TELEGRAM_WEBHOOK_URL"):
+        config.setdefault("bots", {}).setdefault("telegram", {})
+        config["bots"]["telegram"]["webhook_url"] = env_webhook
+
+    return config
+
+
+def expand_paths(paths: list[str]) -> list[Path]:
+    """Expand ~ and resolve paths.
+
+    Args:
+        paths: List of path strings to expand.
+
+    Returns:
+        List of expanded and resolved Path objects.
+    """
+    return [Path(p).expanduser().resolve() for p in paths]
+
+
 class ConfigManager:
     """Manages watched session files via config.yaml.
 
     Provides CRUD operations for session configurations with atomic writes
     to prevent corruption. Supports both old format (list of sessions) and
-    new format (dict with bots and sessions).
+    new format (dict with bots, sessions, index, and search).
     """
 
     def __init__(self, config_path: Path) -> None:
@@ -228,6 +397,8 @@ class ConfigManager:
         """
         self._config_path = config_path
         self._bot_config: BotConfig = BotConfig()
+        self._index_config: IndexConfig = IndexConfig()
+        self._search_config: SearchConfig = SearchConfig()
 
     @property
     def config_path(self) -> Path:
@@ -238,13 +409,16 @@ class ConfigManager:
         """Load all session configurations from the YAML file.
 
         Automatically migrates old format to new format in memory.
-        Bot config is cached and available via get_bot_config().
+        Applies environment variable overrides after loading.
+        Bot, index, and search configs are cached and available via getters.
 
         Returns:
             List of SessionConfig objects. Empty list if file doesn't exist.
         """
         if not self._config_path.exists():
             self._bot_config = BotConfig()
+            self._index_config = IndexConfig()
+            self._search_config = SearchConfig()
             return []
 
         with open(self._config_path, encoding="utf-8") as f:
@@ -252,25 +426,41 @@ class ConfigManager:
 
         if data is None:
             self._bot_config = BotConfig()
-            return []
-
-        if "sessions" not in data:
-            # Load bot config even if no sessions
-            if "bots" in data:
-                self._bot_config = BotConfig.from_dict(data["bots"])
-            else:
-                self._bot_config = BotConfig()
+            self._index_config = IndexConfig()
+            self._search_config = SearchConfig()
             return []
 
         # Check if old format and migrate
         if _is_old_format(data):
             data = _migrate_old_format(data["sessions"])
 
+        # Apply config migration (adds default index/search if missing)
+        data = migrate_config(data)
+
+        # Apply environment variable overrides
+        data = apply_env_overrides(data)
+
         # Load bot config
         if "bots" in data:
             self._bot_config = BotConfig.from_dict(data["bots"])
         else:
             self._bot_config = BotConfig()
+
+        # Load index config
+        if "index" in data:
+            self._index_config = IndexConfig.from_dict(data["index"])
+        else:
+            self._index_config = IndexConfig()
+
+        # Load search config
+        if "search" in data:
+            self._search_config = SearchConfig.from_dict(data["search"])
+        else:
+            self._search_config = SearchConfig()
+
+        # Handle case with no sessions key (but we still loaded configs)
+        if "sessions" not in data:
+            return []
 
         # Load sessions from new format
         sessions_data = data.get("sessions", {})
@@ -289,6 +479,8 @@ class ConfigManager:
         """
         data: dict = {
             "bots": self._bot_config.to_dict(),
+            "index": self._index_config.to_dict(),
+            "search": self._search_config.to_dict(),
             "sessions": {s.session_id: s.to_new_dict() for s in sessions},
         }
 
@@ -330,6 +522,42 @@ class ConfigManager:
             bot_config: New bot configuration.
         """
         self._bot_config = bot_config
+
+    def get_index_config(self) -> IndexConfig:
+        """Return the current index configuration.
+
+        Note: Call load() first to ensure index config is up to date.
+
+        Returns:
+            IndexConfig with index paths and settings.
+        """
+        return self._index_config
+
+    def set_index_config(self, index_config: IndexConfig) -> None:
+        """Set the index configuration (in memory only, call save() to persist).
+
+        Args:
+            index_config: New index configuration.
+        """
+        self._index_config = index_config
+
+    def get_search_config(self) -> SearchConfig:
+        """Return the current search configuration.
+
+        Note: Call load() first to ensure search config is up to date.
+
+        Returns:
+            SearchConfig with search settings.
+        """
+        return self._search_config
+
+    def set_search_config(self, search_config: SearchConfig) -> None:
+        """Set the search configuration (in memory only, call save() to persist).
+
+        Args:
+            search_config: New search configuration.
+        """
+        self._search_config = search_config
 
     def add(self, session_id: str, path: Path) -> None:
         """Add a new session to the watch list.

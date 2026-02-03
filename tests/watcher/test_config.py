@@ -10,6 +10,8 @@ import pytest
 from claude_session_player.watcher.config import (
     BotConfig,
     ConfigManager,
+    IndexConfig,
+    SearchConfig,
     SessionConfig,
     SessionDestinations,
     SlackDestination,
@@ -1454,3 +1456,813 @@ class TestConfigMigrationRoundtrip:
         destinations = config_manager.get_destinations("test-session")
         assert destinations is not None
         assert len(destinations.telegram) == 1
+
+
+# ---------------------------------------------------------------------------
+# IndexConfig tests
+# ---------------------------------------------------------------------------
+
+
+class TestIndexConfig:
+    """Tests for IndexConfig dataclass."""
+
+    def test_create_with_defaults(self) -> None:
+        """IndexConfig has correct default values."""
+        config = IndexConfig()
+        assert config.paths == ["~/.claude/projects"]
+        assert config.refresh_interval == 300
+        assert config.max_sessions_per_project == 100
+        assert config.include_subagents is False
+        assert config.persist is True
+
+    def test_create_with_custom_values(self) -> None:
+        """Can create IndexConfig with custom values."""
+        config = IndexConfig(
+            paths=["/custom/path", "~/projects"],
+            refresh_interval=600,
+            max_sessions_per_project=50,
+            include_subagents=True,
+            persist=False,
+        )
+        assert config.paths == ["/custom/path", "~/projects"]
+        assert config.refresh_interval == 600
+        assert config.max_sessions_per_project == 50
+        assert config.include_subagents is True
+        assert config.persist is False
+
+    def test_to_dict(self) -> None:
+        """to_dict returns expected structure."""
+        config = IndexConfig(
+            paths=["/path/one", "/path/two"],
+            refresh_interval=120,
+        )
+        result = config.to_dict()
+        assert result == {
+            "paths": ["/path/one", "/path/two"],
+            "refresh_interval": 120,
+            "max_sessions_per_project": 100,
+            "include_subagents": False,
+            "persist": True,
+        }
+
+    def test_from_dict(self) -> None:
+        """from_dict reconstructs IndexConfig correctly."""
+        data = {
+            "paths": ["/custom/path"],
+            "refresh_interval": 600,
+            "max_sessions_per_project": 200,
+            "include_subagents": True,
+            "persist": False,
+        }
+        config = IndexConfig.from_dict(data)
+        assert config.paths == ["/custom/path"]
+        assert config.refresh_interval == 600
+        assert config.max_sessions_per_project == 200
+        assert config.include_subagents is True
+        assert config.persist is False
+
+    def test_from_dict_with_defaults(self) -> None:
+        """from_dict uses defaults for missing keys."""
+        config = IndexConfig.from_dict({})
+        assert config.paths == ["~/.claude/projects"]
+        assert config.refresh_interval == 300
+        assert config.max_sessions_per_project == 100
+        assert config.include_subagents is False
+        assert config.persist is True
+
+    def test_from_dict_partial(self) -> None:
+        """from_dict handles partial config."""
+        config = IndexConfig.from_dict({"refresh_interval": 60})
+        assert config.paths == ["~/.claude/projects"]
+        assert config.refresh_interval == 60
+        assert config.max_sessions_per_project == 100
+
+    def test_roundtrip(self) -> None:
+        """to_dict/from_dict round-trip preserves data."""
+        original = IndexConfig(
+            paths=["/path/one", "~/path/two"],
+            refresh_interval=120,
+            max_sessions_per_project=50,
+            include_subagents=True,
+            persist=False,
+        )
+        restored = IndexConfig.from_dict(original.to_dict())
+        assert restored.paths == original.paths
+        assert restored.refresh_interval == original.refresh_interval
+        assert restored.max_sessions_per_project == original.max_sessions_per_project
+        assert restored.include_subagents == original.include_subagents
+        assert restored.persist == original.persist
+
+    def test_expand_paths(self, tmp_path: Path) -> None:
+        """expand_paths expands ~ and resolves paths."""
+        config = IndexConfig(paths=["~/.claude/projects", str(tmp_path)])
+        expanded = config.expand_paths()
+        assert len(expanded) == 2
+        # First path should have ~ expanded
+        assert "~" not in str(expanded[0])
+        assert expanded[0].is_absolute()
+        # Second path should be resolved
+        assert expanded[1] == tmp_path.resolve()
+
+
+# ---------------------------------------------------------------------------
+# SearchConfig tests
+# ---------------------------------------------------------------------------
+
+
+class TestSearchConfig:
+    """Tests for SearchConfig dataclass."""
+
+    def test_create_with_defaults(self) -> None:
+        """SearchConfig has correct default values."""
+        config = SearchConfig()
+        assert config.default_limit == 5
+        assert config.max_limit == 10
+        assert config.default_sort == "recent"
+        assert config.state_ttl_seconds == 300
+
+    def test_create_with_custom_values(self) -> None:
+        """Can create SearchConfig with custom values."""
+        config = SearchConfig(
+            default_limit=10,
+            max_limit=20,
+            default_sort="oldest",
+            state_ttl_seconds=600,
+        )
+        assert config.default_limit == 10
+        assert config.max_limit == 20
+        assert config.default_sort == "oldest"
+        assert config.state_ttl_seconds == 600
+
+    def test_to_dict(self) -> None:
+        """to_dict returns expected structure."""
+        config = SearchConfig(
+            default_limit=3,
+            max_limit=15,
+            default_sort="size",
+            state_ttl_seconds=120,
+        )
+        result = config.to_dict()
+        assert result == {
+            "default_limit": 3,
+            "max_limit": 15,
+            "default_sort": "size",
+            "state_ttl_seconds": 120,
+        }
+
+    def test_from_dict(self) -> None:
+        """from_dict reconstructs SearchConfig correctly."""
+        data = {
+            "default_limit": 8,
+            "max_limit": 25,
+            "default_sort": "duration",
+            "state_ttl_seconds": 900,
+        }
+        config = SearchConfig.from_dict(data)
+        assert config.default_limit == 8
+        assert config.max_limit == 25
+        assert config.default_sort == "duration"
+        assert config.state_ttl_seconds == 900
+
+    def test_from_dict_with_defaults(self) -> None:
+        """from_dict uses defaults for missing keys."""
+        config = SearchConfig.from_dict({})
+        assert config.default_limit == 5
+        assert config.max_limit == 10
+        assert config.default_sort == "recent"
+        assert config.state_ttl_seconds == 300
+
+    def test_from_dict_partial(self) -> None:
+        """from_dict handles partial config."""
+        config = SearchConfig.from_dict({"default_limit": 3})
+        assert config.default_limit == 3
+        assert config.max_limit == 10
+        assert config.default_sort == "recent"
+
+    def test_roundtrip(self) -> None:
+        """to_dict/from_dict round-trip preserves data."""
+        original = SearchConfig(
+            default_limit=7,
+            max_limit=15,
+            default_sort="size",
+            state_ttl_seconds=450,
+        )
+        restored = SearchConfig.from_dict(original.to_dict())
+        assert restored.default_limit == original.default_limit
+        assert restored.max_limit == original.max_limit
+        assert restored.default_sort == original.default_sort
+        assert restored.state_ttl_seconds == original.state_ttl_seconds
+
+
+# ---------------------------------------------------------------------------
+# migrate_config tests
+# ---------------------------------------------------------------------------
+
+
+class TestMigrateConfig:
+    """Tests for migrate_config function."""
+
+    def test_adds_index_config_if_missing(self) -> None:
+        """migrate_config adds default index config when missing."""
+        from claude_session_player.watcher.config import migrate_config
+
+        config: dict = {"bots": {}, "sessions": {}}
+        result = migrate_config(config)
+
+        assert "index" in result
+        assert result["index"]["paths"] == ["~/.claude/projects"]
+        assert result["index"]["refresh_interval"] == 300
+        assert result["index"]["max_sessions_per_project"] == 100
+        assert result["index"]["include_subagents"] is False
+        assert result["index"]["persist"] is True
+
+    def test_adds_search_config_if_missing(self) -> None:
+        """migrate_config adds default search config when missing."""
+        from claude_session_player.watcher.config import migrate_config
+
+        config: dict = {"bots": {}, "sessions": {}}
+        result = migrate_config(config)
+
+        assert "search" in result
+        assert result["search"]["default_limit"] == 5
+        assert result["search"]["max_limit"] == 10
+        assert result["search"]["default_sort"] == "recent"
+        assert result["search"]["state_ttl_seconds"] == 300
+
+    def test_preserves_existing_index_config(self) -> None:
+        """migrate_config preserves existing index config."""
+        from claude_session_player.watcher.config import migrate_config
+
+        config: dict = {
+            "bots": {},
+            "sessions": {},
+            "index": {
+                "paths": ["/custom/path"],
+                "refresh_interval": 60,
+            },
+        }
+        result = migrate_config(config)
+
+        assert result["index"]["paths"] == ["/custom/path"]
+        assert result["index"]["refresh_interval"] == 60
+
+    def test_preserves_existing_search_config(self) -> None:
+        """migrate_config preserves existing search config."""
+        from claude_session_player.watcher.config import migrate_config
+
+        config: dict = {
+            "bots": {},
+            "sessions": {},
+            "search": {
+                "default_limit": 3,
+                "max_limit": 20,
+            },
+        }
+        result = migrate_config(config)
+
+        assert result["search"]["default_limit"] == 3
+        assert result["search"]["max_limit"] == 20
+
+    def test_adds_telegram_mode_if_missing(self) -> None:
+        """migrate_config adds mode to telegram config if missing."""
+        from claude_session_player.watcher.config import migrate_config
+
+        config: dict = {
+            "bots": {"telegram": {"token": "BOT_TOKEN"}},
+            "sessions": {},
+        }
+        result = migrate_config(config)
+
+        assert result["bots"]["telegram"]["mode"] == "webhook"
+
+    def test_preserves_existing_telegram_mode(self) -> None:
+        """migrate_config preserves existing telegram mode."""
+        from claude_session_player.watcher.config import migrate_config
+
+        config: dict = {
+            "bots": {"telegram": {"token": "BOT_TOKEN", "mode": "polling"}},
+            "sessions": {},
+        }
+        result = migrate_config(config)
+
+        assert result["bots"]["telegram"]["mode"] == "polling"
+
+    def test_handles_empty_telegram_config(self) -> None:
+        """migrate_config handles None/empty telegram config."""
+        from claude_session_player.watcher.config import migrate_config
+
+        config: dict = {
+            "bots": {"telegram": None},
+            "sessions": {},
+        }
+        result = migrate_config(config)
+
+        # Should not crash, telegram remains None
+        assert result["bots"]["telegram"] is None
+
+
+# ---------------------------------------------------------------------------
+# apply_env_overrides tests
+# ---------------------------------------------------------------------------
+
+
+class TestApplyEnvOverrides:
+    """Tests for apply_env_overrides function."""
+
+    def test_overrides_index_paths(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CLAUDE_INDEX_PATHS overrides index paths."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("CLAUDE_INDEX_PATHS", "/path/one,/path/two")
+
+        config: dict = {"index": {"paths": ["~/.claude/projects"]}}
+        result = apply_env_overrides(config)
+
+        assert result["index"]["paths"] == ["/path/one", "/path/two"]
+
+    def test_overrides_refresh_interval(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CLAUDE_INDEX_REFRESH_INTERVAL overrides refresh interval."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("CLAUDE_INDEX_REFRESH_INTERVAL", "60")
+
+        config: dict = {"index": {"refresh_interval": 300}}
+        result = apply_env_overrides(config)
+
+        assert result["index"]["refresh_interval"] == 60
+
+    def test_ignores_invalid_refresh_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Invalid CLAUDE_INDEX_REFRESH_INTERVAL is ignored."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("CLAUDE_INDEX_REFRESH_INTERVAL", "not-a-number")
+
+        config: dict = {"index": {"refresh_interval": 300}}
+        result = apply_env_overrides(config)
+
+        # Should keep original value
+        assert result["index"]["refresh_interval"] == 300
+
+    def test_overrides_telegram_webhook_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TELEGRAM_WEBHOOK_URL overrides webhook URL."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook")
+
+        config: dict = {"bots": {"telegram": {"token": "BOT_TOKEN"}}}
+        result = apply_env_overrides(config)
+
+        assert result["bots"]["telegram"]["webhook_url"] == "https://example.com/webhook"
+
+    def test_creates_telegram_section_if_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """TELEGRAM_WEBHOOK_URL creates telegram section if missing."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/webhook")
+
+        config: dict = {}
+        result = apply_env_overrides(config)
+
+        assert result["bots"]["telegram"]["webhook_url"] == "https://example.com/webhook"
+
+    def test_creates_index_section_if_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Environment overrides create index section if missing."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("CLAUDE_INDEX_PATHS", "/custom/path")
+
+        config: dict = {}
+        result = apply_env_overrides(config)
+
+        assert result["index"]["paths"] == ["/custom/path"]
+
+    def test_strips_whitespace_from_paths(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CLAUDE_INDEX_PATHS strips whitespace from paths."""
+        from claude_session_player.watcher.config import apply_env_overrides
+
+        monkeypatch.setenv("CLAUDE_INDEX_PATHS", " /path/one , /path/two ")
+
+        config: dict = {"index": {}}
+        result = apply_env_overrides(config)
+
+        assert result["index"]["paths"] == ["/path/one", "/path/two"]
+
+
+# ---------------------------------------------------------------------------
+# expand_paths tests
+# ---------------------------------------------------------------------------
+
+
+class TestExpandPaths:
+    """Tests for expand_paths function."""
+
+    def test_expands_tilde(self) -> None:
+        """expand_paths expands ~ to home directory."""
+        from claude_session_player.watcher.config import expand_paths
+
+        result = expand_paths(["~/.claude/projects"])
+        assert len(result) == 1
+        assert "~" not in str(result[0])
+        assert result[0].is_absolute()
+
+    def test_resolves_relative_paths(self, tmp_path: Path) -> None:
+        """expand_paths resolves relative paths."""
+        from claude_session_player.watcher.config import expand_paths
+
+        # Create a subdir to test resolution
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+
+        result = expand_paths([str(subdir)])
+        assert result[0].is_absolute()
+        assert result[0] == subdir.resolve()
+
+    def test_handles_multiple_paths(self) -> None:
+        """expand_paths handles multiple paths."""
+        from claude_session_player.watcher.config import expand_paths
+
+        result = expand_paths(["~/.claude/projects", "/absolute/path"])
+        assert len(result) == 2
+        assert all(p.is_absolute() for p in result)
+
+    def test_handles_empty_list(self) -> None:
+        """expand_paths handles empty list."""
+        from claude_session_player.watcher.config import expand_paths
+
+        result = expand_paths([])
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# ConfigManager index/search config tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigManagerIndexConfig:
+    """Tests for ConfigManager index configuration methods."""
+
+    def test_get_index_config_defaults(
+        self, config_manager: ConfigManager
+    ) -> None:
+        """get_index_config returns defaults when no file."""
+        config_manager.load()
+        index_config = config_manager.get_index_config()
+        assert index_config.paths == ["~/.claude/projects"]
+        assert index_config.refresh_interval == 300
+
+    def test_get_index_config_from_file(
+        self, config_manager: ConfigManager, tmp_config_path: Path
+    ) -> None:
+        """get_index_config returns values from config file."""
+        yaml_content = """index:
+  paths:
+    - "/custom/path"
+  refresh_interval: 60
+  max_sessions_per_project: 50
+  include_subagents: true
+  persist: false
+sessions: {}
+"""
+        tmp_config_path.write_text(yaml_content)
+        config_manager.load()
+
+        index_config = config_manager.get_index_config()
+        assert index_config.paths == ["/custom/path"]
+        assert index_config.refresh_interval == 60
+        assert index_config.max_sessions_per_project == 50
+        assert index_config.include_subagents is True
+        assert index_config.persist is False
+
+    def test_set_index_config(
+        self, config_manager: ConfigManager
+    ) -> None:
+        """set_index_config updates in-memory config."""
+        new_config = IndexConfig(
+            paths=["/new/path"],
+            refresh_interval=120,
+        )
+        config_manager.set_index_config(new_config)
+
+        index_config = config_manager.get_index_config()
+        assert index_config.paths == ["/new/path"]
+        assert index_config.refresh_interval == 120
+
+    def test_index_config_persists_on_save(
+        self,
+        config_manager: ConfigManager,
+        sample_session_file: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """Index config is persisted when save() is called."""
+        config_manager.set_index_config(
+            IndexConfig(paths=["/custom/path"], refresh_interval=60)
+        )
+        config_manager.save(
+            [SessionConfig(session_id="test", path=sample_session_file)]
+        )
+
+        # Create new manager and load
+        new_manager = ConfigManager(tmp_config_path)
+        new_manager.load()
+        index_config = new_manager.get_index_config()
+        assert index_config.paths == ["/custom/path"]
+        assert index_config.refresh_interval == 60
+
+
+class TestConfigManagerSearchConfig:
+    """Tests for ConfigManager search configuration methods."""
+
+    def test_get_search_config_defaults(
+        self, config_manager: ConfigManager
+    ) -> None:
+        """get_search_config returns defaults when no file."""
+        config_manager.load()
+        search_config = config_manager.get_search_config()
+        assert search_config.default_limit == 5
+        assert search_config.max_limit == 10
+        assert search_config.default_sort == "recent"
+        assert search_config.state_ttl_seconds == 300
+
+    def test_get_search_config_from_file(
+        self, config_manager: ConfigManager, tmp_config_path: Path
+    ) -> None:
+        """get_search_config returns values from config file."""
+        yaml_content = """search:
+  default_limit: 3
+  max_limit: 20
+  default_sort: size
+  state_ttl_seconds: 600
+sessions: {}
+"""
+        tmp_config_path.write_text(yaml_content)
+        config_manager.load()
+
+        search_config = config_manager.get_search_config()
+        assert search_config.default_limit == 3
+        assert search_config.max_limit == 20
+        assert search_config.default_sort == "size"
+        assert search_config.state_ttl_seconds == 600
+
+    def test_set_search_config(
+        self, config_manager: ConfigManager
+    ) -> None:
+        """set_search_config updates in-memory config."""
+        new_config = SearchConfig(
+            default_limit=8,
+            max_limit=25,
+        )
+        config_manager.set_search_config(new_config)
+
+        search_config = config_manager.get_search_config()
+        assert search_config.default_limit == 8
+        assert search_config.max_limit == 25
+
+    def test_search_config_persists_on_save(
+        self,
+        config_manager: ConfigManager,
+        sample_session_file: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """Search config is persisted when save() is called."""
+        config_manager.set_search_config(
+            SearchConfig(default_limit=8, max_limit=25)
+        )
+        config_manager.save(
+            [SessionConfig(session_id="test", path=sample_session_file)]
+        )
+
+        # Create new manager and load
+        new_manager = ConfigManager(tmp_config_path)
+        new_manager.load()
+        search_config = new_manager.get_search_config()
+        assert search_config.default_limit == 8
+        assert search_config.max_limit == 25
+
+
+# ---------------------------------------------------------------------------
+# ConfigManager config migration integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigManagerMigration:
+    """Tests for ConfigManager config migration during load."""
+
+    def test_load_adds_defaults_when_missing(
+        self, config_manager: ConfigManager, tmp_config_path: Path
+    ) -> None:
+        """load() adds default index/search config when file has none."""
+        yaml_content = """bots:
+  telegram:
+    token: "BOT_TOKEN"
+sessions: {}
+"""
+        tmp_config_path.write_text(yaml_content)
+        config_manager.load()
+
+        # Index config should have defaults
+        index_config = config_manager.get_index_config()
+        assert index_config.paths == ["~/.claude/projects"]
+        assert index_config.refresh_interval == 300
+
+        # Search config should have defaults
+        search_config = config_manager.get_search_config()
+        assert search_config.default_limit == 5
+        assert search_config.max_limit == 10
+
+    def test_load_with_env_override(
+        self,
+        config_manager: ConfigManager,
+        tmp_config_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """load() applies environment variable overrides."""
+        yaml_content = """index:
+  paths:
+    - "~/.claude/projects"
+  refresh_interval: 300
+sessions: {}
+"""
+        tmp_config_path.write_text(yaml_content)
+        monkeypatch.setenv("CLAUDE_INDEX_PATHS", "/env/path")
+        monkeypatch.setenv("CLAUDE_INDEX_REFRESH_INTERVAL", "60")
+
+        config_manager.load()
+
+        index_config = config_manager.get_index_config()
+        assert index_config.paths == ["/env/path"]
+        assert index_config.refresh_interval == 60
+
+    def test_load_all_sections(
+        self, config_manager: ConfigManager, tmp_config_path: Path
+    ) -> None:
+        """load() correctly loads all config sections."""
+        yaml_content = """bots:
+  telegram:
+    token: "BOT_TOKEN"
+    mode: polling
+  slack:
+    token: "xoxb-token"
+    signing_secret: "secret123"
+index:
+  paths:
+    - "/custom/path"
+  refresh_interval: 120
+search:
+  default_limit: 7
+  max_limit: 15
+sessions:
+  test-session:
+    path: "/path/to/session.jsonl"
+    destinations:
+      telegram: []
+      slack: []
+"""
+        tmp_config_path.write_text(yaml_content)
+        sessions = config_manager.load()
+
+        # Verify all sections loaded
+        assert len(sessions) == 1
+
+        bot_config = config_manager.get_bot_config()
+        assert bot_config.telegram_token == "BOT_TOKEN"
+        assert bot_config.telegram_mode == "polling"
+        assert bot_config.slack_token == "xoxb-token"
+        assert bot_config.slack_signing_secret == "secret123"
+
+        index_config = config_manager.get_index_config()
+        assert index_config.paths == ["/custom/path"]
+        assert index_config.refresh_interval == 120
+
+        search_config = config_manager.get_search_config()
+        assert search_config.default_limit == 7
+        assert search_config.max_limit == 15
+
+    def test_save_includes_all_sections(
+        self,
+        config_manager: ConfigManager,
+        sample_session_file: Path,
+        tmp_config_path: Path,
+    ) -> None:
+        """save() includes all config sections in output."""
+        config_manager.set_bot_config(
+            BotConfig(telegram_token="BOT_TOKEN", slack_token="xoxb-token")
+        )
+        config_manager.set_index_config(
+            IndexConfig(paths=["/custom/path"], refresh_interval=60)
+        )
+        config_manager.set_search_config(
+            SearchConfig(default_limit=8, max_limit=20)
+        )
+        config_manager.save(
+            [SessionConfig(session_id="test", path=sample_session_file)]
+        )
+
+        content = tmp_config_path.read_text()
+        assert "bots:" in content
+        assert "index:" in content
+        assert "search:" in content
+        assert "sessions:" in content
+        assert "BOT_TOKEN" in content
+        assert "/custom/path" in content
+        assert "default_limit: 8" in content
+
+
+# ---------------------------------------------------------------------------
+# Integration: Full config file round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestConfigFullRoundtrip:
+    """Tests for full config file round-trip with all sections."""
+
+    def test_full_config_roundtrip(
+        self,
+        tmp_config_path: Path,
+        sample_session_file: Path,
+    ) -> None:
+        """Full config with all sections survives load/save round-trip."""
+        # Create config with all sections
+        manager1 = ConfigManager(tmp_config_path)
+        manager1.set_bot_config(
+            BotConfig(
+                telegram_token="BOT_TOKEN",
+                telegram_mode="polling",
+                telegram_webhook_url="https://example.com",
+                slack_token="xoxb-token",
+                slack_signing_secret="secret123",
+            )
+        )
+        manager1.set_index_config(
+            IndexConfig(
+                paths=["/path/one", "/path/two"],
+                refresh_interval=120,
+                max_sessions_per_project=50,
+                include_subagents=True,
+                persist=False,
+            )
+        )
+        manager1.set_search_config(
+            SearchConfig(
+                default_limit=8,
+                max_limit=25,
+                default_sort="size",
+                state_ttl_seconds=600,
+            )
+        )
+
+        # Save with a session
+        destinations = SessionDestinations(
+            telegram=[TelegramDestination(chat_id="123")],
+            slack=[SlackDestination(channel="C123")],
+        )
+        sessions = [
+            SessionConfig(
+                session_id="test-session",
+                path=sample_session_file,
+                destinations=destinations,
+            )
+        ]
+        manager1.save(sessions)
+
+        # Load with new manager
+        manager2 = ConfigManager(tmp_config_path)
+        loaded_sessions = manager2.load()
+
+        # Verify sessions
+        assert len(loaded_sessions) == 1
+        assert loaded_sessions[0].session_id == "test-session"
+        assert len(loaded_sessions[0].destinations.telegram) == 1
+        assert len(loaded_sessions[0].destinations.slack) == 1
+
+        # Verify bot config
+        bot_config = manager2.get_bot_config()
+        assert bot_config.telegram_token == "BOT_TOKEN"
+        assert bot_config.telegram_mode == "polling"
+        assert bot_config.telegram_webhook_url == "https://example.com"
+        assert bot_config.slack_token == "xoxb-token"
+        assert bot_config.slack_signing_secret == "secret123"
+
+        # Verify index config
+        index_config = manager2.get_index_config()
+        assert index_config.paths == ["/path/one", "/path/two"]
+        assert index_config.refresh_interval == 120
+        assert index_config.max_sessions_per_project == 50
+        assert index_config.include_subagents is True
+        assert index_config.persist is False
+
+        # Verify search config
+        search_config = manager2.get_search_config()
+        assert search_config.default_limit == 8
+        assert search_config.max_limit == 25
+        assert search_config.default_sort == "size"
+        assert search_config.state_ttl_seconds == 600
