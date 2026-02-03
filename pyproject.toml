@@ -10,6 +10,7 @@ claude-session-player = "claude_session_player.cli:main"
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov", "pytest-asyncio"]
 slack = ["slack-sdk>=3.0", "aiohttp>=3.0"]
+telegram = ["python-telegram-bot>=21.0"]
 
 [build-system]
 requires = ["hatchling"]
