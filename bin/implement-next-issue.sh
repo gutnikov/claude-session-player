@@ -32,7 +32,7 @@ You are implementing issue #${ISSUE_NUMBER}: "${ISSUE_TITLE}" for the Claude Ses
 
 ## Instructions
 
-1. FIRST: Read the spec at .claude/specs/claude-session-player.md
+1. FIRST: Read ALL specs in .claude/specs/ directory (claude-session-player.md AND event-driven-renderer.md)
 2. THEN: Read ALL existing worklogs in issues/worklogs/ (read every file that exists)
 3. THEN: Read the full issue description below and understand all requirements
 
@@ -45,7 +45,7 @@ ${ISSUE_BODY}
 Follow this exact workflow:
 
 ### Step 1: Understand Context
-- Read the spec file
+- Read ALL spec files in .claude/specs/
 - Read all worklogs from prior issues
 - Read any existing code that this issue builds on
 - Understand the codebase state
