@@ -1,0 +1,467 @@
+"""SQLite-based search index for session metadata.
+
+This module provides:
+- IndexedSession: Dataclass representing a session stored in the search index
+- SearchDatabase: SQLite database interface for the search index
+
+The database is a CACHE - it can be fully rebuilt from session files at any time.
+The source of truth is the session .jsonl files on disk.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+import aiosqlite
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data Classes
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IndexedSession:
+    """Session metadata stored in the search index."""
+
+    session_id: str
+    project_encoded: str
+    project_display_name: str
+    project_path: str
+    summary: str | None
+    file_path: str
+    file_created_at: datetime
+    file_modified_at: datetime
+    indexed_at: datetime
+    size_bytes: int
+    line_count: int
+    duration_ms: int | None
+    has_subagents: bool
+    is_subagent: bool
+
+    def to_row(self) -> tuple:
+        """Convert to SQLite row tuple.
+
+        Returns:
+            Tuple of values in column order for INSERT statements.
+        """
+        return (
+            self.session_id,
+            self.project_encoded,
+            self.project_display_name,
+            self.project_path,
+            self.summary,
+            self.file_path,
+            self.file_created_at.isoformat(),
+            self.file_modified_at.isoformat(),
+            self.indexed_at.isoformat(),
+            self.size_bytes,
+            self.line_count,
+            self.duration_ms,
+            1 if self.has_subagents else 0,
+            1 if self.is_subagent else 0,
+        )
+
+    @classmethod
+    def from_row(cls, row: aiosqlite.Row) -> IndexedSession:
+        """Create from SQLite row.
+
+        Args:
+            row: A row object with named columns.
+
+        Returns:
+            IndexedSession instance populated from row data.
+        """
+        return cls(
+            session_id=row["session_id"],
+            project_encoded=row["project_encoded"],
+            project_display_name=row["project_display_name"],
+            project_path=row["project_path"],
+            summary=row["summary"],
+            file_path=row["file_path"],
+            file_created_at=datetime.fromisoformat(row["file_created_at"]),
+            file_modified_at=datetime.fromisoformat(row["file_modified_at"]),
+            indexed_at=datetime.fromisoformat(row["indexed_at"]),
+            size_bytes=row["size_bytes"],
+            line_count=row["line_count"],
+            duration_ms=row["duration_ms"],
+            has_subagents=bool(row["has_subagents"]),
+            is_subagent=bool(row["is_subagent"]),
+        )
+
+
+# ---------------------------------------------------------------------------
+# SQL Schema Constants
+# ---------------------------------------------------------------------------
+
+
+CORE_SCHEMA = """
+-- Sessions table
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    project_encoded TEXT NOT NULL,
+    project_display_name TEXT NOT NULL,
+    project_path TEXT NOT NULL,
+    summary TEXT,
+    file_path TEXT NOT NULL UNIQUE,
+    file_created_at TEXT NOT NULL,
+    file_modified_at TEXT NOT NULL,
+    indexed_at TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    line_count INTEGER NOT NULL,
+    duration_ms INTEGER,
+    has_subagents INTEGER NOT NULL DEFAULT 0,
+    is_subagent INTEGER NOT NULL DEFAULT 0
+);
+
+-- Indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_encoded);
+CREATE INDEX IF NOT EXISTS idx_sessions_project_name ON sessions(project_display_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_sessions_modified ON sessions(file_modified_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_project_modified ON sessions(project_encoded, file_modified_at DESC);
+
+-- Metadata table
+CREATE TABLE IF NOT EXISTS index_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- File mtime tracking
+CREATE TABLE IF NOT EXISTS file_mtimes (
+    file_path TEXT PRIMARY KEY,
+    mtime_ns INTEGER NOT NULL,
+    indexed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_mtimes_mtime ON file_mtimes(mtime_ns DESC);
+"""
+
+
+# ---------------------------------------------------------------------------
+# SearchDatabase Class
+# ---------------------------------------------------------------------------
+
+
+class SearchDatabase:
+    """SQLite-based search index for sessions.
+
+    This database is a CACHE - it can be fully rebuilt from
+    session files at any time. The source of truth is the
+    session .jsonl files on disk.
+
+    Features:
+    - Efficient filtering by project, date range
+    - Incremental updates based on file mtime
+    - Automatic schema creation
+
+    Usage:
+        db = SearchDatabase(Path("~/.claude-session-player/state"))
+        await db.initialize()
+
+        # Index sessions
+        await db.upsert_session(session_info)
+
+        # Retrieve
+        session = await db.get_session("session-id")
+
+        # Cleanup
+        await db.close()
+    """
+
+    def __init__(self, state_dir: Path) -> None:
+        """Initialize the SearchDatabase.
+
+        Args:
+            state_dir: Directory for storing the database file.
+        """
+        self.state_dir = Path(state_dir)
+        self.db_path = self.state_dir / "search.db"
+        self._connection: aiosqlite.Connection | None = None
+
+    # ================================================================
+    # Lifecycle
+    # ================================================================
+
+    async def initialize(self) -> None:
+        """Initialize database and create schema.
+
+        Creates the state directory if it doesn't exist,
+        opens the connection, sets pragmas, and creates tables.
+        """
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
+        conn = await self._get_connection()
+
+        # Set pragmas for performance and reliability
+        await conn.execute("PRAGMA journal_mode = WAL")
+        await conn.execute("PRAGMA busy_timeout = 5000")
+        await conn.execute("PRAGMA synchronous = NORMAL")
+        await conn.execute("PRAGMA foreign_keys = ON")
+
+        # Create schema
+        await conn.executescript(CORE_SCHEMA)
+        await conn.commit()
+
+        logger.info(f"SearchDatabase initialized at {self.db_path}")
+
+    async def close(self) -> None:
+        """Close database connection."""
+        if self._connection:
+            await self._connection.close()
+            self._connection = None
+            logger.debug("SearchDatabase connection closed")
+
+    # ================================================================
+    # Connection Management
+    # ================================================================
+
+    async def _get_connection(self) -> aiosqlite.Connection:
+        """Get or create database connection.
+
+        Returns:
+            The aiosqlite connection object.
+        """
+        if self._connection is None:
+            self._connection = await aiosqlite.connect(self.db_path)
+            self._connection.row_factory = aiosqlite.Row
+        return self._connection
+
+    # ================================================================
+    # CRUD Operations
+    # ================================================================
+
+    async def upsert_session(self, session: IndexedSession) -> None:
+        """Insert or update a session in the index.
+
+        Args:
+            session: The session metadata to insert or update.
+        """
+        conn = await self._get_connection()
+        await conn.execute(
+            """
+            INSERT INTO sessions (
+                session_id, project_encoded, project_display_name, project_path,
+                summary, file_path, file_created_at, file_modified_at, indexed_at,
+                size_bytes, line_count, duration_ms, has_subagents, is_subagent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                summary = excluded.summary,
+                file_modified_at = excluded.file_modified_at,
+                indexed_at = excluded.indexed_at,
+                size_bytes = excluded.size_bytes,
+                line_count = excluded.line_count,
+                duration_ms = excluded.duration_ms,
+                has_subagents = excluded.has_subagents
+            """,
+            session.to_row(),
+        )
+        await conn.commit()
+
+    async def upsert_sessions_batch(self, sessions: list[IndexedSession]) -> int:
+        """Batch insert/update sessions.
+
+        Args:
+            sessions: List of sessions to insert or update.
+
+        Returns:
+            The number of sessions processed.
+        """
+        if not sessions:
+            return 0
+
+        conn = await self._get_connection()
+        await conn.executemany(
+            """
+            INSERT INTO sessions (
+                session_id, project_encoded, project_display_name, project_path,
+                summary, file_path, file_created_at, file_modified_at, indexed_at,
+                size_bytes, line_count, duration_ms, has_subagents, is_subagent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                summary = excluded.summary,
+                file_modified_at = excluded.file_modified_at,
+                indexed_at = excluded.indexed_at,
+                size_bytes = excluded.size_bytes,
+                line_count = excluded.line_count,
+                duration_ms = excluded.duration_ms,
+                has_subagents = excluded.has_subagents
+            """,
+            [s.to_row() for s in sessions],
+        )
+        await conn.commit()
+        return len(sessions)
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete a session from the index.
+
+        Args:
+            session_id: The session identifier to delete.
+
+        Returns:
+            True if a session was deleted, False if not found.
+        """
+        conn = await self._get_connection()
+        cursor = await conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+    async def get_session(self, session_id: str) -> IndexedSession | None:
+        """Get a session by ID.
+
+        Args:
+            session_id: The session identifier.
+
+        Returns:
+            IndexedSession if found, None otherwise.
+        """
+        conn = await self._get_connection()
+        async with conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return IndexedSession.from_row(row) if row else None
+
+    async def get_session_by_path(self, file_path: str) -> IndexedSession | None:
+        """Get a session by file path.
+
+        Args:
+            file_path: The absolute path to the session file.
+
+        Returns:
+            IndexedSession if found, None otherwise.
+        """
+        conn = await self._get_connection()
+        async with conn.execute(
+            "SELECT * FROM sessions WHERE file_path = ?",
+            (file_path,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return IndexedSession.from_row(row) if row else None
+
+    # ================================================================
+    # Metadata Operations
+    # ================================================================
+
+    async def _set_metadata(self, key: str, value: str) -> None:
+        """Set metadata value.
+
+        Args:
+            key: The metadata key.
+            value: The metadata value.
+        """
+        conn = await self._get_connection()
+        await conn.execute(
+            """
+            INSERT INTO index_metadata (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, value, datetime.now(timezone.utc).isoformat()),
+        )
+        await conn.commit()
+
+    async def _get_metadata(self, key: str) -> str | None:
+        """Get metadata value.
+
+        Args:
+            key: The metadata key.
+
+        Returns:
+            The value if found, None otherwise.
+        """
+        conn = await self._get_connection()
+        async with conn.execute(
+            "SELECT value FROM index_metadata WHERE key = ?",
+            (key,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["value"] if row else None
+
+    # ================================================================
+    # File mtime tracking for incremental updates
+    # ================================================================
+
+    async def get_file_mtime(self, file_path: str) -> int | None:
+        """Get stored mtime for a file.
+
+        Args:
+            file_path: The absolute path to the file.
+
+        Returns:
+            The mtime in nanoseconds if found, None otherwise.
+        """
+        conn = await self._get_connection()
+        async with conn.execute(
+            "SELECT mtime_ns FROM file_mtimes WHERE file_path = ?",
+            (file_path,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["mtime_ns"] if row else None
+
+    async def set_file_mtime(self, file_path: str, mtime_ns: int) -> None:
+        """Store mtime for a file.
+
+        Args:
+            file_path: The absolute path to the file.
+            mtime_ns: The file mtime in nanoseconds.
+        """
+        conn = await self._get_connection()
+        await conn.execute(
+            """
+            INSERT INTO file_mtimes (file_path, mtime_ns, indexed_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(file_path) DO UPDATE SET
+                mtime_ns = excluded.mtime_ns,
+                indexed_at = excluded.indexed_at
+            """,
+            (file_path, mtime_ns, datetime.now(timezone.utc).isoformat()),
+        )
+        await conn.commit()
+
+    async def get_all_indexed_paths(self) -> set[str]:
+        """Get all indexed file paths.
+
+        Returns:
+            Set of file paths that are currently indexed.
+        """
+        conn = await self._get_connection()
+        async with conn.execute("SELECT file_path FROM sessions") as cursor:
+            rows = await cursor.fetchall()
+            return {row["file_path"] for row in rows}
+
+    # ================================================================
+    # Maintenance Operations
+    # ================================================================
+
+    async def clear_all(self) -> None:
+        """Clear all indexed data (for rebuild).
+
+        Deletes all data from sessions and file_mtimes tables.
+        """
+        conn = await self._get_connection()
+        await conn.execute("DELETE FROM sessions")
+        await conn.execute("DELETE FROM file_mtimes")
+        await conn.commit()
+        logger.info("SearchDatabase cleared all data")
+
+    async def verify_integrity(self) -> bool:
+        """Check database integrity.
+
+        Returns:
+            True if the database passes integrity check, False otherwise.
+        """
+        conn = await self._get_connection()
+        async with conn.execute("PRAGMA integrity_check") as cursor:
+            result = await cursor.fetchone()
+            return result[0] == "ok"
