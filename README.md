@@ -533,6 +533,188 @@ The tool uses Unicode symbols (`❯`, `●`, `✱`, `└`, `✗`, `…`). Ensure
 
 Claude Session Player implements the Claude Code Session Protocol (v2.0.76 – v2.1.29). See `claude-code-session-protocol-schema.md` for the complete protocol specification.
 
+## Session Watcher Service
+
+The Session Watcher Service is an optional component that watches Claude Code session files for changes and streams processed events to subscribers via Server-Sent Events (SSE). It enables real-time session monitoring for building integrations like Slack bots or custom UIs.
+
+### Installation
+
+```bash
+# Install with watcher dependencies
+pip install "claude-session-player[watcher]"
+
+# Or install dependencies directly
+pip install pyyaml watchfiles aiohttp
+```
+
+### Running the Service
+
+```bash
+# Start with defaults (localhost:8080)
+python -m claude_session_player.watcher
+
+# Custom configuration
+python -m claude_session_player.watcher \
+    --host 0.0.0.0 \
+    --port 9000 \
+    --config /etc/watcher/config.yaml \
+    --state-dir /var/lib/watcher/state \
+    --log-level DEBUG
+```
+
+Command-line options:
+- `--host`: HTTP server host (default: `127.0.0.1`)
+- `--port`: HTTP server port (default: `8080`)
+- `--config`: Path to config.yaml (default: `config.yaml`)
+- `--state-dir`: Directory for state files (default: `state`)
+- `--log-level`: Logging level (default: `INFO`)
+
+### API Endpoints
+
+#### POST /watch
+
+Add a session file to the watch list.
+
+```bash
+curl -X POST http://localhost:8080/watch \
+    -H "Content-Type: application/json" \
+    -d '{
+        "session_id": "my-session-01",
+        "path": "/home/user/.claude/projects/abc123/sessions/014d9d94.jsonl"
+    }'
+```
+
+Response (201 Created):
+```json
+{
+    "session_id": "my-session-01",
+    "status": "watching"
+}
+```
+
+#### DELETE /unwatch/{session_id}
+
+Remove a session from the watch list.
+
+```bash
+curl -X DELETE http://localhost:8080/unwatch/my-session-01
+```
+
+Response: 204 No Content
+
+#### GET /sessions
+
+List all watched sessions.
+
+```bash
+curl http://localhost:8080/sessions
+```
+
+Response:
+```json
+{
+    "sessions": [
+        {
+            "session_id": "my-session-01",
+            "path": "/home/user/.claude/projects/abc123/sessions/014d9d94.jsonl",
+            "status": "watching",
+            "file_position": 12345,
+            "last_event_id": "evt_042"
+        }
+    ]
+}
+```
+
+#### GET /sessions/{session_id}/events
+
+Subscribe to SSE events for a session.
+
+```bash
+curl -N -H "Accept: text/event-stream" \
+    http://localhost:8080/sessions/my-session-01/events
+```
+
+Optional header for replay:
+```bash
+curl -N -H "Accept: text/event-stream" \
+    -H "Last-Event-ID: evt_020" \
+    http://localhost:8080/sessions/my-session-01/events
+```
+
+#### GET /health
+
+Health check endpoint.
+
+```bash
+curl http://localhost:8080/health
+```
+
+Response:
+```json
+{
+    "status": "healthy",
+    "sessions_watched": 3,
+    "uptime_seconds": 3600
+}
+```
+
+### SSE Event Format
+
+Events are sent as Server-Sent Events with the following format:
+
+```
+id: evt_001
+event: add_block
+data: {"block_id":"b1","type":"assistant","content":{"text":"Hello"},"request_id":"req_123"}
+
+id: evt_002
+event: update_block
+data: {"block_id":"b1","content":{"text":"Hello, world!"}}
+
+id: evt_003
+event: clear_all
+data: {}
+
+id: session_ended
+event: session_ended
+data: {"reason":"file_deleted"}
+```
+
+Event types:
+- `add_block` — New block added (user message, assistant text, tool call, etc.)
+- `update_block` — Existing block updated (tool result, progress update)
+- `clear_all` — Context compaction occurred, all previous content cleared
+- `session_ended` — Session file deleted or unwatched
+
+### Reconnection and Replay
+
+The service maintains a buffer of the last 20 events per session. When a client reconnects with the `Last-Event-ID` header, events after that ID are replayed. If the ID is unknown or evicted, all buffered events are replayed.
+
+### State Persistence
+
+The service persists processing state to disk, allowing it to resume from the last known position after restart. State files are stored in the state directory (`state/` by default) as JSON files named `{session_id}.json`.
+
+### Example: Subscribing with Python
+
+```python
+import aiohttp
+import asyncio
+
+async def subscribe_to_session(session_id: str):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"http://localhost:8080/sessions/{session_id}/events",
+            headers={"Accept": "text/event-stream"}
+        ) as response:
+            async for line in response.content:
+                line = line.decode("utf-8").strip()
+                if line.startswith("data:"):
+                    data = line[5:].strip()
+                    print(f"Received: {data}")
+
+asyncio.run(subscribe_to_session("my-session-01"))
+```
+
 ## License
 
 MIT License - see LICENSE file for details.
