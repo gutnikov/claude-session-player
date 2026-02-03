@@ -179,13 +179,19 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `claude_session_player/watcher/__init__.py` - Public exports
 - `claude_session_player/watcher/__main__.py` - CLI entry point for watcher service
 - `claude_session_player/watcher/service.py` - Main WatcherService orchestration
-- `claude_session_player/watcher/api.py` - REST API endpoints (aiohttp)
+- `claude_session_player/watcher/api.py` - REST API endpoints (attach/detach)
 - `claude_session_player/watcher/sse.py` - SSE connection management
+- `claude_session_player/watcher/destinations.py` - Destination lifecycle management
+- `claude_session_player/watcher/telegram_publisher.py` - Telegram Bot API integration
+- `claude_session_player/watcher/slack_publisher.py` - Slack Web API integration
+- `claude_session_player/watcher/message_state.py` - Turn-based message grouping
+- `claude_session_player/watcher/debouncer.py` - Rate limiting for message updates
 - `claude_session_player/watcher/event_buffer.py` - Per-session event ring buffer
 - `claude_session_player/watcher/transformer.py` - Stateless line-to-event transformer
 - `claude_session_player/watcher/file_watcher.py` - File change detection (watchfiles)
-- `claude_session_player/watcher/config.py` - Session config management (YAML)
+- `claude_session_player/watcher/config.py` - Session and bot config management (YAML)
 - `claude_session_player/watcher/state.py` - Processing state persistence (JSON)
+- `claude_session_player/watcher/deps.py` - Optional dependency checking
 
 ### Tests
 - `tests/test_parser.py` - Parser tests
@@ -197,6 +203,7 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `tests/test_stress.py` - Stress tests with large sessions
 - `tests/watcher/test_*.py` - Watcher module tests
 - `tests/watcher/test_e2e.py` - End-to-end watcher tests
+- `tests/watcher/test_messaging_integration.py` - Messaging integration tests
 
 ### Example Data
 - `examples/projects/*/sessions/*.jsonl` - Real session files
@@ -265,15 +272,29 @@ python -m claude_session_player.watcher \
     --log-level DEBUG
 ```
 
-### Adding a Session to Watch (via API)
+### Attaching a Messaging Destination
 
 ```bash
-curl -X POST http://localhost:8080/watch \
+# Attach a Telegram chat to a session
+curl -X POST http://localhost:8080/attach \
     -H "Content-Type: application/json" \
-    -d '{"session_id": "my-session", "path": "/path/to/session.jsonl"}'
+    -d '{"session_id": "my-session", "path": "/path/to/session.jsonl", "destination": {"type": "telegram", "chat_id": "123456789"}}'
+
+# Attach a Slack channel
+curl -X POST http://localhost:8080/attach \
+    -H "Content-Type: application/json" \
+    -d '{"session_id": "my-session", "destination": {"type": "slack", "channel": "C0123456789"}}'
 ```
 
-### Subscribing to Session Events
+### Detaching a Destination
+
+```bash
+curl -X POST http://localhost:8080/detach \
+    -H "Content-Type: application/json" \
+    -d '{"session_id": "my-session", "destination": {"type": "telegram", "chat_id": "123456789"}}'
+```
+
+### Subscribing to Session Events (SSE)
 
 ```bash
 curl -N -H "Accept: text/event-stream" \
@@ -287,51 +308,71 @@ The watcher service uses a layered architecture:
 ```
 HTTP Request → WatcherAPI → WatcherService → Components
                                    ↓
-                    ┌──────────────┼──────────────┐
-                    ↓              ↓              ↓
-              ConfigManager   FileWatcher   StateManager
-                    │              │              │
-                    └──────────────┼──────────────┘
-                                   ↓
-                             transformer()
-                                   ↓
-                          EventBufferManager
-                                   ↓
-                            SSEManager → Clients
+         ┌─────────────────────────┼─────────────────────────┐
+         │              │          │          │              │
+         ▼              ▼          ▼          ▼              ▼
+   SSEManager    TelegramPub  SlackPub  DestinationMgr  FileWatcher
+         │              │          │          │              │
+         └──────────────┴──────────┴──────────┘              │
+                               │                             │
+                               ▼                             │
+                    MessageStateTracker ←────────────────────┘
+                               │
+                               ▼
+                       MessageDebouncer
 ```
 
-### Event Flow (File Change → SSE)
+### Event Flow (File Change → Messaging)
 
 ```python
-# FileWatcher detects change
-await on_file_change(session_id, lines)
+FileWatcher detects change
     ↓
-# Load processing context from state
-state = state_manager.load(session_id)
-context = state.processing_context
+WatcherService._on_file_change(session_id, lines)
     ↓
-# Transform lines to events
-events, new_context = transform(lines, context)
+transformer.transform(lines, context) → events
     ↓
-# Save updated state
-state_manager.save(session_id, new_state)
-    ↓
-# Buffer events and broadcast
-for event in events:
-    event_id = event_buffer.add_event(session_id, event)
-    await sse_manager.broadcast(session_id, event_id, event)
+For each event:
+    ├─→ EventBufferManager.add_event() → event_id
+    ├─→ SSEManager.broadcast()
+    └─→ MessageStateTracker.handle_event() → MessageAction
+            ├─→ SendNewMessage → TelegramPublisher / SlackPublisher
+            └─→ UpdateExistingMessage → MessageDebouncer → Publishers
 ```
 
 ### Key Components
 
 - **WatcherService**: Orchestrates all components, handles lifecycle
-- **WatcherAPI**: REST endpoints (POST /watch, DELETE /unwatch, GET /sessions, etc.)
+- **WatcherAPI**: REST endpoints (POST /attach, POST /detach, GET /sessions, etc.)
 - **FileWatcher**: Uses `watchfiles` for cross-platform file change detection
 - **transformer()**: Stateless function that converts JSONL lines to events
 - **EventBufferManager**: Per-session ring buffer (last 20 events) for replay
 - **SSEManager**: Manages SSE connections, broadcasts events, handles keepalive
-- **ConfigManager**: Persists watched sessions to `config.yaml`
+- **DestinationManager**: Track attached destinations, manage keep-alive timer
+- **TelegramPublisher**: Telegram Bot API via aiogram (send/edit messages)
+- **SlackPublisher**: Slack Web API via slack-sdk (post/update messages)
+- **MessageStateTracker**: Map turns to message IDs, handle turn finalization
+- **MessageDebouncer**: Rate-limit message updates per destination
+- **ConfigManager**: Persists watched sessions and bot config to `config.yaml`
 - **StateManager**: Persists processing context and file position per session
+
+### Configuration (config.yaml)
+
+```yaml
+bots:
+  telegram:
+    token: "BOT_TOKEN"
+  slack:
+    token: "xoxb-..."
+
+sessions:
+  my-session:
+    path: "/path/to/session.jsonl"
+    destinations:
+      telegram:
+        - chat_id: "123456789"
+      slack:
+        - channel: "C0123456789"
+```
 
 ## Known Limitations
 
