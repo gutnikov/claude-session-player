@@ -1954,3 +1954,437 @@ class TestSearchIntegration:
         assert results[0].score > results[1].score
 
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Aggregation query tests - get_projects
+# ---------------------------------------------------------------------------
+
+
+class TestGetProjects:
+    """Tests for get_projects() aggregation query."""
+
+    @pytest.mark.asyncio
+    async def test_get_projects_empty(self, tmp_path: Path) -> None:
+        """Returns empty list for empty DB."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        projects = await db.get_projects()
+        assert projects == []
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_projects_single(self, tmp_path: Path) -> None:
+        """One project with counts."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        await db.upsert_session(
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                project_encoded="-Users-user-work-trello",
+                project_display_name="trello",
+                project_path="/Users/user/work/trello",
+                size_bytes=1000,
+            )
+        )
+
+        projects = await db.get_projects()
+
+        assert len(projects) == 1
+        assert projects[0]["project_display_name"] == "trello"
+        assert projects[0]["project_encoded"] == "-Users-user-work-trello"
+        assert projects[0]["project_path"] == "/Users/user/work/trello"
+        assert projects[0]["session_count"] == 1
+        assert projects[0]["total_size_bytes"] == 1000
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_projects_multiple(self, tmp_path: Path) -> None:
+        """Multiple projects sorted by date."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        sessions = [
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                file_modified_at=now - timedelta(days=2),
+            ),
+            create_test_session(
+                session_id="s2",
+                file_path="/path/s2.jsonl",
+                project_encoded="-api",
+                project_display_name="api",
+                project_path="/api",
+                file_modified_at=now - timedelta(days=1),
+            ),
+            create_test_session(
+                session_id="s3",
+                file_path="/path/s3.jsonl",
+                project_encoded="-docs",
+                project_display_name="docs",
+                project_path="/docs",
+                file_modified_at=now - timedelta(days=3),
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        projects = await db.get_projects()
+
+        assert len(projects) == 3
+        # Should be sorted by latest_modified_at DESC
+        assert projects[0]["project_display_name"] == "api"  # Most recent
+        assert projects[1]["project_display_name"] == "trello"
+        assert projects[2]["project_display_name"] == "docs"  # Oldest
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_projects_aggregation(self, tmp_path: Path) -> None:
+        """Counts and totals correct."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        sessions = [
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                file_modified_at=now - timedelta(days=1),
+                size_bytes=1000,
+            ),
+            create_test_session(
+                session_id="s2",
+                file_path="/path/s2.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                file_modified_at=now,
+                size_bytes=2000,
+            ),
+            create_test_session(
+                session_id="s3",
+                file_path="/path/s3.jsonl",
+                project_encoded="-api",
+                project_display_name="api",
+                project_path="/api",
+                file_modified_at=now - timedelta(days=2),
+                size_bytes=500,
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        projects = await db.get_projects()
+
+        assert len(projects) == 2
+
+        # trello should be first (more recent)
+        trello = projects[0]
+        assert trello["project_display_name"] == "trello"
+        assert trello["session_count"] == 2
+        assert trello["total_size_bytes"] == 3000  # 1000 + 2000
+
+        api = projects[1]
+        assert api["project_display_name"] == "api"
+        assert api["session_count"] == 1
+        assert api["total_size_bytes"] == 500
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_projects_excludes_subagents(self, tmp_path: Path) -> None:
+        """Subagent sessions not counted."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        sessions = [
+            create_test_session(
+                session_id="main",
+                file_path="/path/main.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                is_subagent=False,
+                size_bytes=1000,
+            ),
+            create_test_session(
+                session_id="subagent",
+                file_path="/path/subagent.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                is_subagent=True,
+                size_bytes=500,
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        projects = await db.get_projects()
+
+        assert len(projects) == 1
+        assert projects[0]["session_count"] == 1  # Only main session
+        assert projects[0]["total_size_bytes"] == 1000  # Only main session size
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_projects_since_filter(self, tmp_path: Path) -> None:
+        """Date filter works - since."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        sessions = [
+            create_test_session(
+                session_id="recent",
+                file_path="/path/recent.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                file_modified_at=now - timedelta(days=1),
+            ),
+            create_test_session(
+                session_id="old",
+                file_path="/path/old.jsonl",
+                project_encoded="-api",
+                project_display_name="api",
+                project_path="/api",
+                file_modified_at=now - timedelta(days=10),
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        # Filter: since 5 days ago
+        since = now - timedelta(days=5)
+        projects = await db.get_projects(since=since)
+
+        assert len(projects) == 1
+        assert projects[0]["project_display_name"] == "trello"
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_projects_until_filter(self, tmp_path: Path) -> None:
+        """Date filter works - until."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        sessions = [
+            create_test_session(
+                session_id="recent",
+                file_path="/path/recent.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                file_modified_at=now - timedelta(days=1),
+            ),
+            create_test_session(
+                session_id="old",
+                file_path="/path/old.jsonl",
+                project_encoded="-api",
+                project_display_name="api",
+                project_path="/api",
+                file_modified_at=now - timedelta(days=10),
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        # Filter: until 5 days ago
+        until = now - timedelta(days=5)
+        projects = await db.get_projects(until=until)
+
+        assert len(projects) == 1
+        assert projects[0]["project_display_name"] == "api"
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_projects_both_filters(self, tmp_path: Path) -> None:
+        """Date filters work together."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        sessions = [
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                project_encoded="-recent",
+                project_display_name="recent",
+                project_path="/recent",
+                file_modified_at=now - timedelta(days=1),
+            ),
+            create_test_session(
+                session_id="s2",
+                file_path="/path/s2.jsonl",
+                project_encoded="-mid",
+                project_display_name="mid",
+                project_path="/mid",
+                file_modified_at=now - timedelta(days=5),
+            ),
+            create_test_session(
+                session_id="s3",
+                file_path="/path/s3.jsonl",
+                project_encoded="-old",
+                project_display_name="old",
+                project_path="/old",
+                file_modified_at=now - timedelta(days=15),
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        # Filter: between 3 and 10 days ago
+        since = now - timedelta(days=10)
+        until = now - timedelta(days=3)
+        projects = await db.get_projects(since=since, until=until)
+
+        assert len(projects) == 1
+        assert projects[0]["project_display_name"] == "mid"
+
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Aggregation query tests - get_stats
+# ---------------------------------------------------------------------------
+
+
+class TestGetStats:
+    """Tests for get_stats() aggregation query."""
+
+    @pytest.mark.asyncio
+    async def test_get_stats_empty(self, tmp_path: Path) -> None:
+        """Returns zeros for empty DB."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        stats = await db.get_stats()
+
+        assert stats["total_sessions"] == 0
+        assert stats["total_projects"] == 0
+        assert stats["total_size_bytes"] == 0
+        assert isinstance(stats["fts_available"], bool)
+        # Metadata may be empty string or None
+        assert stats["last_full_index"] is None or stats["last_full_index"] == ""
+        assert (
+            stats["last_incremental_index"] is None
+            or stats["last_incremental_index"] == ""
+        )
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_stats_populated(self, tmp_path: Path) -> None:
+        """Returns correct counts."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        sessions = [
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                size_bytes=1000,
+                is_subagent=False,
+            ),
+            create_test_session(
+                session_id="s2",
+                file_path="/path/s2.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                size_bytes=2000,
+                is_subagent=False,
+            ),
+            create_test_session(
+                session_id="s3",
+                file_path="/path/s3.jsonl",
+                project_encoded="-api",
+                project_display_name="api",
+                project_path="/api",
+                size_bytes=500,
+                is_subagent=False,
+            ),
+            create_test_session(
+                session_id="s4",
+                file_path="/path/s4.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                size_bytes=300,
+                is_subagent=True,  # Subagent - excluded from session count
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        stats = await db.get_stats()
+
+        assert stats["total_sessions"] == 3  # Excludes subagent
+        assert stats["total_projects"] == 2  # trello and api
+        assert stats["total_size_bytes"] == 3800  # All sessions including subagent
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_stats_includes_metadata(self, tmp_path: Path) -> None:
+        """FTS status and timestamps included."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        # Set some metadata
+        await db._set_metadata("last_full_index", "2024-01-15T10:30:00+00:00")
+        await db._set_metadata("last_incremental_index", "2024-01-16T14:00:00+00:00")
+
+        stats = await db.get_stats()
+
+        assert isinstance(stats["fts_available"], bool)
+        assert stats["last_full_index"] == "2024-01-15T10:30:00+00:00"
+        assert stats["last_incremental_index"] == "2024-01-16T14:00:00+00:00"
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_get_stats_only_subagents(self, tmp_path: Path) -> None:
+        """Only subagent sessions returns zero session count but includes size."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        await db.upsert_session(
+            create_test_session(
+                session_id="subagent",
+                file_path="/path/subagent.jsonl",
+                project_encoded="-trello",
+                project_display_name="trello",
+                project_path="/trello",
+                size_bytes=1000,
+                is_subagent=True,
+            )
+        )
+
+        stats = await db.get_stats()
+
+        assert stats["total_sessions"] == 0  # No main sessions
+        assert stats["total_projects"] == 1  # Still counts project
+        assert stats["total_size_bytes"] == 1000  # Size is counted
+
+        await db.close()

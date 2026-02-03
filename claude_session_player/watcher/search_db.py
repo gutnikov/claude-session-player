@@ -839,3 +839,107 @@ class SearchDatabase:
         score += recency_boost
 
         return score
+
+    # ================================================================
+    # Aggregation Queries
+    # ================================================================
+
+    async def get_projects(
+        self,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[dict]:
+        """Get all projects with session counts.
+
+        Returns a list of projects with aggregated statistics,
+        excluding subagent sessions from counts.
+
+        Args:
+            since: Only include sessions modified after this date.
+            until: Only include sessions modified before this date.
+
+        Returns:
+            List of dicts with keys:
+            - project_encoded: str
+            - project_display_name: str
+            - project_path: str
+            - session_count: int
+            - latest_modified_at: str (ISO format)
+            - total_size_bytes: int
+        """
+        conn = await self._get_connection()
+
+        conditions = ["is_subagent = 0"]
+        params: list = []
+
+        if since:
+            conditions.append("file_modified_at >= ?")
+            params.append(since.isoformat())
+        if until:
+            conditions.append("file_modified_at <= ?")
+            params.append(until.isoformat())
+
+        where_clause = " AND ".join(conditions)
+
+        sql = f"""
+            SELECT
+                project_encoded,
+                project_display_name,
+                project_path,
+                COUNT(*) as session_count,
+                MAX(file_modified_at) as latest_modified_at,
+                SUM(size_bytes) as total_size_bytes
+            FROM sessions
+            WHERE {where_clause}
+            GROUP BY project_encoded
+            ORDER BY latest_modified_at DESC
+        """
+
+        async with conn.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_stats(self) -> dict:
+        """Get index statistics.
+
+        Returns statistics about the search index including
+        session counts, size totals, and metadata.
+
+        Returns:
+            Dict with keys:
+            - total_sessions: int (excludes subagents)
+            - total_projects: int (all distinct projects)
+            - total_size_bytes: int (all sessions including subagents)
+            - fts_available: bool
+            - last_full_index: str | None
+            - last_incremental_index: str | None
+        """
+        conn = await self._get_connection()
+
+        stats: dict = {}
+
+        # Total sessions (excluding subagents)
+        async with conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE is_subagent = 0"
+        ) as cursor:
+            stats["total_sessions"] = (await cursor.fetchone())[0]
+
+        # Total projects (distinct)
+        async with conn.execute(
+            "SELECT COUNT(DISTINCT project_encoded) FROM sessions"
+        ) as cursor:
+            stats["total_projects"] = (await cursor.fetchone())[0]
+
+        # Total size (all sessions)
+        async with conn.execute("SELECT SUM(size_bytes) FROM sessions") as cursor:
+            result = (await cursor.fetchone())[0]
+            stats["total_size_bytes"] = result or 0
+
+        # Metadata
+        stats["fts_available"] = self.fts_available
+        stats["last_full_index"] = await self._get_metadata("last_full_index") or None
+        stats["last_incremental_index"] = (
+            await self._get_metadata("last_incremental_index") or None
+        )
+
+        return stats
