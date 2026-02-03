@@ -16,7 +16,12 @@ from claude_session_player.watcher.config import (
     expand_paths,
     migrate_config,
 )
-from claude_session_player.watcher.search_db import IndexedSession, SearchDatabase
+from claude_session_player.watcher.search_db import (
+    IndexedSession,
+    SearchDatabase,
+    SearchFilters,
+    SearchResult,
+)
 from claude_session_player.watcher.debouncer import MessageDebouncer, PendingUpdate
 from claude_session_player.watcher.deps import check_slack_available, check_telegram_available
 from claude_session_player.watcher.destinations import AttachedDestination, DestinationManager
@@ -141,6 +146,8 @@ __all__ = [
     "TurnState",
     "UpdateExistingMessage",
     "SearchDatabase",
+    "SearchFilters",
+    "SearchResult",
     "WatcherAPI",
     "WatcherService",
     "transform",
