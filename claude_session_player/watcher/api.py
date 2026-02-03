@@ -1,12 +1,13 @@
 """REST API for session watcher service.
 
-Provides endpoints for watch/unwatch/list operations and delegates
+Provides endpoints for attach/detach/list operations and delegates
 SSE streaming to the SSE module.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,169 +16,328 @@ from typing import TYPE_CHECKING
 from aiohttp import web
 
 if TYPE_CHECKING:
-    from claude_session_player.watcher.config import ConfigManager
+    from claude_session_player.watcher.config import BotConfig, ConfigManager
+    from claude_session_player.watcher.destinations import DestinationManager
     from claude_session_player.watcher.event_buffer import EventBufferManager
-    from claude_session_player.watcher.file_watcher import FileWatcher
     from claude_session_player.watcher.sse import SSEManager
-    from claude_session_player.watcher.state import StateManager
 
 
 @dataclass
 class WatcherAPI:
     """REST API handler for session watcher service.
 
-    Coordinates between ConfigManager, StateManager, FileWatcher, and SSEManager
-    to provide a unified HTTP interface for managing watched sessions.
+    Coordinates between ConfigManager, DestinationManager, EventBufferManager,
+    and SSEManager to provide a unified HTTP interface for managing watched
+    sessions and messaging destinations.
     """
 
     config_manager: ConfigManager
-    state_manager: StateManager
-    file_watcher: FileWatcher
+    destination_manager: DestinationManager
     event_buffer: EventBufferManager
     sse_manager: SSEManager
 
     _start_time: float = field(default_factory=time.time, repr=False)
 
-    async def handle_watch(self, request: web.Request) -> web.Response:
-        """Handle POST /watch - add session to watch list.
+    async def handle_attach(self, request: web.Request) -> web.Response:
+        """Handle POST /attach - attach a messaging destination to a session.
 
         Request body:
             {
-                "session_id": "014d9d94-abc123",
-                "path": "/path/to/session.jsonl"
+                "session_id": "my-session",
+                "path": "/path/to/session.jsonl",  # Required if session unknown
+                "destination": {
+                    "type": "telegram",  # or "slack"
+                    "chat_id": "123456789",  # for telegram
+                    "channel": "C0123456789"  # for slack
+                },
+                "replay_count": 0  # Optional, default 0
             }
 
         Response 201:
             {
-                "session_id": "014d9d94-abc123",
-                "status": "watching"
+                "attached": true,
+                "session_id": "my-session",
+                "destination": {"type": "telegram", "chat_id": "123456789"},
+                "replayed_events": 0
             }
 
-        Response 400: Invalid request (missing fields, invalid path)
-        Response 404: File not found
-        Response 409: Session ID already exists
+        Error responses:
+        - 400: Invalid request (missing fields, invalid destination type)
+        - 401: Bot token not configured
+        - 403: Bot credential validation failed
+        - 404: Session path not found
         """
+        # Import here to avoid circular imports at module load time
+        from claude_session_player.watcher.slack_publisher import SlackAuthError
+        from claude_session_player.watcher.telegram_publisher import TelegramAuthError
+
         try:
             data = await request.json()
-        except Exception:
-            return web.json_response(
-                {"error": "Invalid JSON body"},
-                status=400,
-            )
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
 
         # Validate required fields
         session_id = data.get("session_id")
-        path_str = data.get("path")
-
         if not session_id:
+            return web.json_response({"error": "session_id required"}, status=400)
+
+        destination = data.get("destination")
+        if not destination:
+            return web.json_response({"error": "destination required"}, status=400)
+
+        dest_type = destination.get("type")
+        if dest_type not in ("telegram", "slack"):
             return web.json_response(
-                {"error": "Missing required field: session_id"},
+                {"error": "destination.type must be 'telegram' or 'slack'"},
                 status=400,
             )
 
-        if not path_str:
-            return web.json_response(
-                {"error": "Missing required field: path"},
-                status=400,
-            )
+        # Validate destination fields
+        if dest_type == "telegram":
+            identifier = destination.get("chat_id")
+            if not identifier:
+                return web.json_response(
+                    {"error": "destination.chat_id required for telegram"},
+                    status=400,
+                )
+        else:
+            identifier = destination.get("channel")
+            if not identifier:
+                return web.json_response(
+                    {"error": "destination.channel required for slack"},
+                    status=400,
+                )
 
-        path = Path(path_str)
+        path_str = data.get("path")
+        path = Path(path_str) if path_str else None
+        replay_count = data.get("replay_count", 0)
 
-        # Validate path is absolute
-        if not path.is_absolute():
-            return web.json_response(
-                {"error": f"Path must be absolute: {path}"},
-                status=400,
-            )
+        # Validate path if provided
+        if path is not None:
+            if not path.is_absolute():
+                return web.json_response(
+                    {"error": f"Path must be absolute: {path}"},
+                    status=400,
+                )
+            if not path.exists():
+                return web.json_response(
+                    {"error": f"Session path not found: {path}"},
+                    status=404,
+                )
 
-        # Check if file exists
-        if not path.exists():
-            return web.json_response(
-                {"error": f"File not found: {path}"},
-                status=404,
-            )
-
-        # Check for duplicate session
-        if self.config_manager.get(session_id) is not None:
-            return web.json_response(
-                {"error": f"Session already exists: {session_id}"},
-                status=409,
-            )
-
-        # Add to config
         try:
-            self.config_manager.add(session_id, path)
-        except ValueError as e:
-            return web.json_response(
-                {"error": str(e)},
-                status=400,
+            # Validate bot credentials before attaching
+            await self._validate_destination(dest_type)
+
+            # Attach destination
+            await self.destination_manager.attach(
+                session_id=session_id,
+                path=path,
+                destination_type=dest_type,
+                identifier=identifier,
             )
-        except FileNotFoundError as e:
+
+            # Handle replay if requested
+            replayed = 0
+            if replay_count > 0:
+                replayed = await self._replay_to_destination(
+                    session_id=session_id,
+                    destination_type=dest_type,
+                    identifier=identifier,
+                    count=replay_count,
+                )
+
+            # Build destination response based on type
+            if dest_type == "telegram":
+                dest_response = {"type": dest_type, "chat_id": identifier}
+            else:
+                dest_response = {"type": dest_type, "channel": identifier}
+
             return web.json_response(
-                {"error": str(e)},
+                {
+                    "attached": True,
+                    "session_id": session_id,
+                    "destination": dest_response,
+                    "replayed_events": replayed,
+                },
+                status=201,
+            )
+
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        except FileNotFoundError:
+            return web.json_response(
+                {"error": "Session path not found"},
                 status=404,
             )
+        except TelegramAuthError as e:
+            error_msg = str(e)
+            if "not configured" in error_msg.lower():
+                return web.json_response(
+                    {"error": "Telegram bot token not configured"},
+                    status=401,
+                )
+            return web.json_response(
+                {"error": "Telegram bot credential validation failed"},
+                status=403,
+            )
+        except SlackAuthError as e:
+            error_msg = str(e)
+            if "not configured" in error_msg.lower():
+                return web.json_response(
+                    {"error": "Slack bot token not configured"},
+                    status=401,
+                )
+            return web.json_response(
+                {"error": "Slack bot credential validation failed"},
+                status=403,
+            )
 
-        # Add to file watcher (start from end of file)
-        file_size = path.stat().st_size
-        self.file_watcher.add(session_id, path, start_position=file_size)
+    async def _validate_destination(self, dest_type: str) -> None:
+        """Validate bot credentials for the destination type.
 
-        # Process initial lines for context
-        await self.file_watcher.process_initial(session_id, last_n_lines=3)
+        Args:
+            dest_type: "telegram" or "slack".
 
-        return web.json_response(
-            {"session_id": session_id, "status": "watching"},
-            status=201,
+        Raises:
+            TelegramAuthError: If Telegram bot token invalid or not configured.
+            SlackAuthError: If Slack bot token invalid or not configured.
+        """
+        from claude_session_player.watcher.slack_publisher import (
+            SlackAuthError,
+            SlackPublisher,
+        )
+        from claude_session_player.watcher.telegram_publisher import (
+            TelegramAuthError,
+            TelegramPublisher,
         )
 
-    async def handle_unwatch(self, request: web.Request) -> web.Response:
-        """Handle DELETE /unwatch/{session_id} - remove session.
+        bot_config = self.config_manager.get_bot_config()
+
+        if dest_type == "telegram":
+            if not bot_config.telegram_token:
+                raise TelegramAuthError("Telegram bot token not configured")
+            publisher = TelegramPublisher(token=bot_config.telegram_token)
+            try:
+                await publisher.validate()
+            finally:
+                await publisher.close()
+        else:  # slack
+            if not bot_config.slack_token:
+                raise SlackAuthError("Slack bot token not configured")
+            publisher = SlackPublisher(token=bot_config.slack_token)
+            try:
+                await publisher.validate()
+            finally:
+                await publisher.close()
+
+    async def _replay_to_destination(
+        self,
+        session_id: str,
+        destination_type: str,
+        identifier: str,
+        count: int,
+    ) -> int:
+        """Replay events to a destination.
+
+        Args:
+            session_id: Session identifier.
+            destination_type: "telegram" or "slack".
+            identifier: chat_id or channel.
+            count: Number of events to replay.
+
+        Returns:
+            Number of events actually replayed.
+        """
+        # Get events from buffer
+        buffer = self.event_buffer.get_buffer(session_id)
+        events = buffer.get_since(None)
+
+        # Limit to requested count (take last N)
+        if len(events) > count:
+            events = events[-count:]
+
+        # TODO: In issue #76, this will be integrated with MessageStateTracker
+        # to properly format and send replay messages. For now, just return count.
+        return len(events)
+
+    async def handle_detach(self, request: web.Request) -> web.Response:
+        """Handle POST /detach - detach a messaging destination from a session.
+
+        Request body:
+            {
+                "session_id": "my-session",
+                "destination": {
+                    "type": "telegram",
+                    "chat_id": "123456789"
+                }
+            }
 
         Response 204: Success (no body)
-        Response 404: Session not found
-        """
-        session_id = request.match_info["session_id"]
 
-        # Check if session exists
-        if self.config_manager.get(session_id) is None:
+        Error responses:
+        - 400: Invalid request
+        - 404: Session or destination not found
+        """
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        session_id = data.get("session_id")
+        destination = data.get("destination")
+
+        if not session_id or not destination:
             return web.json_response(
-                {"error": f"Session not found: {session_id}"},
-                status=404,
+                {"error": "session_id and destination required"},
+                status=400,
             )
 
-        # Emit session_ended event to SSE subscribers
-        await self.sse_manager.close_session(session_id, reason="unwatched")
+        dest_type = destination.get("type")
+        if dest_type == "telegram":
+            identifier = destination.get("chat_id")
+        elif dest_type == "slack":
+            identifier = destination.get("channel")
+        else:
+            return web.json_response(
+                {"error": "Invalid destination type"},
+                status=400,
+            )
 
-        # Remove from file watcher
-        self.file_watcher.remove(session_id)
+        if not identifier:
+            return web.json_response(
+                {"error": "Destination identifier required"},
+                status=400,
+            )
 
-        # Remove event buffer
-        self.event_buffer.remove_buffer(session_id)
+        detached = await self.destination_manager.detach(
+            session_id=session_id,
+            destination_type=dest_type,
+            identifier=identifier,
+        )
 
-        # Delete state file
-        self.state_manager.delete(session_id)
-
-        # Remove from config
-        try:
-            self.config_manager.remove(session_id)
-        except KeyError:
-            # Already removed, not an error
-            pass
+        if not detached:
+            return web.json_response(
+                {"error": "Destination not found"},
+                status=404,
+            )
 
         return web.Response(status=204)
 
     async def handle_list_sessions(self, request: web.Request) -> web.Response:
-        """Handle GET /sessions - list all watched sessions.
+        """Handle GET /sessions - list all sessions and their destinations.
 
         Response 200:
             {
                 "sessions": [
                     {
-                        "session_id": "014d9d94-abc123",
+                        "session_id": "my-session",
                         "path": "/path/to/session.jsonl",
-                        "status": "watching",
-                        "file_position": 12345,
-                        "last_event_id": "evt_042"
+                        "sse_clients": 2,
+                        "destinations": {
+                            "telegram": [{"chat_id": "123456789"}],
+                            "slack": [{"channel": "C0123456789"}]
+                        }
                     }
                 ]
             }
@@ -188,24 +348,30 @@ class WatcherAPI:
         for session in sessions:
             session_id = session.session_id
 
-            # Get file position from file watcher or state manager
-            file_position = self.file_watcher.get_position(session_id)
-            if file_position is None:
-                # Try loading from state manager
-                state = self.state_manager.load(session_id)
-                file_position = state.file_position if state else 0
+            # Get SSE client count
+            sse_clients = self.sse_manager.get_connection_count(session_id)
 
-            # Get last event ID from buffer
-            buffer = self.event_buffer.get_buffer(session_id)
-            events = buffer.get_since(None)
-            last_event_id = events[-1][0] if events else None
+            # Get destinations
+            destinations = self.destination_manager.get_destinations(session_id)
+            telegram_dests = [
+                {"chat_id": d.identifier}
+                for d in destinations
+                if d.type == "telegram"
+            ]
+            slack_dests = [
+                {"channel": d.identifier}
+                for d in destinations
+                if d.type == "slack"
+            ]
 
             result.append({
                 "session_id": session_id,
                 "path": str(session.path),
-                "status": "watching",
-                "file_position": file_position,
-                "last_event_id": last_event_id,
+                "sse_clients": sse_clients,
+                "destinations": {
+                    "telegram": telegram_dests,
+                    "slack": slack_dests,
+                },
             })
 
         return web.json_response({"sessions": result})
@@ -273,22 +439,31 @@ class WatcherAPI:
         return response
 
     async def handle_health(self, request: web.Request) -> web.Response:
-        """Handle GET /health - health check.
+        """Handle GET /health - health check with bot status.
 
         Response 200:
             {
                 "status": "healthy",
-                "sessions_watched": 42,
-                "uptime_seconds": 3600
+                "sessions_watched": 3,
+                "uptime_seconds": 3600,
+                "bots": {
+                    "telegram": "configured",  # or "not_configured"
+                    "slack": "not_configured"
+                }
             }
         """
         sessions = self.config_manager.list_all()
         uptime = int(time.time() - self._start_time)
+        bot_config = self.config_manager.get_bot_config()
 
         return web.json_response({
             "status": "healthy",
             "sessions_watched": len(sessions),
             "uptime_seconds": uptime,
+            "bots": {
+                "telegram": "configured" if bot_config.telegram_token else "not_configured",
+                "slack": "configured" if bot_config.slack_token else "not_configured",
+            },
         })
 
     def create_app(self) -> web.Application:
@@ -299,8 +474,8 @@ class WatcherAPI:
         """
         app = web.Application()
 
-        app.router.add_post("/watch", self.handle_watch)
-        app.router.add_delete("/unwatch/{session_id}", self.handle_unwatch)
+        app.router.add_post("/attach", self.handle_attach)
+        app.router.add_post("/detach", self.handle_detach)
         app.router.add_get("/sessions", self.handle_list_sessions)
         app.router.add_get("/sessions/{session_id}/events", self.handle_session_events)
         app.router.add_get("/health", self.handle_health)

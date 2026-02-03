@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,11 +19,10 @@ from claude_session_player.events import (
     BlockType,
 )
 from claude_session_player.watcher.api import WatcherAPI
-from claude_session_player.watcher.config import ConfigManager
+from claude_session_player.watcher.config import BotConfig, ConfigManager
+from claude_session_player.watcher.destinations import DestinationManager
 from claude_session_player.watcher.event_buffer import EventBufferManager
-from claude_session_player.watcher.file_watcher import FileWatcher
 from claude_session_player.watcher.sse import SSEManager
-from claude_session_player.watcher.state import StateManager
 
 
 # --- Mock HTTP Request/Response ---
@@ -82,14 +82,6 @@ def temp_config_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def temp_state_dir(tmp_path: Path) -> Path:
-    """Create a temporary state directory."""
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-    return state_dir
-
-
-@pytest.fixture
 def session_file(tmp_path: Path) -> Path:
     """Create a temporary session file."""
     session_path = tmp_path / "session.jsonl"
@@ -105,200 +97,265 @@ def empty_session_file(tmp_path: Path) -> Path:
     return session_path
 
 
-async def dummy_callback(session_id: str, lines: list[dict]) -> None:
-    """Dummy callback for FileWatcher."""
+async def dummy_session_start(session_id: str, path: Path) -> None:
+    """Dummy callback for session start."""
     pass
 
 
-async def dummy_deleted_callback(session_id: str) -> None:
-    """Dummy callback for file deletion."""
+async def dummy_session_stop(session_id: str) -> None:
+    """Dummy callback for session stop."""
     pass
 
 
 @pytest.fixture
+def config_manager(temp_config_path: Path) -> ConfigManager:
+    """Create a ConfigManager instance."""
+    return ConfigManager(temp_config_path)
+
+
+@pytest.fixture
+def destination_manager(config_manager: ConfigManager) -> DestinationManager:
+    """Create a DestinationManager instance."""
+    return DestinationManager(
+        _config=config_manager,
+        _on_session_start=dummy_session_start,
+        _on_session_stop=dummy_session_stop,
+    )
+
+
+@pytest.fixture
+def event_buffer() -> EventBufferManager:
+    """Create an EventBufferManager instance."""
+    return EventBufferManager()
+
+
+@pytest.fixture
+def sse_manager(event_buffer: EventBufferManager) -> SSEManager:
+    """Create an SSEManager instance."""
+    return SSEManager(event_buffer=event_buffer)
+
+
+@pytest.fixture
 def watcher_api(
-    temp_config_path: Path,
-    temp_state_dir: Path,
+    config_manager: ConfigManager,
+    destination_manager: DestinationManager,
+    event_buffer: EventBufferManager,
+    sse_manager: SSEManager,
 ) -> WatcherAPI:
     """Create a WatcherAPI instance with all dependencies."""
-    config_manager = ConfigManager(temp_config_path)
-    state_manager = StateManager(temp_state_dir)
-    event_buffer = EventBufferManager()
-    file_watcher = FileWatcher(
-        on_lines_callback=dummy_callback,
-        on_file_deleted_callback=dummy_deleted_callback,
-    )
-    sse_manager = SSEManager(event_buffer=event_buffer)
-
     return WatcherAPI(
         config_manager=config_manager,
-        state_manager=state_manager,
-        file_watcher=file_watcher,
+        destination_manager=destination_manager,
         event_buffer=event_buffer,
         sse_manager=sse_manager,
     )
 
 
-# --- Tests for POST /watch ---
+@pytest.fixture
+def watcher_api_with_telegram_token(
+    temp_config_path: Path,
+    destination_manager: DestinationManager,
+    event_buffer: EventBufferManager,
+    sse_manager: SSEManager,
+) -> WatcherAPI:
+    """Create a WatcherAPI instance with telegram token configured."""
+    config_manager = ConfigManager(temp_config_path)
+    config_manager.set_bot_config(BotConfig(telegram_token="test-token"))
+    config_manager.save([])
+
+    # Re-attach config to destination manager
+    destination_manager._config = config_manager
+
+    return WatcherAPI(
+        config_manager=config_manager,
+        destination_manager=destination_manager,
+        event_buffer=event_buffer,
+        sse_manager=sse_manager,
+    )
 
 
-class TestHandleWatchSuccess:
-    """Tests for POST /watch success cases."""
+@pytest.fixture
+def watcher_api_with_slack_token(
+    temp_config_path: Path,
+    destination_manager: DestinationManager,
+    event_buffer: EventBufferManager,
+    sse_manager: SSEManager,
+) -> WatcherAPI:
+    """Create a WatcherAPI instance with slack token configured."""
+    config_manager = ConfigManager(temp_config_path)
+    config_manager.set_bot_config(BotConfig(slack_token="xoxb-test-token"))
+    config_manager.save([])
 
-    async def test_watch_success(
-        self, watcher_api: WatcherAPI, session_file: Path
+    # Re-attach config to destination manager
+    destination_manager._config = config_manager
+
+    return WatcherAPI(
+        config_manager=config_manager,
+        destination_manager=destination_manager,
+        event_buffer=event_buffer,
+        sse_manager=sse_manager,
+    )
+
+
+# --- Tests for POST /attach ---
+
+
+class TestHandleAttachSuccess:
+    """Tests for POST /attach success cases."""
+
+    async def test_attach_telegram_success(
+        self, watcher_api_with_telegram_token: WatcherAPI, session_file: Path
     ) -> None:
-        """Successful POST /watch returns 201."""
-        request = MockRequest(
-            _json_data={
-                "session_id": "test-session",
-                "path": str(session_file),
-            }
-        )
+        """Successful POST /attach for telegram returns 201."""
+        # Mock validate to not actually call Telegram API
+        with patch.object(
+            watcher_api_with_telegram_token, "_validate_destination", new_callable=AsyncMock
+        ):
+            request = MockRequest(
+                _json_data={
+                    "session_id": "test-session",
+                    "path": str(session_file),
+                    "destination": {
+                        "type": "telegram",
+                        "chat_id": "123456789",
+                    },
+                }
+            )
 
-        response = await watcher_api.handle_watch(request)
+            response = await watcher_api_with_telegram_token.handle_attach(request)
 
-        assert response.status == 201
-        data = json.loads(response.body)
-        assert data["session_id"] == "test-session"
-        assert data["status"] == "watching"
+            assert response.status == 201
+            data = json.loads(response.body)
+            assert data["attached"] is True
+            assert data["session_id"] == "test-session"
+            assert data["destination"]["type"] == "telegram"
+            assert data["destination"]["chat_id"] == "123456789"
+            assert data["replayed_events"] == 0
 
-    async def test_watch_adds_to_config(
-        self, watcher_api: WatcherAPI, session_file: Path
+    async def test_attach_slack_success(
+        self, watcher_api_with_slack_token: WatcherAPI, session_file: Path
     ) -> None:
-        """POST /watch adds session to config."""
-        request = MockRequest(
-            _json_data={
-                "session_id": "test-session",
-                "path": str(session_file),
-            }
-        )
+        """Successful POST /attach for slack returns 201."""
+        with patch.object(
+            watcher_api_with_slack_token, "_validate_destination", new_callable=AsyncMock
+        ):
+            request = MockRequest(
+                _json_data={
+                    "session_id": "test-session",
+                    "path": str(session_file),
+                    "destination": {
+                        "type": "slack",
+                        "channel": "C0123456789",
+                    },
+                }
+            )
 
-        await watcher_api.handle_watch(request)
+            response = await watcher_api_with_slack_token.handle_attach(request)
 
-        config = watcher_api.config_manager.get("test-session")
-        assert config is not None
-        assert config.session_id == "test-session"
-        assert config.path == session_file
+            assert response.status == 201
+            data = json.loads(response.body)
+            assert data["attached"] is True
+            assert data["session_id"] == "test-session"
+            assert data["destination"]["type"] == "slack"
+            assert data["destination"]["channel"] == "C0123456789"
 
-    async def test_watch_adds_to_file_watcher(
-        self, watcher_api: WatcherAPI, session_file: Path
+    async def test_attach_idempotent(
+        self, watcher_api_with_telegram_token: WatcherAPI, session_file: Path
     ) -> None:
-        """POST /watch adds file to file watcher."""
-        request = MockRequest(
-            _json_data={
-                "session_id": "test-session",
-                "path": str(session_file),
-            }
-        )
+        """Duplicate attach returns success (idempotent)."""
+        with patch.object(
+            watcher_api_with_telegram_token, "_validate_destination", new_callable=AsyncMock
+        ):
+            request = MockRequest(
+                _json_data={
+                    "session_id": "test-session",
+                    "path": str(session_file),
+                    "destination": {
+                        "type": "telegram",
+                        "chat_id": "123456789",
+                    },
+                }
+            )
 
-        await watcher_api.handle_watch(request)
+            # First attach
+            response1 = await watcher_api_with_telegram_token.handle_attach(request)
+            assert response1.status == 201
 
-        assert "test-session" in watcher_api.file_watcher.watched_sessions
+            # Second attach (idempotent)
+            response2 = await watcher_api_with_telegram_token.handle_attach(request)
+            assert response2.status == 201
 
-    async def test_watch_multiple_sessions(
-        self, watcher_api: WatcherAPI, tmp_path: Path
+    async def test_attach_with_replay_count(
+        self, watcher_api_with_telegram_token: WatcherAPI, session_file: Path
     ) -> None:
-        """Can watch multiple sessions."""
-        # Create two session files
-        file1 = tmp_path / "session1.jsonl"
-        file2 = tmp_path / "session2.jsonl"
-        file1.write_text('{"type":"user"}\n')
-        file2.write_text('{"type":"user"}\n')
+        """Attach with replay_count returns replayed_events count."""
+        with patch.object(
+            watcher_api_with_telegram_token, "_validate_destination", new_callable=AsyncMock
+        ):
+            # Add some events to the buffer
+            event = AddBlock(
+                block=Block(
+                    id="block_1",
+                    type=BlockType.ASSISTANT,
+                    content=AssistantContent(text="test"),
+                )
+            )
+            watcher_api_with_telegram_token.event_buffer.add_event("test-session", event)
+            watcher_api_with_telegram_token.event_buffer.add_event("test-session", event)
 
-        request1 = MockRequest(
-            _json_data={"session_id": "session-1", "path": str(file1)}
-        )
-        request2 = MockRequest(
-            _json_data={"session_id": "session-2", "path": str(file2)}
-        )
+            request = MockRequest(
+                _json_data={
+                    "session_id": "test-session",
+                    "path": str(session_file),
+                    "destination": {
+                        "type": "telegram",
+                        "chat_id": "123456789",
+                    },
+                    "replay_count": 5,
+                }
+            )
 
-        response1 = await watcher_api.handle_watch(request1)
-        response2 = await watcher_api.handle_watch(request2)
+            response = await watcher_api_with_telegram_token.handle_attach(request)
 
-        assert response1.status == 201
-        assert response2.status == 201
-        assert len(watcher_api.config_manager.list_all()) == 2
+            assert response.status == 201
+            data = json.loads(response.body)
+            assert data["replayed_events"] == 2  # Only 2 events in buffer
 
 
-class TestHandleWatchMissingFields:
-    """Tests for POST /watch with missing fields."""
-
-    async def test_missing_session_id(
-        self, watcher_api: WatcherAPI, session_file: Path
-    ) -> None:
-        """POST /watch without session_id returns 400."""
-        request = MockRequest(
-            _json_data={"path": str(session_file)}
-        )
-
-        response = await watcher_api.handle_watch(request)
-
-        assert response.status == 400
-        data = json.loads(response.body)
-        assert "session_id" in data["error"]
-
-    async def test_missing_path(self, watcher_api: WatcherAPI) -> None:
-        """POST /watch without path returns 400."""
-        request = MockRequest(
-            _json_data={"session_id": "test-session"}
-        )
-
-        response = await watcher_api.handle_watch(request)
-
-        assert response.status == 400
-        data = json.loads(response.body)
-        assert "path" in data["error"]
-
-    async def test_empty_session_id(
-        self, watcher_api: WatcherAPI, session_file: Path
-    ) -> None:
-        """POST /watch with empty session_id returns 400."""
-        request = MockRequest(
-            _json_data={"session_id": "", "path": str(session_file)}
-        )
-
-        response = await watcher_api.handle_watch(request)
-
-        assert response.status == 400
+class TestHandleAttachValidationErrors:
+    """Tests for POST /attach validation errors."""
 
     async def test_invalid_json(self, watcher_api: WatcherAPI) -> None:
-        """POST /watch with invalid JSON returns 400."""
+        """POST /attach with invalid JSON returns 400."""
         request = MockRequest(_json_error=True)
 
-        response = await watcher_api.handle_watch(request)
+        response = await watcher_api.handle_attach(request)
 
         assert response.status == 400
         data = json.loads(response.body)
         assert "Invalid JSON" in data["error"]
 
-
-class TestHandleWatchFileNotFound:
-    """Tests for POST /watch with file not found."""
-
-    async def test_file_not_found(self, watcher_api: WatcherAPI) -> None:
-        """POST /watch with nonexistent file returns 404."""
+    async def test_missing_session_id(
+        self, watcher_api: WatcherAPI, session_file: Path
+    ) -> None:
+        """POST /attach without session_id returns 400."""
         request = MockRequest(
             _json_data={
-                "session_id": "test-session",
-                "path": "/nonexistent/path/session.jsonl",
+                "path": str(session_file),
+                "destination": {"type": "telegram", "chat_id": "123"},
             }
         )
 
-        response = await watcher_api.handle_watch(request)
+        response = await watcher_api.handle_attach(request)
 
-        assert response.status == 404
+        assert response.status == 400
         data = json.loads(response.body)
-        assert "not found" in data["error"].lower()
+        assert "session_id required" in data["error"]
 
-
-class TestHandleWatchDuplicateSession:
-    """Tests for POST /watch with duplicate session."""
-
-    async def test_duplicate_session(
+    async def test_missing_destination(
         self, watcher_api: WatcherAPI, session_file: Path
     ) -> None:
-        """POST /watch with existing session_id returns 409."""
+        """POST /attach without destination returns 400."""
         request = MockRequest(
             _json_data={
                 "session_id": "test-session",
@@ -306,110 +363,315 @@ class TestHandleWatchDuplicateSession:
             }
         )
 
-        # First watch succeeds
-        response1 = await watcher_api.handle_watch(request)
-        assert response1.status == 201
+        response = await watcher_api.handle_attach(request)
 
-        # Second watch with same ID fails
-        response2 = await watcher_api.handle_watch(request)
-        assert response2.status == 409
-        data = json.loads(response2.body)
-        assert "already exists" in data["error"].lower()
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "destination required" in data["error"]
 
-
-class TestHandleWatchInvalidPath:
-    """Tests for POST /watch with invalid path."""
-
-    async def test_relative_path(self, watcher_api: WatcherAPI) -> None:
-        """POST /watch with relative path returns 400."""
+    async def test_invalid_destination_type(
+        self, watcher_api: WatcherAPI, session_file: Path
+    ) -> None:
+        """POST /attach with invalid destination type returns 400."""
         request = MockRequest(
             _json_data={
                 "session_id": "test-session",
-                "path": "relative/path/session.jsonl",
+                "path": str(session_file),
+                "destination": {"type": "discord"},
             }
         )
 
-        response = await watcher_api.handle_watch(request)
+        response = await watcher_api.handle_attach(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "telegram" in data["error"] and "slack" in data["error"]
+
+    async def test_missing_telegram_chat_id(
+        self, watcher_api: WatcherAPI, session_file: Path
+    ) -> None:
+        """POST /attach for telegram without chat_id returns 400."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "test-session",
+                "path": str(session_file),
+                "destination": {"type": "telegram"},
+            }
+        )
+
+        response = await watcher_api.handle_attach(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "chat_id required" in data["error"]
+
+    async def test_missing_slack_channel(
+        self, watcher_api: WatcherAPI, session_file: Path
+    ) -> None:
+        """POST /attach for slack without channel returns 400."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "test-session",
+                "path": str(session_file),
+                "destination": {"type": "slack"},
+            }
+        )
+
+        response = await watcher_api.handle_attach(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "channel required" in data["error"]
+
+    async def test_relative_path(self, watcher_api: WatcherAPI) -> None:
+        """POST /attach with relative path returns 400."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "test-session",
+                "path": "relative/path.jsonl",
+                "destination": {"type": "telegram", "chat_id": "123"},
+            }
+        )
+
+        response = await watcher_api.handle_attach(request)
 
         assert response.status == 400
         data = json.loads(response.body)
         assert "absolute" in data["error"].lower()
 
 
-# --- Tests for DELETE /unwatch/{session_id} ---
+class TestHandleAttachNotFound:
+    """Tests for POST /attach with file not found."""
+
+    async def test_path_not_found(self, watcher_api: WatcherAPI) -> None:
+        """POST /attach with nonexistent path returns 404."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "test-session",
+                "path": "/nonexistent/path/session.jsonl",
+                "destination": {"type": "telegram", "chat_id": "123"},
+            }
+        )
+
+        response = await watcher_api.handle_attach(request)
+
+        assert response.status == 404
+        data = json.loads(response.body)
+        assert "not found" in data["error"].lower()
 
 
-class TestHandleUnwatchSuccess:
-    """Tests for DELETE /unwatch success cases."""
+class TestHandleAttachAuthErrors:
+    """Tests for POST /attach auth errors (401, 403)."""
 
-    async def test_unwatch_success(
+    async def test_telegram_token_not_configured(
         self, watcher_api: WatcherAPI, session_file: Path
     ) -> None:
-        """DELETE /unwatch returns 204 on success."""
-        # First watch the session
-        watch_request = MockRequest(
+        """POST /attach for telegram without token returns 401."""
+        request = MockRequest(
             _json_data={
                 "session_id": "test-session",
                 "path": str(session_file),
+                "destination": {"type": "telegram", "chat_id": "123"},
             }
         )
-        await watcher_api.handle_watch(watch_request)
 
-        # Then unwatch
-        unwatch_request = MockRequest(match_info={"session_id": "test-session"})
-        response = await watcher_api.handle_unwatch(unwatch_request)
+        response = await watcher_api.handle_attach(request)
 
-        assert response.status == 204
+        assert response.status == 401
+        data = json.loads(response.body)
+        assert "not configured" in data["error"].lower()
 
-    async def test_unwatch_removes_from_config(
+    async def test_slack_token_not_configured(
         self, watcher_api: WatcherAPI, session_file: Path
     ) -> None:
-        """DELETE /unwatch removes session from config."""
-        # Watch
-        watch_request = MockRequest(
+        """POST /attach for slack without token returns 401."""
+        request = MockRequest(
             _json_data={
                 "session_id": "test-session",
                 "path": str(session_file),
+                "destination": {"type": "slack", "channel": "C123"},
             }
         )
-        await watcher_api.handle_watch(watch_request)
-        assert watcher_api.config_manager.get("test-session") is not None
 
-        # Unwatch
-        unwatch_request = MockRequest(match_info={"session_id": "test-session"})
-        await watcher_api.handle_unwatch(unwatch_request)
+        response = await watcher_api.handle_attach(request)
 
-        assert watcher_api.config_manager.get("test-session") is None
+        assert response.status == 401
+        data = json.loads(response.body)
+        assert "not configured" in data["error"].lower()
 
-    async def test_unwatch_removes_from_file_watcher(
-        self, watcher_api: WatcherAPI, session_file: Path
+    async def test_telegram_validation_failed(
+        self, watcher_api_with_telegram_token: WatcherAPI, session_file: Path
     ) -> None:
-        """DELETE /unwatch removes file from file watcher."""
-        # Watch
-        watch_request = MockRequest(
+        """POST /attach for telegram with invalid token returns 403."""
+        from claude_session_player.watcher.telegram_publisher import TelegramAuthError
+
+        with patch.object(
+            watcher_api_with_telegram_token,
+            "_validate_destination",
+            new_callable=AsyncMock,
+            side_effect=TelegramAuthError("Invalid token"),
+        ):
+            request = MockRequest(
+                _json_data={
+                    "session_id": "test-session",
+                    "path": str(session_file),
+                    "destination": {"type": "telegram", "chat_id": "123"},
+                }
+            )
+
+            response = await watcher_api_with_telegram_token.handle_attach(request)
+
+            assert response.status == 403
+            data = json.loads(response.body)
+            assert "validation failed" in data["error"].lower()
+
+    async def test_slack_validation_failed(
+        self, watcher_api_with_slack_token: WatcherAPI, session_file: Path
+    ) -> None:
+        """POST /attach for slack with invalid token returns 403."""
+        from claude_session_player.watcher.slack_publisher import SlackAuthError
+
+        with patch.object(
+            watcher_api_with_slack_token,
+            "_validate_destination",
+            new_callable=AsyncMock,
+            side_effect=SlackAuthError("Invalid token"),
+        ):
+            request = MockRequest(
+                _json_data={
+                    "session_id": "test-session",
+                    "path": str(session_file),
+                    "destination": {"type": "slack", "channel": "C123"},
+                }
+            )
+
+            response = await watcher_api_with_slack_token.handle_attach(request)
+
+            assert response.status == 403
+            data = json.loads(response.body)
+            assert "validation failed" in data["error"].lower()
+
+
+# --- Tests for POST /detach ---
+
+
+class TestHandleDetachSuccess:
+    """Tests for POST /detach success cases."""
+
+    async def test_detach_success(
+        self, watcher_api_with_telegram_token: WatcherAPI, session_file: Path
+    ) -> None:
+        """POST /detach returns 204 on success."""
+        with patch.object(
+            watcher_api_with_telegram_token, "_validate_destination", new_callable=AsyncMock
+        ):
+            # First attach
+            attach_request = MockRequest(
+                _json_data={
+                    "session_id": "test-session",
+                    "path": str(session_file),
+                    "destination": {"type": "telegram", "chat_id": "123"},
+                }
+            )
+            await watcher_api_with_telegram_token.handle_attach(attach_request)
+
+            # Then detach
+            detach_request = MockRequest(
+                _json_data={
+                    "session_id": "test-session",
+                    "destination": {"type": "telegram", "chat_id": "123"},
+                }
+            )
+            response = await watcher_api_with_telegram_token.handle_detach(detach_request)
+
+            assert response.status == 204
+
+
+class TestHandleDetachValidationErrors:
+    """Tests for POST /detach validation errors."""
+
+    async def test_invalid_json(self, watcher_api: WatcherAPI) -> None:
+        """POST /detach with invalid JSON returns 400."""
+        request = MockRequest(_json_error=True)
+
+        response = await watcher_api.handle_detach(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "Invalid JSON" in data["error"]
+
+    async def test_missing_session_id(self, watcher_api: WatcherAPI) -> None:
+        """POST /detach without session_id returns 400."""
+        request = MockRequest(
+            _json_data={
+                "destination": {"type": "telegram", "chat_id": "123"},
+            }
+        )
+
+        response = await watcher_api.handle_detach(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "required" in data["error"]
+
+    async def test_missing_destination(self, watcher_api: WatcherAPI) -> None:
+        """POST /detach without destination returns 400."""
+        request = MockRequest(
             _json_data={
                 "session_id": "test-session",
-                "path": str(session_file),
             }
         )
-        await watcher_api.handle_watch(watch_request)
-        assert "test-session" in watcher_api.file_watcher.watched_sessions
 
-        # Unwatch
-        unwatch_request = MockRequest(match_info={"session_id": "test-session"})
-        await watcher_api.handle_unwatch(unwatch_request)
+        response = await watcher_api.handle_detach(request)
 
-        assert "test-session" not in watcher_api.file_watcher.watched_sessions
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "required" in data["error"]
+
+    async def test_invalid_destination_type(self, watcher_api: WatcherAPI) -> None:
+        """POST /detach with invalid destination type returns 400."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "test-session",
+                "destination": {"type": "discord"},
+            }
+        )
+
+        response = await watcher_api.handle_detach(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "Invalid destination type" in data["error"]
+
+    async def test_missing_identifier(self, watcher_api: WatcherAPI) -> None:
+        """POST /detach without identifier returns 400."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "test-session",
+                "destination": {"type": "telegram"},
+            }
+        )
+
+        response = await watcher_api.handle_detach(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "identifier required" in data["error"].lower()
 
 
-class TestHandleUnwatchNotFound:
-    """Tests for DELETE /unwatch with not found."""
+class TestHandleDetachNotFound:
+    """Tests for POST /detach with not found."""
 
-    async def test_unwatch_not_found(self, watcher_api: WatcherAPI) -> None:
-        """DELETE /unwatch for nonexistent session returns 404."""
-        request = MockRequest(match_info={"session_id": "nonexistent"})
+    async def test_destination_not_found(self, watcher_api: WatcherAPI) -> None:
+        """POST /detach for nonexistent destination returns 404."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "nonexistent-session",
+                "destination": {"type": "telegram", "chat_id": "123"},
+            }
+        )
 
-        response = await watcher_api.handle_unwatch(request)
+        response = await watcher_api.handle_detach(request)
 
         assert response.status == 404
         data = json.loads(response.body)
@@ -432,103 +694,78 @@ class TestHandleListSessions:
         data = json.loads(response.body)
         assert data["sessions"] == []
 
-    async def test_list_sessions(
-        self, watcher_api: WatcherAPI, tmp_path: Path
+    async def test_list_sessions_with_destinations(
+        self, watcher_api_with_telegram_token: WatcherAPI, session_file: Path
     ) -> None:
-        """GET /sessions returns all watched sessions."""
-        # Create and watch two sessions
-        file1 = tmp_path / "session1.jsonl"
-        file2 = tmp_path / "session2.jsonl"
-        file1.write_text('{"type":"user"}\n')
-        file2.write_text('{"type":"user"}\n')
-
-        await watcher_api.handle_watch(
-            MockRequest(_json_data={"session_id": "session-1", "path": str(file1)})
-        )
-        await watcher_api.handle_watch(
-            MockRequest(_json_data={"session_id": "session-2", "path": str(file2)})
-        )
-
-        # List sessions
-        request = MockRequest()
-        response = await watcher_api.handle_list_sessions(request)
-
-        assert response.status == 200
-        data = json.loads(response.body)
-        assert len(data["sessions"]) == 2
-
-        session_ids = {s["session_id"] for s in data["sessions"]}
-        assert "session-1" in session_ids
-        assert "session-2" in session_ids
-
-    async def test_list_sessions_includes_status(
-        self, watcher_api: WatcherAPI, session_file: Path
-    ) -> None:
-        """GET /sessions includes status for each session."""
-        await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={"session_id": "test-session", "path": str(session_file)}
+        """GET /sessions returns sessions with destinations."""
+        with patch.object(
+            watcher_api_with_telegram_token, "_validate_destination", new_callable=AsyncMock
+        ):
+            # Attach a destination
+            attach_request = MockRequest(
+                _json_data={
+                    "session_id": "test-session",
+                    "path": str(session_file),
+                    "destination": {"type": "telegram", "chat_id": "123456789"},
+                }
             )
-        )
+            await watcher_api_with_telegram_token.handle_attach(attach_request)
 
-        request = MockRequest()
-        response = await watcher_api.handle_list_sessions(request)
+            # List sessions
+            request = MockRequest()
+            response = await watcher_api_with_telegram_token.handle_list_sessions(request)
 
-        data = json.loads(response.body)
-        session = data["sessions"][0]
-        assert session["status"] == "watching"
+            assert response.status == 200
+            data = json.loads(response.body)
+            assert len(data["sessions"]) == 1
+            session = data["sessions"][0]
+            assert session["session_id"] == "test-session"
+            assert session["path"] == str(session_file)
+            assert "sse_clients" in session
+            assert "destinations" in session
+            assert session["destinations"]["telegram"] == [{"chat_id": "123456789"}]
+            assert session["destinations"]["slack"] == []
 
-    async def test_list_sessions_includes_path(
-        self, watcher_api: WatcherAPI, session_file: Path
+    async def test_list_sessions_multiple_destinations(
+        self, watcher_api_with_telegram_token: WatcherAPI, session_file: Path
     ) -> None:
-        """GET /sessions includes path for each session."""
-        await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={"session_id": "test-session", "path": str(session_file)}
+        """GET /sessions shows multiple destinations."""
+        with patch.object(
+            watcher_api_with_telegram_token, "_validate_destination", new_callable=AsyncMock
+        ):
+            # Attach first destination
+            await watcher_api_with_telegram_token.handle_attach(
+                MockRequest(
+                    _json_data={
+                        "session_id": "test-session",
+                        "path": str(session_file),
+                        "destination": {"type": "telegram", "chat_id": "111"},
+                    }
+                )
             )
-        )
 
-        request = MockRequest()
-        response = await watcher_api.handle_list_sessions(request)
-
-        data = json.loads(response.body)
-        session = data["sessions"][0]
-        assert session["path"] == str(session_file)
-
-    async def test_list_sessions_includes_file_position(
-        self, watcher_api: WatcherAPI, session_file: Path
-    ) -> None:
-        """GET /sessions includes file_position for each session."""
-        await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={"session_id": "test-session", "path": str(session_file)}
+            # Attach second destination
+            await watcher_api_with_telegram_token.handle_attach(
+                MockRequest(
+                    _json_data={
+                        "session_id": "test-session",
+                        "destination": {"type": "telegram", "chat_id": "222"},
+                    }
+                )
             )
-        )
 
-        request = MockRequest()
-        response = await watcher_api.handle_list_sessions(request)
-
-        data = json.loads(response.body)
-        session = data["sessions"][0]
-        assert "file_position" in session
-        assert isinstance(session["file_position"], int)
-
-    async def test_list_sessions_includes_last_event_id(
-        self, watcher_api: WatcherAPI, session_file: Path
-    ) -> None:
-        """GET /sessions includes last_event_id (or null) for each session."""
-        await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={"session_id": "test-session", "path": str(session_file)}
+            # List sessions
+            response = await watcher_api_with_telegram_token.handle_list_sessions(
+                MockRequest()
             )
-        )
 
-        request = MockRequest()
-        response = await watcher_api.handle_list_sessions(request)
-
-        data = json.loads(response.body)
-        session = data["sessions"][0]
-        assert "last_event_id" in session
+            data = json.loads(response.body)
+            session = data["sessions"][0]
+            telegram_dests = session["destinations"]["telegram"]
+            assert len(telegram_dests) == 2
+            chat_ids = {d["chat_id"] for d in telegram_dests}
+            assert "111" in chat_ids
+            assert "222" in chat_ids
 
 
 # --- Tests for GET /health ---
@@ -547,23 +784,6 @@ class TestHandleHealth:
         data = json.loads(response.body)
         assert data["status"] == "healthy"
 
-    async def test_health_returns_session_count(
-        self, watcher_api: WatcherAPI, session_file: Path
-    ) -> None:
-        """GET /health returns sessions_watched count."""
-        # Watch a session
-        await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={"session_id": "test-session", "path": str(session_file)}
-            )
-        )
-
-        request = MockRequest()
-        response = await watcher_api.handle_health(request)
-
-        data = json.loads(response.body)
-        assert data["sessions_watched"] == 1
-
     async def test_health_returns_uptime(self, watcher_api: WatcherAPI) -> None:
         """GET /health returns uptime_seconds."""
         request = MockRequest()
@@ -575,23 +795,42 @@ class TestHandleHealth:
         assert isinstance(data["uptime_seconds"], int)
         assert data["uptime_seconds"] >= 0
 
-    async def test_health_uptime_increases(self, watcher_api: WatcherAPI) -> None:
-        """GET /health uptime increases over time."""
+    async def test_health_returns_bot_status_not_configured(
+        self, watcher_api: WatcherAPI
+    ) -> None:
+        """GET /health returns not_configured for bots without tokens."""
         request = MockRequest()
 
-        response1 = await watcher_api.handle_health(request)
-        data1 = json.loads(response1.body)
-        uptime1 = data1["uptime_seconds"]
+        response = await watcher_api.handle_health(request)
 
-        # Wait a bit
-        await asyncio.sleep(0.1)
+        data = json.loads(response.body)
+        assert "bots" in data
+        assert data["bots"]["telegram"] == "not_configured"
+        assert data["bots"]["slack"] == "not_configured"
 
-        response2 = await watcher_api.handle_health(request)
-        data2 = json.loads(response2.body)
-        uptime2 = data2["uptime_seconds"]
+    async def test_health_returns_bot_status_telegram_configured(
+        self, watcher_api_with_telegram_token: WatcherAPI
+    ) -> None:
+        """GET /health returns configured for telegram with token."""
+        request = MockRequest()
 
-        # Uptime should be same or greater (small sleep might not tick)
-        assert uptime2 >= uptime1
+        response = await watcher_api_with_telegram_token.handle_health(request)
+
+        data = json.loads(response.body)
+        assert data["bots"]["telegram"] == "configured"
+        assert data["bots"]["slack"] == "not_configured"
+
+    async def test_health_returns_bot_status_slack_configured(
+        self, watcher_api_with_slack_token: WatcherAPI
+    ) -> None:
+        """GET /health returns configured for slack with token."""
+        request = MockRequest()
+
+        response = await watcher_api_with_slack_token.handle_health(request)
+
+        data = json.loads(response.body)
+        assert data["bots"]["telegram"] == "not_configured"
+        assert data["bots"]["slack"] == "configured"
 
 
 # --- Tests for GET /sessions/{session_id}/events ---
@@ -632,205 +871,69 @@ class TestCreateApp:
         # Get route info
         routes = {r.resource.canonical for r in app.router.routes() if r.resource}
 
-        assert "/watch" in routes
-        assert "/unwatch/{session_id}" in routes
+        assert "/attach" in routes
+        assert "/detach" in routes
         assert "/sessions" in routes
         assert "/sessions/{session_id}/events" in routes
         assert "/health" in routes
+
+        # Old endpoints should NOT be registered
+        assert "/watch" not in routes
+        assert "/unwatch/{session_id}" not in routes
 
 
 # --- Tests for integration scenarios ---
 
 
-class TestIntegrationWatchUnwatchFlow:
-    """Integration tests for watch → unwatch flow."""
+class TestIntegrationAttachDetachFlow:
+    """Integration tests for attach → detach flow."""
 
-    async def test_watch_then_unwatch(
-        self, watcher_api: WatcherAPI, session_file: Path
+    async def test_attach_then_detach(
+        self, watcher_api_with_telegram_token: WatcherAPI, session_file: Path
     ) -> None:
-        """Watch and unwatch a session successfully."""
-        session_id = "integration-test"
-
-        # Watch
-        watch_response = await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={"session_id": session_id, "path": str(session_file)}
+        """Attach and detach a destination successfully."""
+        with patch.object(
+            watcher_api_with_telegram_token, "_validate_destination", new_callable=AsyncMock
+        ):
+            # Attach
+            attach_response = await watcher_api_with_telegram_token.handle_attach(
+                MockRequest(
+                    _json_data={
+                        "session_id": "test-session",
+                        "path": str(session_file),
+                        "destination": {"type": "telegram", "chat_id": "123"},
+                    }
+                )
             )
-        )
-        assert watch_response.status == 201
+            assert attach_response.status == 201
 
-        # List should show session
-        list_response = await watcher_api.handle_list_sessions(MockRequest())
-        list_data = json.loads(list_response.body)
-        assert len(list_data["sessions"]) == 1
-
-        # Unwatch
-        unwatch_response = await watcher_api.handle_unwatch(
-            MockRequest(match_info={"session_id": session_id})
-        )
-        assert unwatch_response.status == 204
-
-        # List should be empty
-        list_response2 = await watcher_api.handle_list_sessions(MockRequest())
-        list_data2 = json.loads(list_response2.body)
-        assert len(list_data2["sessions"]) == 0
-
-    async def test_watch_multiple_unwatch_one(
-        self, watcher_api: WatcherAPI, tmp_path: Path
-    ) -> None:
-        """Watch multiple sessions and unwatch one."""
-        # Create session files
-        file1 = tmp_path / "session1.jsonl"
-        file2 = tmp_path / "session2.jsonl"
-        file1.write_text('{"type":"user"}\n')
-        file2.write_text('{"type":"user"}\n')
-
-        # Watch both
-        await watcher_api.handle_watch(
-            MockRequest(_json_data={"session_id": "session-1", "path": str(file1)})
-        )
-        await watcher_api.handle_watch(
-            MockRequest(_json_data={"session_id": "session-2", "path": str(file2)})
-        )
-
-        # Unwatch one
-        await watcher_api.handle_unwatch(
-            MockRequest(match_info={"session_id": "session-1"})
-        )
-
-        # List should show only session-2
-        list_response = await watcher_api.handle_list_sessions(MockRequest())
-        list_data = json.loads(list_response.body)
-        assert len(list_data["sessions"]) == 1
-        assert list_data["sessions"][0]["session_id"] == "session-2"
-
-
-class TestIntegrationHealthWithSessions:
-    """Integration tests for health endpoint with sessions."""
-
-    async def test_health_count_updates(
-        self, watcher_api: WatcherAPI, tmp_path: Path
-    ) -> None:
-        """Health endpoint session count updates with watch/unwatch."""
-        # Initially no sessions
-        response1 = await watcher_api.handle_health(MockRequest())
-        data1 = json.loads(response1.body)
-        assert data1["sessions_watched"] == 0
-
-        # Watch a session
-        file1 = tmp_path / "session1.jsonl"
-        file1.write_text('{"type":"user"}\n')
-        await watcher_api.handle_watch(
-            MockRequest(_json_data={"session_id": "session-1", "path": str(file1)})
-        )
-
-        response2 = await watcher_api.handle_health(MockRequest())
-        data2 = json.loads(response2.body)
-        assert data2["sessions_watched"] == 1
-
-        # Unwatch
-        await watcher_api.handle_unwatch(
-            MockRequest(match_info={"session_id": "session-1"})
-        )
-
-        response3 = await watcher_api.handle_health(MockRequest())
-        data3 = json.loads(response3.body)
-        assert data3["sessions_watched"] == 0
-
-
-class TestEdgeCases:
-    """Tests for edge cases and error handling."""
-
-    async def test_watch_empty_file(
-        self, watcher_api: WatcherAPI, empty_session_file: Path
-    ) -> None:
-        """Can watch an empty session file."""
-        response = await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={
-                    "session_id": "empty-session",
-                    "path": str(empty_session_file),
-                }
+            # List should show session with destination
+            list_response = await watcher_api_with_telegram_token.handle_list_sessions(
+                MockRequest()
             )
-        )
+            list_data = json.loads(list_response.body)
+            assert len(list_data["sessions"]) == 1
+            assert list_data["sessions"][0]["destinations"]["telegram"] == [{"chat_id": "123"}]
 
-        assert response.status == 201
-
-    async def test_session_id_with_special_chars(
-        self, watcher_api: WatcherAPI, session_file: Path
-    ) -> None:
-        """Session ID with special characters is handled."""
-        # UUID-style session ID with dashes
-        response = await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={
-                    "session_id": "014d9d94-abc1-4def-8901-234567890abc",
-                    "path": str(session_file),
-                }
+            # Detach
+            detach_response = await watcher_api_with_telegram_token.handle_detach(
+                MockRequest(
+                    _json_data={
+                        "session_id": "test-session",
+                        "destination": {"type": "telegram", "chat_id": "123"},
+                    }
+                )
             )
-        )
+            assert detach_response.status == 204
 
-        assert response.status == 201
-
-        # Verify it's stored correctly
-        config = watcher_api.config_manager.get("014d9d94-abc1-4def-8901-234567890abc")
-        assert config is not None
-
-    async def test_path_with_spaces(self, watcher_api: WatcherAPI, tmp_path: Path) -> None:
-        """Path with spaces is handled correctly."""
-        dir_with_space = tmp_path / "dir with spaces"
-        dir_with_space.mkdir()
-        session_file = dir_with_space / "session.jsonl"
-        session_file.write_text('{"type":"user"}\n')
-
-        response = await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={
-                    "session_id": "space-test",
-                    "path": str(session_file),
-                }
+            # Session still exists in config (keep-alive timer will remove it later)
+            list_response2 = await watcher_api_with_telegram_token.handle_list_sessions(
+                MockRequest()
             )
-        )
-
-        assert response.status == 201
-
-
-class TestUnwatchCleansUpResources:
-    """Tests that unwatch properly cleans up all resources."""
-
-    async def test_unwatch_removes_event_buffer(
-        self, watcher_api: WatcherAPI, session_file: Path
-    ) -> None:
-        """Unwatch removes the event buffer for the session."""
-        # Watch and add an event
-        await watcher_api.handle_watch(
-            MockRequest(
-                _json_data={"session_id": "test-session", "path": str(session_file)}
-            )
-        )
-
-        # Add an event to the buffer
-        event = AddBlock(
-            block=Block(
-                id="block_1",
-                type=BlockType.ASSISTANT,
-                content=AssistantContent(text="test"),
-            )
-        )
-        watcher_api.event_buffer.add_event("test-session", event)
-
-        # Buffer should have the session
-        buffer = watcher_api.event_buffer.get_buffer("test-session")
-        assert len(buffer) > 0
-
-        # Unwatch
-        await watcher_api.handle_unwatch(
-            MockRequest(match_info={"session_id": "test-session"})
-        )
-
-        # Buffer should be removed (new buffer will be empty)
-        new_buffer = watcher_api.event_buffer.get_buffer("test-session")
-        assert len(new_buffer) == 0
+            list_data2 = json.loads(list_response2.body)
+            # Destinations should be empty but session may still exist
+            if list_data2["sessions"]:
+                assert list_data2["sessions"][0]["destinations"]["telegram"] == []
 
 
 class TestWatcherAPIStartTime:
@@ -842,26 +945,34 @@ class TestWatcherAPIStartTime:
         assert watcher_api._start_time <= time.time()
 
     def test_custom_start_time(
-        self, temp_config_path: Path, temp_state_dir: Path
+        self,
+        config_manager: ConfigManager,
+        destination_manager: DestinationManager,
+        event_buffer: EventBufferManager,
+        sse_manager: SSEManager,
     ) -> None:
         """WatcherAPI can be created with custom start time."""
         custom_time = time.time() - 3600  # 1 hour ago
 
-        config_manager = ConfigManager(temp_config_path)
-        state_manager = StateManager(temp_state_dir)
-        event_buffer = EventBufferManager()
-        file_watcher = FileWatcher(
-            on_lines_callback=dummy_callback,
-        )
-        sse_manager = SSEManager(event_buffer=event_buffer)
-
         api = WatcherAPI(
             config_manager=config_manager,
-            state_manager=state_manager,
-            file_watcher=file_watcher,
+            destination_manager=destination_manager,
             event_buffer=event_buffer,
             sse_manager=sse_manager,
             _start_time=custom_time,
         )
 
         assert api._start_time == custom_time
+
+
+# --- Tests for module imports ---
+
+
+class TestModuleImports:
+    """Tests for module imports and __all__."""
+
+    def test_watcher_api_importable(self) -> None:
+        """WatcherAPI can be imported from watcher module."""
+        from claude_session_player.watcher import WatcherAPI
+
+        assert WatcherAPI is not None
