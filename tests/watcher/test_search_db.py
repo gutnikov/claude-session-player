@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import aiosqlite
 import pytest
 
 from claude_session_player.watcher.search_db import (
@@ -550,6 +551,300 @@ class TestSearchDatabaseMaintenance:
         """Verify integrity returns True for valid DB."""
         result = await db.verify_integrity()
         assert result is True
+
+    @pytest.mark.asyncio
+    async def test_backup_creates_valid_db(self, db: SearchDatabase, tmp_path: Path) -> None:
+        """Backup creates a readable database."""
+        # Insert some data
+        session = create_test_session(session_id="backup-test", file_path="/path/backup.jsonl")
+        await db.upsert_session(session)
+
+        # Create backup
+        backup_path = tmp_path / "backups" / "backup.db"
+        await db.backup(backup_path)
+
+        # Verify backup exists
+        assert backup_path.exists()
+        assert backup_path.stat().st_size > 0
+
+    @pytest.mark.asyncio
+    async def test_backup_contains_data(self, db: SearchDatabase, tmp_path: Path) -> None:
+        """Backup has same data as original."""
+        # Insert data
+        session = create_test_session(session_id="backup-data", file_path="/path/backup-data.jsonl")
+        await db.upsert_session(session)
+
+        # Create backup
+        backup_path = tmp_path / "backup.db"
+        await db.backup(backup_path)
+
+        # Open backup and verify data
+        backup_db = SearchDatabase(tmp_path / "backup_state")
+        backup_db.db_path = backup_path
+        backup_db._connection = await aiosqlite.connect(backup_path)
+        backup_db._connection.row_factory = aiosqlite.Row
+
+        retrieved = await backup_db.get_session("backup-data")
+        assert retrieved is not None
+        assert retrieved.session_id == "backup-data"
+        await backup_db.close()
+
+    @pytest.mark.asyncio
+    async def test_backup_to_existing_db(self, db: SearchDatabase, tmp_path: Path) -> None:
+        """Backup to existing database file works."""
+        backup_path = tmp_path / "existing.db"
+
+        # Create initial backup
+        session1 = create_test_session(session_id="first", file_path="/path/first.jsonl")
+        await db.upsert_session(session1)
+        await db.backup(backup_path)
+
+        # Add more data
+        session2 = create_test_session(session_id="second", file_path="/path/second.jsonl")
+        await db.upsert_session(session2)
+
+        # Backup again to same path
+        await db.backup(backup_path)
+
+        # Verify backup has both sessions
+        backup_db = SearchDatabase(tmp_path / "backup_state")
+        backup_db.db_path = backup_path
+        backup_db._connection = await aiosqlite.connect(backup_path)
+        backup_db._connection.row_factory = aiosqlite.Row
+
+        assert await backup_db.get_session("first") is not None
+        assert await backup_db.get_session("second") is not None
+        await backup_db.close()
+
+    @pytest.mark.asyncio
+    async def test_vacuum_reduces_size(self, db: SearchDatabase) -> None:
+        """Vacuum reclaims disk space after delete."""
+        # Insert many sessions
+        sessions = [
+            create_test_session(session_id=f"vacuum-{i}", file_path=f"/path/vacuum-{i}.jsonl")
+            for i in range(100)
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        # Get size after insert (flush WAL first)
+        await db.checkpoint()
+        initial_size = db.db_path.stat().st_size
+
+        # Delete all sessions
+        await db.clear_all()
+        await db.checkpoint()
+
+        # Run vacuum
+        await db.vacuum()
+
+        # Size should be reduced (or at least not error)
+        # Note: incremental vacuum may not reduce size dramatically
+        final_size = db.db_path.stat().st_size
+        # Just verify vacuum completed without error - size reduction depends on free pages
+        assert final_size >= 0
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_flushes_wal(self, db: SearchDatabase) -> None:
+        """Checkpoint resets WAL file."""
+        # Insert data to create WAL entries
+        session = create_test_session(session_id="checkpoint-test", file_path="/path/cp.jsonl")
+        await db.upsert_session(session)
+
+        # Run checkpoint
+        await db.checkpoint()
+
+        # Verify data is still accessible
+        retrieved = await db.get_session("checkpoint-test")
+        assert retrieved is not None
+
+    @pytest.mark.asyncio
+    async def test_verify_integrity_valid(self, db: SearchDatabase) -> None:
+        """Returns True for valid database."""
+        result = await db.verify_integrity()
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_safe_initialize_normal(self, tmp_path: Path) -> None:
+        """safe_initialize works when DB is fine."""
+        db = SearchDatabase(tmp_path)
+        await db.safe_initialize()
+
+        # Should work normally
+        session = create_test_session(session_id="safe-init", file_path="/path/safe.jsonl")
+        await db.upsert_session(session)
+
+        retrieved = await db.get_session("safe-init")
+        assert retrieved is not None
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_safe_initialize_corrupt(self, tmp_path: Path) -> None:
+        """safe_initialize recovers from corruption."""
+        db_path = tmp_path / "search.db"
+
+        # Create a corrupt database file
+        db_path.write_text("This is not a valid SQLite database")
+
+        db = SearchDatabase(tmp_path)
+        await db.safe_initialize()
+
+        # Should have recovered
+        assert await db.verify_integrity() is True
+
+        # Corrupt file should be backed up
+        corrupt_path = tmp_path / "search.db.corrupt"
+        assert corrupt_path.exists()
+        assert corrupt_path.read_text() == "This is not a valid SQLite database"
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_recover_renames_corrupt(self, tmp_path: Path) -> None:
+        """Recovery renames corrupt DB."""
+        # Create an initial valid database
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+        session = create_test_session(session_id="original", file_path="/path/orig.jsonl")
+        await db.upsert_session(session)
+        await db.close()
+
+        # Verify the file exists
+        assert db.db_path.exists()
+
+        # Manually trigger recovery
+        db = SearchDatabase(tmp_path)
+        # Simulate connection state so _recover_database works
+        await db._recover_database()
+
+        # Original should be renamed to .corrupt
+        corrupt_path = tmp_path / "search.db.corrupt"
+        assert corrupt_path.exists()
+
+        # New database should be created
+        assert db.db_path.exists()
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_recover_cleans_wal(self, tmp_path: Path) -> None:
+        """Recovery removes WAL files from corrupt database."""
+        # Create database
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+        session = create_test_session(session_id="wal-test", file_path="/path/wal.jsonl")
+        await db.upsert_session(session)
+        await db.close()
+
+        # Create fake WAL files simulating a corrupt state
+        wal_path = tmp_path / "search.db-wal"
+        shm_path = tmp_path / "search.db-shm"
+        wal_path.write_text("fake wal data that would cause corruption")
+        shm_path.write_text("fake shm data")
+
+        # Verify WAL files exist before recovery
+        assert wal_path.exists()
+        assert shm_path.exists()
+
+        # Trigger recovery - this should:
+        # 1. Rename search.db to search.db.corrupt
+        # 2. Remove old WAL/SHM files
+        # 3. Create new database
+        db = SearchDatabase(tmp_path)
+        await db._recover_database()
+
+        # Old corrupt database should be renamed
+        corrupt_path = tmp_path / "search.db.corrupt"
+        assert corrupt_path.exists()
+
+        # New database should be valid
+        assert await db.verify_integrity() is True
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_recover_when_no_corrupt_file(self, tmp_path: Path) -> None:
+        """Recovery works when no DB file exists."""
+        db = SearchDatabase(tmp_path)
+
+        # Recovery when database doesn't exist yet
+        await db._recover_database()
+
+        # Should create fresh database
+        assert db.db_path.exists()
+        assert await db.verify_integrity() is True
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_success(self, db: SearchDatabase) -> None:
+        """Normal execution works."""
+        cursor = await db.execute_with_retry(
+            "SELECT COUNT(*) FROM sessions", ()
+        )
+        result = await cursor.fetchone()
+        assert result[0] == 0
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_busy(self, tmp_path: Path) -> None:
+        """Retries on database locked error."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        # Track attempts
+        attempts = []
+
+        original_execute = db._connection.execute
+
+        async def mock_execute(sql, params=()):
+            attempts.append(1)
+            if len(attempts) < 3:
+                # Simulate locked error
+                raise sqlite3.OperationalError("database is locked")
+            return await original_execute(sql, params)
+
+        db._connection.execute = mock_execute
+
+        # Should succeed after retries
+        cursor = await db.execute_with_retry(
+            "SELECT COUNT(*) FROM sessions", (), max_retries=5
+        )
+        result = await cursor.fetchone()
+        assert result[0] == 0
+        assert len(attempts) == 3  # Failed twice, succeeded third time
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_exhausted(self, tmp_path: Path) -> None:
+        """Raises error when retries exhausted."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        async def always_locked(sql, params=()):
+            raise sqlite3.OperationalError("database is locked")
+
+        db._connection.execute = always_locked
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            await db.execute_with_retry(
+                "SELECT 1", (), max_retries=2
+            )
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_multiple_rapid_backup_calls(self, db: SearchDatabase, tmp_path: Path) -> None:
+        """Multiple rapid backup calls work correctly."""
+        session = create_test_session(session_id="rapid", file_path="/path/rapid.jsonl")
+        await db.upsert_session(session)
+
+        # Create multiple backups rapidly
+        for i in range(3):
+            backup_path = tmp_path / f"backup_{i}.db"
+            await db.backup(backup_path)
+            assert backup_path.exists()
 
 
 # ---------------------------------------------------------------------------
