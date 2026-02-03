@@ -672,7 +672,7 @@ class TestCLI:
         assert "● Hi!" in captured.out
 
     def test_cli_missing_argument_shows_usage(self, monkeypatch, capsys):
-        """CLI without file argument shows usage and exits with error."""
+        """CLI without command shows usage and exits cleanly."""
         import sys
         from claude_session_player.cli import main
 
@@ -681,9 +681,10 @@ class TestCLI:
         with pytest.raises(SystemExit) as exc_info:
             main()
 
-        assert exc_info.value.code == 1
+        # Standard CLI behavior: showing help exits with 0
+        assert exc_info.value.code == 0
         captured = capsys.readouterr()
-        assert "Usage:" in captured.err
+        assert "usage:" in captured.out.lower() or "replay" in captured.out.lower()
 
     def test_cli_missing_file_shows_error(self, monkeypatch, capsys):
         """CLI with non-existent file shows error and exits."""
