@@ -23,9 +23,9 @@ from claude_session_player.events import (
 class TestBlockType:
     """Tests for BlockType enum."""
 
-    def test_block_type_has_six_values(self) -> None:
-        """BlockType enum has exactly 6 values."""
-        assert len(BlockType) == 6
+    def test_block_type_has_seven_values(self) -> None:
+        """BlockType enum has exactly 7 values."""
+        assert len(BlockType) == 7
 
     def test_block_type_user(self) -> None:
         """USER block type has correct value."""
@@ -38,6 +38,10 @@ class TestBlockType:
     def test_block_type_tool_call(self) -> None:
         """TOOL_CALL block type has correct value."""
         assert BlockType.TOOL_CALL.value == "tool_call"
+
+    def test_block_type_question(self) -> None:
+        """QUESTION block type has correct value."""
+        assert BlockType.QUESTION.value == "question"
 
     def test_block_type_thinking(self) -> None:
         """THINKING block type has correct value."""

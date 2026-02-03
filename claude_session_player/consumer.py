@@ -10,6 +10,7 @@ from .events import (
     DurationContent,
     Event,
     ProcessingContext,
+    QuestionContent,
     SystemContent,
     ThinkingContent,
     ToolCallContent,
@@ -103,6 +104,8 @@ def format_block(block: Block) -> str:
         return format_assistant_text(content.text)
     elif isinstance(content, ToolCallContent):
         return format_tool_call(content)
+    elif isinstance(content, QuestionContent):
+        return format_question(content)
     elif isinstance(content, ThinkingContent):
         return "\u2731 Thinking\u2026"
     elif isinstance(content, DurationContent):
@@ -165,6 +168,45 @@ def format_tool_call(content: ToolCallContent) -> str:
         line += f"\n  \u2514 {content.progress_text}"
 
     return line
+
+
+def format_question(content: QuestionContent) -> str:
+    """Format an AskUserQuestion block as markdown.
+
+    Args:
+        content: The QuestionContent to format.
+
+    Returns:
+        Formatted question string with options and/or answers.
+    """
+    parts: list[str] = []
+
+    for question in content.questions:
+        # Header line: ● Question: {header}
+        header = question.header or "Question"
+        lines = [f"\u25cf Question: {header}"]
+
+        # Question text: ├ {question text}
+        lines.append(f"  \u251c {question.question}")
+
+        # Check if we have an answer for this question
+        answer = None
+        if content.answers:
+            answer = content.answers.get(question.question)
+
+        if answer:
+            # Answered: └ ✓ {selected answer}
+            lines.append(f"  \u2514 \u2713 {answer}")
+        else:
+            # Pending: show options and awaiting response
+            for opt in question.options:
+                # │ ○ {label}
+                lines.append(f"  \u2502 \u25cb {opt.label}")
+            lines.append("  \u2514 (awaiting response)")
+
+        parts.append("\n".join(lines))
+
+    return "\n\n".join(parts)
 
 
 def replay_session(lines: list[dict]) -> str:
