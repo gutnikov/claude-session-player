@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from claude_session_player.watcher.api import WatcherAPI
 from claude_session_player.watcher.config import (
+    BackupConfig,
     BotConfig,
     ConfigManager,
+    DatabaseConfig,
     IndexConfig,
     SearchConfig,
     SessionConfig,
@@ -83,8 +85,10 @@ from claude_session_player.watcher.transformer import transform
 __all__ = [
     "apply_env_overrides",
     "AttachedDestination",
+    "BackupConfig",
     "BotCommandDef",
     "BotConfig",
+    "DatabaseConfig",
     "build_webhook_url",
     "check_slack_available",
     "check_telegram_available",
