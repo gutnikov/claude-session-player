@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from .formatter import format_assistant_text, format_user_text, truncate_result
-from .models import AssistantText, ScreenState, SystemOutput, ToolCall, UserMessage
-from .parser import LineType, classify_line, get_local_command_text, get_request_id, get_tool_result_info, get_tool_use_info, get_user_text
+from .models import AssistantText, ScreenState, SystemOutput, ThinkingIndicator, ToolCall, TurnDuration, UserMessage
+from .parser import LineType, classify_line, get_duration_ms, get_local_command_text, get_request_id, get_tool_result_info, get_tool_use_info, get_user_text
 from .tools import abbreviate_tool_input
 
 
@@ -30,6 +30,12 @@ def render(state: ScreenState, line: dict) -> ScreenState:
         _render_tool_use(state, line)
     elif line_type is LineType.TOOL_RESULT:
         _render_tool_result(state, line)
+    elif line_type is LineType.THINKING:
+        _render_thinking(state, line)
+    elif line_type is LineType.TURN_DURATION:
+        _render_turn_duration(state, line)
+    elif line_type is LineType.COMPACT_BOUNDARY:
+        _render_compact_boundary(state)
     # INVISIBLE and unhandled types: do nothing (future issues add more cases)
 
     return state
@@ -109,3 +115,22 @@ def _render_tool_result(state: ScreenState, line: dict) -> None:
 
     # Tool result breaks assistant grouping
     state.current_request_id = None
+
+
+def _render_thinking(state: ScreenState, line: dict) -> None:
+    """Render a thinking indicator."""
+    request_id = get_request_id(line)
+    state.elements.append(ThinkingIndicator(request_id=request_id))
+    state.current_request_id = request_id
+
+
+def _render_turn_duration(state: ScreenState, line: dict) -> None:
+    """Render turn duration timing line."""
+    duration_ms = get_duration_ms(line)
+    state.elements.append(TurnDuration(duration_ms=duration_ms))
+    state.current_request_id = None
+
+
+def _render_compact_boundary(state: ScreenState) -> None:
+    """Handle compact boundary by clearing all state."""
+    state.clear()

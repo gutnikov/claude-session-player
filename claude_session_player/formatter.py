@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
-from .models import AssistantText, ScreenState, SystemOutput, ToolCall, UserMessage
+from .models import AssistantText, ScreenState, SystemOutput, ThinkingIndicator, ToolCall, TurnDuration, UserMessage
+
+
+def format_duration(ms: int) -> str:
+    """Format milliseconds as human-readable duration.
+
+    Args:
+        ms: Duration in milliseconds.
+
+    Returns:
+        Formatted string like "5s" or "1m 28s".
+    """
+    total_seconds = ms // 1000
+    if total_seconds < 60:
+        return f"{total_seconds}s"
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+    return f"{minutes}m {seconds}s"
 
 
 def truncate_result(text: str, max_lines: int = 5) -> str:
@@ -73,6 +90,10 @@ def format_element(element: object) -> str:
             for result_line in result_lines[1:]:
                 line += f"\n    {result_line}"
         return line
+    if isinstance(element, ThinkingIndicator):
+        return "\u2731 Thinking\u2026"
+    if isinstance(element, TurnDuration):
+        return f"\u2731 Crunched for {format_duration(element.duration_ms)}"
     return ""
 
 

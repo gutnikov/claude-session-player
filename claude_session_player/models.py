@@ -38,7 +38,7 @@ class ToolCall:
 class ThinkingIndicator:
     """Thinking block. Rendered as ✱ Thinking…"""
 
-    pass
+    request_id: str | None = None
 
 
 @dataclass
