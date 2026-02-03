@@ -13,11 +13,16 @@ This module provides the main orchestration service that wires together:
 - SlackPublisher: Slack Web API integration
 - MessageStateTracker: turn-based message grouping
 - MessageDebouncer: rate-limiting message updates
+- SessionIndexer: session file discovery and indexing
+- SearchEngine: session search and ranking
+- SearchStateManager: pagination state for bot commands
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,12 +37,16 @@ from claude_session_player.watcher.debouncer import MessageDebouncer
 from claude_session_player.watcher.destinations import AttachedDestination, DestinationManager
 from claude_session_player.watcher.event_buffer import EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher
+from claude_session_player.watcher.indexer import IndexConfig, SessionIndexer
 from claude_session_player.watcher.message_state import (
     MessageStateTracker,
     NoAction,
     SendNewMessage,
     UpdateExistingMessage,
 )
+from claude_session_player.watcher.rate_limit import RateLimiter
+from claude_session_player.watcher.search import SearchEngine
+from claude_session_player.watcher.search_state import SearchStateManager
 from claude_session_player.watcher.slack_publisher import SlackError, SlackPublisher
 from claude_session_player.watcher.sse import SSEManager
 from claude_session_player.watcher.state import SessionState, StateManager
@@ -77,6 +86,11 @@ class WatcherService:
     message_state: MessageStateTracker | None = None
     message_debouncer: MessageDebouncer | None = None
 
+    # Search components
+    indexer: SessionIndexer | None = None
+    search_engine: SearchEngine | None = None
+    search_state_manager: SearchStateManager | None = None
+
     # HTTP server config
     host: str = "127.0.0.1"
     port: int = 8080
@@ -85,6 +99,7 @@ class WatcherService:
     _runner: AppRunner | None = field(default=None, repr=False)
     _site: TCPSite | None = field(default=None, repr=False)
     _running: bool = field(default=False, repr=False)
+    _refresh_task: asyncio.Task | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize components if not injected."""
@@ -130,6 +145,37 @@ class WatcherService:
         if self.message_debouncer is None:
             self.message_debouncer = MessageDebouncer()
 
+        # Initialize search components
+        index_config = self.config_manager.get_index_config()
+        search_config = self.config_manager.get_search_config()
+
+        if self.indexer is None:
+            # Convert IndexConfig from config module to indexer IndexConfig
+            indexer_config = IndexConfig(
+                refresh_interval=index_config.refresh_interval,
+                max_sessions_per_project=index_config.max_sessions_per_project,
+                include_subagents=index_config.include_subagents,
+                persist=index_config.persist,
+            )
+            self.indexer = SessionIndexer(
+                paths=index_config.expand_paths(),
+                config=indexer_config,
+                state_dir=self.state_dir,
+            )
+
+        if self.search_engine is None:
+            self.search_engine = SearchEngine(self.indexer)
+
+        if self.search_state_manager is None:
+            self.search_state_manager = SearchStateManager(
+                ttl_seconds=search_config.state_ttl_seconds
+            )
+
+        # Create rate limiters for search endpoints
+        search_limiter = RateLimiter(rate=30, window_seconds=60)  # 30/min per IP
+        preview_limiter = RateLimiter(rate=60, window_seconds=60)  # 60/min per IP
+        refresh_limiter = RateLimiter(rate=1, window_seconds=60)  # 1/60s global
+
         if self.api is None:
             self.api = WatcherAPI(
                 config_manager=self.config_manager,
@@ -137,6 +183,11 @@ class WatcherService:
                 event_buffer=self.event_buffer,
                 sse_manager=self.sse_manager,
                 replay_callback=self.replay_to_destination,
+                indexer=self.indexer,
+                search_engine=self.search_engine,
+                search_limiter=search_limiter,
+                preview_limiter=preview_limiter,
+                refresh_limiter=refresh_limiter,
             )
 
     @property
@@ -154,8 +205,10 @@ class WatcherService:
            - Validate file exists (remove from config if not)
            - Add to FileWatcher with saved position
         3. Restore messaging destinations from config
-        4. Start FileWatcher
-        5. Start HTTP server
+        4. Build initial session index
+        5. Start periodic index refresh
+        6. Start FileWatcher
+        7. Start HTTP server
         """
         if self._running:
             logger.warning("Service already running")
@@ -169,6 +222,21 @@ class WatcherService:
         # Restore messaging destinations from config
         await self.destination_manager.restore_from_config()
         logger.info("Messaging destinations restored from config")
+
+        # Build initial session index
+        if self.indexer:
+            try:
+                index = await self.indexer.get_index()
+                logger.info(
+                    f"Indexed {len(index.sessions)} sessions "
+                    f"from {len(index.projects)} projects"
+                )
+            except Exception as e:
+                logger.error(f"Failed to build initial index: {e}")
+
+        # Start periodic refresh task
+        self._refresh_task = asyncio.create_task(self._periodic_refresh())
+        logger.info("Periodic index refresh started")
 
         # Start file watcher
         await self.file_watcher.start()
@@ -189,13 +257,14 @@ class WatcherService:
 
         Shutdown sequence:
         1. Stop accepting new HTTP connections
-        2. Flush pending message updates
-        3. Close messaging publishers
-        4. Stop FileWatcher
-        5. Save all session states
-        6. Send session_ended to all SSE clients
-        7. Close all SSE connections
-        8. Exit
+        2. Cancel periodic refresh task
+        3. Flush pending message updates
+        4. Close messaging publishers
+        5. Stop FileWatcher
+        6. Save all session states
+        7. Send session_ended to all SSE clients
+        8. Close all SSE connections
+        9. Exit
         """
         if not self._running:
             return
@@ -212,6 +281,16 @@ class WatcherService:
             self._runner = None
 
         logger.info("HTTP server stopped")
+
+        # Cancel periodic refresh task
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._refresh_task = None
+            logger.info("Periodic refresh task cancelled")
 
         # Flush pending message updates
         if self.message_debouncer:
@@ -747,6 +826,33 @@ class WatcherService:
             return 0
 
         return len(events_to_replay)
+
+    async def _periodic_refresh(self) -> None:
+        """Background task for periodic index refresh.
+
+        Runs continuously, refreshing the index at the configured interval.
+        Errors are logged but do not crash the service.
+        """
+        if self.indexer is None:
+            return
+
+        index_config = self.config_manager.get_index_config()
+        interval = index_config.refresh_interval
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+
+                start = time.monotonic()
+                await self.indexer.refresh(force=True)
+                duration = time.monotonic() - start
+
+                logger.debug(f"Index refreshed in {duration:.2f}s")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Index refresh failed: {e}")
+                # Continue running, try again next interval
 
     async def validate_destination(self, destination_type: str) -> None:
         """Validate bot credentials for a destination type.

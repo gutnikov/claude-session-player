@@ -862,6 +862,236 @@ class TestWatcherServiceIntegration:
             await service.stop()
 
 
+# --- Tests for indexer integration ---
+
+
+class TestWatcherServiceIndexerIntegration:
+    """Tests for SessionIndexer integration in WatcherService."""
+
+    def test_indexer_initialized_on_service_creation(
+        self, temp_config_path: Path, temp_state_dir: Path
+    ) -> None:
+        """Indexer is initialized when service is created."""
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+        )
+
+        assert service.indexer is not None
+
+    def test_search_engine_available_via_service(
+        self, temp_config_path: Path, temp_state_dir: Path
+    ) -> None:
+        """Search engine is available via service."""
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+        )
+
+        assert service.search_engine is not None
+
+    def test_search_state_manager_available_via_service(
+        self, temp_config_path: Path, temp_state_dir: Path
+    ) -> None:
+        """SearchStateManager is available via service."""
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+        )
+
+        assert service.search_state_manager is not None
+
+    async def test_initial_index_built_on_start(
+        self, temp_config_path: Path, temp_state_dir: Path
+    ) -> None:
+        """Initial index is built during service start."""
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+            port=8920,
+        )
+
+        try:
+            await service.start()
+
+            # Index should be populated (even if empty)
+            assert service.indexer is not None
+            index = await service.indexer.get_index()
+            assert index is not None
+            # Index may be empty if no sessions exist
+        finally:
+            await service.stop()
+
+    async def test_refresh_task_started_on_start(
+        self, temp_config_path: Path, temp_state_dir: Path
+    ) -> None:
+        """Periodic refresh task is started when service starts."""
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+            port=8921,
+        )
+
+        try:
+            await service.start()
+
+            assert service._refresh_task is not None
+            assert not service._refresh_task.done()
+        finally:
+            await service.stop()
+
+    async def test_refresh_task_cancelled_on_stop(
+        self, temp_config_path: Path, temp_state_dir: Path
+    ) -> None:
+        """Refresh task is cancelled when service stops."""
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+            port=8922,
+        )
+
+        await service.start()
+        refresh_task = service._refresh_task
+        assert refresh_task is not None
+
+        await service.stop()
+
+        assert service._refresh_task is None
+        assert refresh_task.cancelled() or refresh_task.done()
+
+    async def test_api_has_indexer_access(
+        self, temp_config_path: Path, temp_state_dir: Path
+    ) -> None:
+        """API has access to indexer and search engine."""
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+            port=8923,
+        )
+
+        assert service.api is not None
+        assert service.api.indexer is not None
+        assert service.api.search_engine is not None
+
+    async def test_api_has_rate_limiters(
+        self, temp_config_path: Path, temp_state_dir: Path
+    ) -> None:
+        """API has rate limiters configured."""
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+            port=8924,
+        )
+
+        assert service.api is not None
+        assert service.api.search_limiter is not None
+        assert service.api.preview_limiter is not None
+        assert service.api.refresh_limiter is not None
+
+
+class TestWatcherServiceHealthCheckWithIndex:
+    """Tests for health check with index stats."""
+
+    async def test_health_check_includes_index_stats(
+        self, temp_config_path: Path, temp_state_dir: Path
+    ) -> None:
+        """Health check response includes index statistics."""
+        from aiohttp.test_utils import make_mocked_request
+
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+            port=8925,
+        )
+
+        try:
+            await service.start()
+
+            # Create mock request
+            request = make_mocked_request("GET", "/health")
+
+            # Call health handler
+            response = await service.api.handle_health(request)
+
+            # Parse response body
+            import json
+
+            body = json.loads(response.body)
+
+            assert "sessions_indexed" in body
+            assert "projects_indexed" in body
+            assert "index_age_seconds" in body
+            assert body["status"] == "healthy"
+        finally:
+            await service.stop()
+
+
+class TestWatcherServiceFullLifecycleWithIndexing:
+    """Integration tests for full service lifecycle with indexing."""
+
+    async def test_full_lifecycle_with_indexing(
+        self, temp_config_path: Path, temp_state_dir: Path, tmp_path: Path
+    ) -> None:
+        """Test full service lifecycle with indexer integration."""
+        from claude_session_player.watcher.indexer import IndexConfig, SessionIndexer
+        from claude_session_player.watcher.search import SearchEngine
+
+        # Create a project directory structure
+        projects_dir = tmp_path / ".claude" / "projects"
+        project_dir = projects_dir / "-tmp-test--project"
+        project_dir.mkdir(parents=True)
+
+        # Create a session file
+        session_file = project_dir / "test-session-id.jsonl"
+        session_file.write_text(
+            '{"type":"summary","summary":"Test session"}\n'
+            '{"type":"user","message":{"content":"hello"}}\n'
+        )
+
+        # Create a custom indexer with only the test paths
+        indexer = SessionIndexer(
+            paths=[projects_dir],
+            config=IndexConfig(persist=False),  # Don't persist to avoid conflicts
+            state_dir=temp_state_dir,
+        )
+        search_engine = SearchEngine(indexer)
+
+        # Now create service with injected indexer
+        service = WatcherService(
+            config_path=temp_config_path,
+            state_dir=temp_state_dir,
+            port=8926,
+            indexer=indexer,
+            search_engine=search_engine,
+        )
+
+        try:
+            await service.start()
+            assert service.is_running
+
+            # Check indexer found our session
+            index = await service.indexer.get_index()
+            assert len(index.sessions) == 1
+            assert "test-session-id" in index.sessions
+
+            # Check search engine works
+            from claude_session_player.watcher.search import SearchParams, SearchFilters
+
+            params = SearchParams(
+                query="Test",
+                terms=["Test"],
+                filters=SearchFilters(),
+            )
+            results = await service.search_engine.search(params)
+            assert results.total == 1
+
+            await service.stop()
+            assert not service.is_running
+        finally:
+            if service.is_running:
+                await service.stop()
+
+
 # --- Tests for CLI entry point ---
 
 
