@@ -486,12 +486,15 @@ class WatcherAPI:
         return response
 
     async def handle_health(self, request: web.Request) -> web.Response:
-        """Handle GET /health - health check with bot status.
+        """Handle GET /health - health check with bot and index status.
 
         Response 200:
             {
                 "status": "healthy",
                 "sessions_watched": 3,
+                "sessions_indexed": 100,
+                "projects_indexed": 5,
+                "index_age_seconds": 127,
                 "uptime_seconds": 3600,
                 "bots": {
                     "telegram": "configured",  # or "not_configured"
@@ -503,9 +506,26 @@ class WatcherAPI:
         uptime = int(time.time() - self._start_time)
         bot_config = self.config_manager.get_bot_config()
 
+        # Get index stats
+        sessions_indexed = 0
+        projects_indexed = 0
+        index_age_seconds = 0
+
+        if self.indexer is not None:
+            try:
+                index = await self.indexer.get_index()
+                sessions_indexed = len(index.sessions)
+                projects_indexed = len(index.projects)
+                index_age_seconds = self._get_index_age_seconds()
+            except Exception:
+                pass  # Index not available
+
         return web.json_response({
             "status": "healthy",
             "sessions_watched": len(sessions),
+            "sessions_indexed": sessions_indexed,
+            "projects_indexed": projects_indexed,
+            "index_age_seconds": index_age_seconds,
             "uptime_seconds": uptime,
             "bots": {
                 "telegram": "configured" if bot_config.telegram_token else "not_configured",
