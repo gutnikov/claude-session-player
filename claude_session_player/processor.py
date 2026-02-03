@@ -285,6 +285,8 @@ def _process_tool_result(context: ProcessingContext, line: dict) -> list[Event]:
                     is_error=is_error,
                     progress_text=original.progress_text,
                 )
+                # Update cache so subsequent progress messages preserve the result
+                _store_tool_content(tool_use_id, updated_content)
             else:
                 # Fallback: create content with empty tool_name/label
                 # This shouldn't happen in normal operation
