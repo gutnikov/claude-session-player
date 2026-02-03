@@ -856,6 +856,222 @@ The service automatically rate-limits message updates to stay within platform li
 
 Message state (which Telegram/Slack messages to update) is ephemeral and not persisted. After a service restart, new events will create new messages rather than updating existing ones.
 
+## Session Search
+
+Search your Claude Code sessions across all projects via Slack, Telegram, or REST API.
+
+### Quick Start
+
+1. Configure index paths in `config.yaml`:
+   ```yaml
+   index:
+     paths:
+       - "~/.claude/projects"
+   ```
+
+2. Start the watcher service (index builds automatically)
+
+3. Search via bot command:
+   - Slack: `/search auth bug`
+   - Telegram: `/search auth bug`
+
+### Search Syntax
+
+| Command | Description |
+|---------|-------------|
+| `/search auth bug` | Search for "auth" OR "bug" |
+| `/search "auth bug"` | Search exact phrase |
+| `/search auth -p trello` | Filter by project |
+| `/search -l 7d` | Last 7 days |
+| `/search --since 2024-01-01` | Since date |
+
+### Search Options
+
+| Option | Short | Description | Example |
+|--------|-------|-------------|---------|
+| `--project` | `-p` | Filter by project name (substring) | `-p trello` |
+| `--last` | `-l` | Sessions from last N units | `-l 7d`, `-l 2w`, `-l 1m` |
+| `--since` | `-s` | Sessions since date (ISO) | `-s 2024-01-01` |
+| `--until` | `-u` | Sessions until date (ISO) | `-u 2024-01-31` |
+| `--sort` | (none) | Sort: `recent`, `oldest`, `size` | `--sort size` |
+
+### Search REST API
+
+```bash
+# Search sessions
+curl "http://localhost:8080/search?q=auth&limit=5"
+
+# Search with filters
+curl "http://localhost:8080/search?q=auth&project=trello&since=2024-01-01"
+
+# List projects
+curl "http://localhost:8080/projects"
+
+# Preview session
+curl "http://localhost:8080/sessions/{session_id}/preview"
+
+# Force index refresh
+curl -X POST "http://localhost:8080/index/refresh"
+```
+
+#### GET /search
+
+Search sessions across all indexed projects.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `q` | string | (empty) | Search query |
+| `project` | string | (none) | Project name filter (substring) |
+| `since` | ISO date | (none) | Sessions modified after this date |
+| `until` | ISO date | (none) | Sessions modified before this date |
+| `sort` | enum | `recent` | `recent`, `oldest`, `size`, `duration` |
+| `limit` | int | 5 | Results per page (max: 10) |
+| `offset` | int | 0 | Pagination offset |
+
+Response:
+```json
+{
+  "query": "auth bug",
+  "total": 3,
+  "offset": 0,
+  "limit": 5,
+  "results": [
+    {
+      "session_id": "930c1604-5137-4684-a344-863b511a914c",
+      "project": {
+        "display_name": "trello-clone",
+        "encoded_name": "-Users-user-work-trello--clone"
+      },
+      "summary": "Fix authentication bug in login flow",
+      "modified_at": "2024-01-15T10:53:00Z",
+      "size_bytes": 2457
+    }
+  ]
+}
+```
+
+#### GET /projects
+
+List all indexed projects with session counts.
+
+Response:
+```json
+{
+  "projects": [
+    {
+      "display_name": "trello-clone",
+      "session_count": 5,
+      "latest_session_at": "2024-01-15T10:53:00Z"
+    }
+  ],
+  "total_projects": 4,
+  "total_sessions": 28
+}
+```
+
+#### GET /sessions/{session_id}/preview
+
+Get a preview of the session's recent activity.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | int | 5 | Number of events (max: 20) |
+
+Response:
+```json
+{
+  "session_id": "930c1604-...",
+  "project_name": "trello-clone",
+  "summary": "Fix authentication bug",
+  "total_events": 42,
+  "preview_events": [
+    {"type": "user", "text": "Can you fix the login bug?"},
+    {"type": "assistant", "text": "I'll investigate..."},
+    {"type": "tool_call", "tool_name": "Read", "label": "src/auth/login.ts"}
+  ]
+}
+```
+
+### Slack Setup for Search
+
+1. Update your Slack app manifest to add slash command:
+   ```yaml
+   features:
+     slash_commands:
+       - command: /search
+         description: Search Claude Code sessions
+         usage_hint: "[query] [-p project] [-l 7d]"
+   settings:
+     interactivity:
+       is_enabled: true
+       request_url: https://your-server/slack/interactions
+   ```
+
+2. Add `signing_secret` to config:
+   ```yaml
+   bots:
+     slack:
+       token: "xoxb-..."
+       signing_secret: "your-signing-secret"
+   ```
+
+3. Search results include interactive buttons:
+   - **Watch**: Attach session and start streaming events
+   - **Preview**: Show last 5 events in a thread
+
+### Telegram Setup for Search
+
+Bot commands are registered automatically. Choose webhook or polling mode:
+
+```yaml
+bots:
+  telegram:
+    token: "BOT_TOKEN"
+    mode: webhook  # or "polling" for local dev
+    webhook_url: "https://your-server.com"  # Required for webhook mode
+```
+
+Search results show inline keyboard buttons for Watch (👁) and Preview (📋).
+
+### Index Configuration
+
+```yaml
+index:
+  # Directories to scan (supports ~)
+  paths:
+    - "~/.claude/projects"
+
+  # Refresh interval in seconds
+  refresh_interval: 300
+
+  # Max sessions per project (oldest excluded)
+  max_sessions_per_project: 100
+
+  # Include subagent sessions
+  include_subagents: false
+
+  # Persist index to disk
+  persist: true
+```
+
+### Search Configuration
+
+```yaml
+search:
+  default_limit: 5      # Results per page
+  max_limit: 10         # Maximum allowed
+  default_sort: recent  # recent|oldest|size|duration
+  state_ttl_seconds: 300  # Pagination state TTL
+```
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `CLAUDE_INDEX_PATHS` | Comma-separated index paths |
+| `CLAUDE_INDEX_REFRESH_INTERVAL` | Refresh interval (seconds) |
+| `TELEGRAM_WEBHOOK_URL` | Telegram webhook URL |
+
 ## Breaking Changes
 
 ### v0.5.0

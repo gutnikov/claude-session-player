@@ -21,6 +21,9 @@ claude-session-player examples/projects/orca/sessions/014d9d94-xxx.jsonl
 
 # Or via Python module
 python -m claude_session_player.cli path/to/session.jsonl
+
+# Search sessions via API
+curl "http://localhost:8080/search?q=auth"
 ```
 
 ## Architecture
@@ -179,7 +182,7 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `claude_session_player/watcher/__init__.py` - Public exports
 - `claude_session_player/watcher/__main__.py` - CLI entry point for watcher service
 - `claude_session_player/watcher/service.py` - Main WatcherService orchestration
-- `claude_session_player/watcher/api.py` - REST API endpoints (attach/detach)
+- `claude_session_player/watcher/api.py` - REST API endpoints (attach/detach/search)
 - `claude_session_player/watcher/sse.py` - SSE connection management
 - `claude_session_player/watcher/destinations.py` - Destination lifecycle management
 - `claude_session_player/watcher/telegram_publisher.py` - Telegram Bot API integration
@@ -193,6 +196,16 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `claude_session_player/watcher/state.py` - Processing state persistence (JSON)
 - `claude_session_player/watcher/deps.py` - Optional dependency checking
 
+### Search Module
+- `claude_session_player/watcher/indexer.py` - Session indexer (path encoding, metadata extraction)
+- `claude_session_player/watcher/search.py` - Search engine (query parsing, ranking)
+- `claude_session_player/watcher/search_state.py` - Search state manager (pagination)
+- `claude_session_player/watcher/rate_limit.py` - Token bucket rate limiter
+- `claude_session_player/watcher/bot_router.py` - Webhook router for Slack/Telegram
+- `claude_session_player/watcher/slack_commands.py` - Slack /search command handler
+- `claude_session_player/watcher/telegram_commands.py` - Telegram /search command handler
+- `claude_session_player/watcher/telegram_bot.py` - Telegram webhook setup and polling
+
 ### Tests
 - `tests/test_parser.py` - Parser tests
 - `tests/test_processor.py` - Processor tests
@@ -204,6 +217,14 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `tests/watcher/test_*.py` - Watcher module tests
 - `tests/watcher/test_e2e.py` - End-to-end watcher tests
 - `tests/watcher/test_messaging_integration.py` - Messaging integration tests
+- `tests/watcher/test_indexer.py` - Session indexer tests
+- `tests/watcher/test_search.py` - Search engine tests
+- `tests/watcher/test_search_state.py` - Search state manager tests
+- `tests/watcher/test_rate_limit.py` - Rate limiter tests
+- `tests/watcher/test_api_search.py` - Search API endpoint tests
+- `tests/watcher/test_slack_commands.py` - Slack command handler tests
+- `tests/watcher/test_telegram_commands.py` - Telegram command handler tests
+- `tests/watcher/test_search_e2e.py` - End-to-end search flow tests
 
 ### Example Data
 - `examples/projects/*/sessions/*.jsonl` - Real session files
@@ -301,6 +322,47 @@ curl -N -H "Accept: text/event-stream" \
     http://localhost:8080/sessions/my-session/events
 ```
 
+### Searching Sessions
+
+```python
+import asyncio
+from pathlib import Path
+from claude_session_player.watcher.indexer import SessionIndexer, IndexConfig
+from claude_session_player.watcher.search import SearchEngine
+
+async def search_sessions():
+    # Build index
+    config = IndexConfig(paths=[Path("~/.claude/projects").expanduser()])
+    indexer = SessionIndexer(config)
+    await indexer.get_index()
+
+    # Search
+    engine = SearchEngine(indexer)
+    params = engine.parse_query("auth bug")
+    results = await engine.search(params)
+
+    for session in results.results:
+        print(f"{session.project_display_name}: {session.summary}")
+
+asyncio.run(search_sessions())
+```
+
+### Searching via REST API
+
+```bash
+# Search with query
+curl "http://localhost:8080/search?q=auth"
+
+# Search with filters
+curl "http://localhost:8080/search?q=auth&project=trello&limit=10"
+
+# List all projects
+curl "http://localhost:8080/projects"
+
+# Preview a session
+curl "http://localhost:8080/sessions/930c1604-5137-4684-a344-863b511a914c/preview"
+```
+
 ## Watcher Architecture
 
 The watcher service uses a layered architecture:
@@ -354,6 +416,16 @@ For each event:
 - **MessageDebouncer**: Rate-limit message updates per destination
 - **ConfigManager**: Persists watched sessions and bot config to `config.yaml`
 - **StateManager**: Persists processing context and file position per session
+
+### Search Components
+
+- **SessionIndexer**: Scans `.claude/projects` directories, builds/persists session index
+- **SearchEngine**: Query parsing, filtering, and ranking algorithm
+- **SearchStateManager**: Manages pagination state per chat for bot interactions
+- **RateLimiter**: Token bucket rate limiter for API and bot commands
+- **BotRouter**: Routes Slack/Telegram webhooks to command handlers
+- **SlackCommandHandler**: Handles Slack `/search` command and interactions
+- **TelegramCommandHandler**: Handles Telegram `/search` command and callbacks
 
 ### Configuration (config.yaml)
 
