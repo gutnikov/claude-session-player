@@ -11,7 +11,7 @@ echo "=== Claude Session Player: Implement Next Issue ==="
 echo ""
 
 # Find the next open issue (lowest number first, enforced sort by number)
-NEXT_ISSUE=$(gh issue list --state open --label enhancement --json number,title --jq 'sort_by(.number) | [.[] | select(.number >= 1 and .number <= 11)] | .[0]')
+NEXT_ISSUE=$(gh issue list --state open --label enhancement --json number,title --jq 'sort_by(.number) | .[0]')
 
 if [ -z "$NEXT_ISSUE" ] || [ "$NEXT_ISSUE" = "null" ]; then
     echo "No open issues found. All done!"
