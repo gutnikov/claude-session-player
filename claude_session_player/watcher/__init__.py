@@ -11,6 +11,7 @@ from claude_session_player.watcher.config import (
     SlackDestination,
     TelegramDestination,
 )
+from claude_session_player.watcher.debouncer import MessageDebouncer, PendingUpdate
 from claude_session_player.watcher.deps import check_slack_available, check_telegram_available
 from claude_session_player.watcher.destinations import AttachedDestination, DestinationManager
 from claude_session_player.watcher.event_buffer import EventBuffer, EventBufferManager
@@ -60,6 +61,8 @@ __all__ = [
     "check_telegram_available",
     "ConfigManager",
     "DestinationManager",
+    "MessageDebouncer",
+    "PendingUpdate",
     "escape_markdown",
     "escape_mrkdwn",
     "EventBuffer",
