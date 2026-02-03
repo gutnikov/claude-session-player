@@ -384,3 +384,156 @@ def summary_line() -> dict:
 @pytest.fixture
 def pr_link_line() -> dict:
     return {"type": "pr-link", "url": "https://github.com/org/repo/pull/1"}
+
+
+# ---------------------------------------------------------------------------
+# Issue 09 fixtures: isSidechain messages, Task tool results
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sidechain_user_line() -> dict:
+    """User message with isSidechain=true (should be INVISIBLE)."""
+    return {
+        "type": "user",
+        "isSidechain": True,
+        "isMeta": False,
+        "uuid": "side-001",
+        "parentUuid": None,
+        "sessionId": "sess-001",
+        "message": {"role": "user", "content": "sidechain user message"},
+    }
+
+
+@pytest.fixture
+def sidechain_assistant_line() -> dict:
+    """Assistant message with isSidechain=true (should be INVISIBLE)."""
+    return {
+        "type": "assistant",
+        "isSidechain": True,
+        "uuid": "side-002",
+        "parentUuid": "side-001",
+        "requestId": "req_side_001",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "sidechain response"}],
+        },
+    }
+
+
+@pytest.fixture
+def task_tool_use_line() -> dict:
+    """Task tool_use for sub-agent."""
+    return {
+        "type": "assistant",
+        "uuid": "task-001",
+        "parentUuid": "aaa-111",
+        "requestId": "req_task_001",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_task_001",
+                    "name": "Task",
+                    "input": {"description": "Explore codebase structure"},
+                }
+            ],
+        },
+    }
+
+
+@pytest.fixture
+def task_tool_result_line() -> dict:
+    """Task tool result with toolUseResult structure."""
+    return {
+        "type": "user",
+        "isMeta": False,
+        "uuid": "task-result-001",
+        "parentUuid": "task-001",
+        "sessionId": "sess-001",
+        "toolUseResult": {
+            "status": "completed",
+            "agentId": "ab97f57",
+            "content": [{"type": "text", "text": "There are still 114 errors remaining."}],
+            "totalDurationMs": 785728,
+            "totalTokens": 126186,
+            "totalToolUseCount": 77,
+        },
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_task_001",
+                    "content": "Fallback content if toolUseResult not used",
+                    "is_error": False,
+                }
+            ],
+        },
+    }
+
+
+@pytest.fixture
+def user_list_content_line() -> dict:
+    """User message with list content (not string)."""
+    return {
+        "type": "user",
+        "isMeta": False,
+        "uuid": "user-list-001",
+        "parentUuid": None,
+        "sessionId": "sess-001",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "implement this feature"}],
+        },
+    }
+
+
+@pytest.fixture
+def tool_result_list_content_line() -> dict:
+    """Tool result with list content (not string)."""
+    return {
+        "type": "user",
+        "isMeta": False,
+        "uuid": "result-list-001",
+        "parentUuid": "bbb-222",
+        "sessionId": "sess-001",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_001",
+                    "content": [
+                        {"type": "text", "text": "line 1 of result"},
+                        {"type": "text", "text": "line 2 of result"},
+                    ],
+                    "is_error": False,
+                }
+            ],
+        },
+    }
+
+
+@pytest.fixture
+def tool_result_null_content_line() -> dict:
+    """Tool result with null content."""
+    return {
+        "type": "user",
+        "isMeta": False,
+        "uuid": "result-null-001",
+        "parentUuid": "bbb-222",
+        "sessionId": "sess-001",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_001",
+                    "content": None,
+                    "is_error": False,
+                }
+            ],
+        },
+    }
