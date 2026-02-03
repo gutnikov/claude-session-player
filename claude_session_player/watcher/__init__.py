@@ -18,6 +18,18 @@ from claude_session_player.watcher.file_watcher import FileWatcher, IncrementalR
 from claude_session_player.watcher.service import WatcherService
 from claude_session_player.watcher.sse import SSEConnection, SSEManager
 from claude_session_player.watcher.state import SessionState, StateManager
+from claude_session_player.watcher.telegram_publisher import (
+    TelegramAuthError,
+    TelegramError,
+    TelegramPublisher,
+    ToolCallInfo,
+    escape_markdown,
+    format_context_compacted,
+    format_system_message,
+    format_turn_message,
+    format_user_message,
+    get_tool_icon,
+)
 from claude_session_player.watcher.transformer import transform
 
 __all__ = [
@@ -27,9 +39,15 @@ __all__ = [
     "check_telegram_available",
     "ConfigManager",
     "DestinationManager",
+    "escape_markdown",
     "EventBuffer",
     "EventBufferManager",
     "FileWatcher",
+    "format_context_compacted",
+    "format_system_message",
+    "format_turn_message",
+    "format_user_message",
+    "get_tool_icon",
     "IncrementalReader",
     "SessionConfig",
     "SessionDestinations",
@@ -38,7 +56,11 @@ __all__ = [
     "SSEConnection",
     "SSEManager",
     "StateManager",
+    "TelegramAuthError",
     "TelegramDestination",
+    "TelegramError",
+    "TelegramPublisher",
+    "ToolCallInfo",
     "WatcherAPI",
     "WatcherService",
     "transform",
