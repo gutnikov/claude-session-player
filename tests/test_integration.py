@@ -8,44 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from claude_session_player.consumer import replay_session as replay_session_new
-from claude_session_player.models import ScreenState
+from claude_session_player.consumer import replay_session
 from claude_session_player.parser import read_session
-from claude_session_player.renderer import render
-
-
-# ---------------------------------------------------------------------------
-# Helper functions for integration tests
-# ---------------------------------------------------------------------------
-
-
-def replay_session_old(jsonl_path: str | Path) -> str:
-    """Replay a full session using the OLD mutable-state API.
-
-    Args:
-        jsonl_path: Path to the JSONL session file.
-
-    Returns:
-        The markdown output from the final screen state.
-    """
-    lines = read_session(jsonl_path)
-    state = ScreenState()
-    for line in lines:
-        render(state, line)
-    return state.to_markdown()
-
-
-def replay_session(jsonl_path: str | Path) -> str:
-    """Replay a full session using the NEW event-driven API.
-
-    Args:
-        jsonl_path: Path to the JSONL session file.
-
-    Returns:
-        The markdown output from the final screen state.
-    """
-    lines = read_session(jsonl_path)
-    return replay_session_new(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +30,7 @@ SESSION_FILES = {
 
 
 # ---------------------------------------------------------------------------
-# Snapshot Tests (using new API)
+# Snapshot Tests
 # ---------------------------------------------------------------------------
 
 
@@ -75,7 +39,7 @@ class TestSnapshotSayHi:
 
     def test_simple_session_output(self):
         """Session with user->assistant text produces expected output."""
-        output = replay_session(SESSION_FILES["simple_say_hi"])
+        output = replay_session(read_session(SESSION_FILES["simple_say_hi"]))
         expected = read_snapshot("simple_say_hi.md")
         assert output == expected
 
@@ -85,7 +49,7 @@ class TestSnapshotTrelloCleanup:
 
     def test_trello_cleanup_output(self):
         """Session with thinking, tool use, tool results produces expected output."""
-        output = replay_session(SESSION_FILES["trello_cleanup"])
+        output = replay_session(read_session(SESSION_FILES["trello_cleanup"]))
         expected = read_snapshot("trello_cleanup.md")
         assert output == expected
 
@@ -95,7 +59,7 @@ class TestSnapshotBootstrapPlugin:
 
     def test_bootstrap_plugin_output(self):
         """Session with local-command-stdout produces expected output."""
-        output = replay_session(SESSION_FILES["bootstrap_plugin"])
+        output = replay_session(read_session(SESSION_FILES["bootstrap_plugin"]))
         expected = read_snapshot("bootstrap_plugin.md")
         assert output == expected
 
@@ -105,7 +69,7 @@ class TestSnapshotTaskSubagent:
 
     def test_task_subagent_output(self):
         """Session with Task tool use and collapsed result produces expected output."""
-        output = replay_session(SESSION_FILES["task_with_subagent"])
+        output = replay_session(read_session(SESSION_FILES["task_with_subagent"]))
         expected = read_snapshot("task_with_subagent.md")
         assert output == expected
 
@@ -115,7 +79,7 @@ class TestSnapshotProtoMigrationCompaction:
 
     def test_compaction_output(self):
         """Session with compact_boundary only shows post-compaction content."""
-        output = replay_session(SESSION_FILES["proto_migration_compaction"])
+        output = replay_session(read_session(SESSION_FILES["proto_migration_compaction"]))
         expected = read_snapshot("proto_migration_compaction.md")
         assert output == expected
 
@@ -127,50 +91,6 @@ def read_snapshot(filename: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Old vs New API Comparison Tests
-# ---------------------------------------------------------------------------
-
-
-class TestOldVsNewAPIComparison:
-    """Verify new event-driven API produces identical output to old API."""
-
-    def test_simple_say_hi_identical(self):
-        """Simple session produces identical output from both APIs."""
-        path = SESSION_FILES["simple_say_hi"]
-        old_output = replay_session_old(path)
-        new_output = replay_session(path)
-        assert old_output == new_output
-
-    def test_trello_cleanup_identical(self):
-        """Trello cleanup session produces identical output from both APIs."""
-        path = SESSION_FILES["trello_cleanup"]
-        old_output = replay_session_old(path)
-        new_output = replay_session(path)
-        assert old_output == new_output
-
-    def test_bootstrap_plugin_identical(self):
-        """Bootstrap plugin session produces identical output from both APIs."""
-        path = SESSION_FILES["bootstrap_plugin"]
-        old_output = replay_session_old(path)
-        new_output = replay_session(path)
-        assert old_output == new_output
-
-    def test_task_with_subagent_identical(self):
-        """Task subagent session produces identical output from both APIs."""
-        path = SESSION_FILES["task_with_subagent"]
-        old_output = replay_session_old(path)
-        new_output = replay_session(path)
-        assert old_output == new_output
-
-    def test_proto_migration_compaction_identical(self):
-        """Proto migration compaction session produces identical output from both APIs."""
-        path = SESSION_FILES["proto_migration_compaction"]
-        old_output = replay_session_old(path)
-        new_output = replay_session(path)
-        assert old_output == new_output
-
-
-# ---------------------------------------------------------------------------
 # No-Crash Tests
 # ---------------------------------------------------------------------------
 
@@ -179,7 +99,7 @@ class TestNoCrash:
     """Verify all session files process without raising exceptions."""
 
     def test_all_sessions_no_crash(self):
-        """Every real session file processes without crashing using new API."""
+        """Every real session file processes without crashing."""
         session_files = glob.glob(
             str(EXAMPLES_DIR / "projects" / "**" / "*.jsonl"), recursive=True
         )
@@ -189,7 +109,7 @@ class TestNoCrash:
             # Should not raise any exception
             lines = read_session(path)
             # Just verify it produces some output (even if empty for metadata-only sessions)
-            replay_session_new(lines)
+            replay_session(lines)
 
     def test_subagent_files_no_crash(self):
         """Subagent session files also process without crashing."""
@@ -200,7 +120,7 @@ class TestNoCrash:
         # Subagent files may or may not exist
         for path in subagent_files:
             lines = read_session(path)
-            replay_session_new(lines)
+            replay_session(lines)
 
     def test_stress_sessions_no_crash(self):
         """All session files process without crash (stress test)."""
@@ -209,15 +129,13 @@ class TestNoCrash:
         )
         for path in all_files:
             lines = read_session(path)
-            # Verify both old and new APIs work
-            output_old = replay_session_old(path)
-            output_new = replay_session_new(lines)
-            # They should produce identical output
-            assert output_old == output_new, f"Output mismatch for {path}"
+            output = replay_session(lines)
+            # Just verify we get a string back
+            assert isinstance(output, str)
 
 
 # ---------------------------------------------------------------------------
-# Focused Scenario Integration Tests (using new API)
+# Focused Scenario Integration Tests
 # ---------------------------------------------------------------------------
 
 
@@ -247,7 +165,7 @@ class TestScenarioFullTurnFlow:
             },
             {"type": "system", "subtype": "turn_duration", "durationMs": 5000},
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         assert "❯ hello" in md
         assert "✱ Thinking…" in md
@@ -296,7 +214,7 @@ class TestScenarioToolWithProgressAndResult:
                 },
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         # Should show result, not progress
         assert "● Bash(Echo test)" in md
@@ -342,7 +260,7 @@ class TestScenarioCompactionClearsHistory:
                 "message": {"content": [{"type": "text", "text": "post-compact response"}]},
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         # Pre-compaction content should NOT appear
         assert "first message" not in md
@@ -415,7 +333,7 @@ class TestScenarioParallelToolCalls:
                 },
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         # Both tool calls should be rendered
         assert "● Read(file1.py)" in md
@@ -465,7 +383,7 @@ class TestScenarioSubAgentCollapsedResult:
                 },
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         assert "● Task(Explore the codebase)" in md
         # Should use collapsed result from toolUseResult
@@ -499,7 +417,7 @@ class TestScenarioMultipleUserMessages:
                 "message": {"content": [{"type": "text", "text": "Second answer"}]},
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         # All messages should be present
         assert "❯ First question" in md
@@ -523,7 +441,7 @@ class TestScenarioMetadataOnlySession:
             {"type": "queue-operation", "operation": "dequeue"},
             {"type": "summary", "summary": "Some summary"},
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         assert md == ""
 
@@ -562,7 +480,7 @@ class TestScenarioToolResultError:
                 },
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         assert "● Bash(Fail command)" in md
         assert "✗ Command failed" in md
@@ -581,7 +499,7 @@ class TestScenarioLocalCommandOutput:
                 },
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         assert "Plugin installed successfully!" in md
 
@@ -620,7 +538,7 @@ class TestScenarioWebSearchProgress:
                 "toolUseID": "search-0",
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         assert "● WebSearch(Claude hooks 2026)" in md
         # Last progress should be shown (search results)
@@ -638,7 +556,7 @@ class TestEmptySession:
     def test_empty_session(self):
         """Empty session produces empty output."""
         lines: list[dict] = []
-        md = replay_session_new(lines)
+        md = replay_session(lines)
         assert md == ""
 
     def test_session_with_only_invisible_lines(self):
@@ -664,7 +582,7 @@ class TestEmptySession:
                 "message": {"content": [{"type": "text", "text": "sidechain assistant"}]},
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
         assert md == ""
 
 
@@ -714,7 +632,7 @@ class TestCompactionOnlyShowsPostCompaction:
                 "message": {"content": [{"type": "text", "text": "post-compact assistant"}]},
             },
         ]
-        md = replay_session_new(lines)
+        md = replay_session(lines)
 
         # Pre-compaction should NOT appear
         assert "pre-compact user" not in md

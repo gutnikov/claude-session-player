@@ -2,14 +2,6 @@
 
 import pytest
 
-from claude_session_player.models import ScreenState
-
-
-@pytest.fixture
-def empty_state() -> ScreenState:
-    """Return a fresh, empty ScreenState."""
-    return ScreenState()
-
 
 # ---------------------------------------------------------------------------
 # Issue 02 fixtures: JSONL line dicts for each message type

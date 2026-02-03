@@ -50,19 +50,11 @@ python -m claude_session_player.cli path/to/session.jsonl
 ### As a Library
 
 ```python
-from claude_session_player.models import ScreenState
-from claude_session_player.parser import read_session
-from claude_session_player.renderer import render
+from claude_session_player import replay_session, read_session
 
 # Load and replay a session
 lines = read_session("path/to/session.jsonl")
-state = ScreenState()
-
-for line in lines:
-    render(state, line)
-
-# Get the markdown output
-markdown = state.to_markdown()
+markdown = replay_session(lines)
 print(markdown)
 ```
 
@@ -238,157 +230,165 @@ Here's a complete example showing various message types:
 
 ## API Reference
 
-### Core Functions
+### High-Level API
 
-#### `render(state: ScreenState, line: dict) -> ScreenState`
+#### `replay_session(lines: list[dict]) -> str`
 
-Process a single JSONL line and update the screen state.
+Replay a session and return markdown output. This is the simplest way to use the library.
 
 ```python
-from claude_session_player.models import ScreenState
-from claude_session_player.renderer import render
+from claude_session_player import replay_session, read_session
 
-state = ScreenState()
-line = {"type": "user", "message": {"content": "Hello"}}
-state = render(state, line)
+lines = read_session("session.jsonl")
+markdown = replay_session(lines)
+print(markdown)
 ```
-
-**Arguments:**
-- `state`: The current `ScreenState` (mutated in place)
-- `line`: A parsed JSONL line dictionary
-
-**Returns:** The same `state` object, updated.
 
 #### `read_session(path: str) -> list[dict]`
 
 Read and parse all lines from a JSONL session file.
 
 ```python
-from claude_session_player.parser import read_session
+from claude_session_player import read_session
 
 lines = read_session("session.jsonl")
 for line in lines:
     print(line.get("type"))
 ```
 
-#### `classify_line(line: dict) -> LineType`
+### Event-Driven API
 
-Classify a JSONL line into one of 15 line types.
+For more control, use the event-driven architecture directly:
 
 ```python
-from claude_session_player.parser import classify_line, LineType
+from claude_session_player import (
+    ProcessingContext,
+    ScreenStateConsumer,
+    process_line,
+    read_session,
+)
 
-line_type = classify_line({"type": "user", "message": {"content": "hi"}})
-assert line_type == LineType.USER_INPUT
+# Create context and consumer
+context = ProcessingContext()
+consumer = ScreenStateConsumer()
+
+# Process each line into events, feed to consumer
+for line in read_session("session.jsonl"):
+    for event in process_line(context, line):
+        consumer.handle(event)
+
+# Get the final markdown output
+markdown = consumer.to_markdown()
+
+# Or access the internal state
+for block in consumer.blocks:
+    print(f"{block.type}: {block.id}")
 ```
 
-### Data Models
+### Event Types
 
-#### `ScreenState`
-
-Mutable state representing the terminal screen.
+The processor emits three event types:
 
 ```python
-from claude_session_player.models import ScreenState
+from claude_session_player import AddBlock, UpdateBlock, ClearAll
 
-state = ScreenState()
-state.elements      # list[ScreenElement] - rendered elements
-state.tool_calls    # dict[str, int] - tool_use_id → element index
-state.current_request_id  # str | None - current response group
-
-# Get markdown output
-markdown = state.to_markdown()
-
-# Clear all state (used on compaction)
-state.clear()
+# AddBlock: Add a new block to the consumer
+# UpdateBlock: Update an existing block (e.g., add tool result)
+# ClearAll: Clear all blocks (on compaction)
 ```
 
-#### Screen Elements
+### Block Types
 
-All visual elements that can appear in the output:
+Blocks represent visual elements in the output:
 
 ```python
-from claude_session_player.models import (
-    UserMessage,      # User input (❯)
-    AssistantText,    # Assistant response (●)
-    ToolCall,         # Tool invocation (● ToolName(...))
-    ThinkingIndicator,  # Thinking (✱ Thinking…)
-    TurnDuration,     # Timing (✱ Crunched for...)
-    SystemOutput,     # System/local command output
+from claude_session_player import Block, BlockType
+
+# BlockType variants:
+BlockType.USER        # User message (❯)
+BlockType.ASSISTANT   # Assistant text (●)
+BlockType.TOOL_CALL   # Tool invocation (● ToolName(...))
+BlockType.THINKING    # Thinking indicator (✱ Thinking…)
+BlockType.DURATION    # Turn timing (✱ Crunched for...)
+BlockType.SYSTEM      # System output
+```
+
+### Block Content Types
+
+Each block type has a specific content type:
+
+```python
+from claude_session_player import (
+    UserContent,       # text: str
+    AssistantContent,  # text: str, request_id: str | None
+    ToolCallContent,   # tool_name: str, tool_use_id: str, label: str,
+                       # result: str | None, is_error: bool, progress_text: str | None,
+                       # request_id: str | None
+    ThinkingContent,   # request_id: str | None
+    DurationContent,   # duration_ms: int
+    SystemContent,     # text: str
 )
 ```
 
-#### LineType Enum
+### Line Classification
 
-Classification of JSONL line types:
+Classify JSONL lines into semantic types:
 
 ```python
-from claude_session_player.parser import LineType
+from claude_session_player import classify_line, LineType
 
-# User message types
-LineType.USER_INPUT           # Direct user text
-LineType.TOOL_RESULT          # Tool result content
-LineType.LOCAL_COMMAND_OUTPUT # <local-command-stdout>
+line_type = classify_line({"type": "user", "message": {"content": "hi"}})
+assert line_type == LineType.USER_INPUT
 
-# Assistant message types
-LineType.ASSISTANT_TEXT       # Text response
-LineType.TOOL_USE            # Tool invocation
-LineType.THINKING            # Thinking block
-
-# System message types
-LineType.TURN_DURATION       # Turn timing
-LineType.COMPACT_BOUNDARY    # Context compaction marker
-
-# Progress message types
-LineType.BASH_PROGRESS       # Bash command output
-LineType.HOOK_PROGRESS       # Hook execution
-LineType.AGENT_PROGRESS      # Sub-agent progress
-LineType.QUERY_UPDATE        # Search query
-LineType.SEARCH_RESULTS      # Search results count
-LineType.WAITING_FOR_TASK    # Waiting for task
-
-# Skip type
-LineType.INVISIBLE           # Metadata, should not render
+# LineType variants:
+# User messages: USER_INPUT, TOOL_RESULT, LOCAL_COMMAND_OUTPUT
+# Assistant messages: ASSISTANT_TEXT, TOOL_USE, THINKING
+# System messages: TURN_DURATION, COMPACT_BOUNDARY
+# Progress: BASH_PROGRESS, HOOK_PROGRESS, AGENT_PROGRESS,
+#           QUERY_UPDATE, SEARCH_RESULTS, WAITING_FOR_TASK
+# Skip: INVISIBLE
 ```
 
 ## Advanced Usage
 
-### Processing Large Sessions
-
-For very large sessions, process incrementally:
+### Inspecting Individual Blocks
 
 ```python
-import json
-from claude_session_player.models import ScreenState
-from claude_session_player.renderer import render
+from claude_session_player import (
+    ProcessingContext, ScreenStateConsumer, process_line,
+    read_session, BlockType, ToolCallContent
+)
 
-state = ScreenState()
-with open("large_session.jsonl") as f:
-    for line_text in f:
-        if line_text.strip():
-            line = json.loads(line_text)
-            render(state, line)
+context = ProcessingContext()
+consumer = ScreenStateConsumer()
 
-print(state.to_markdown())
+for line in read_session("session.jsonl"):
+    for event in process_line(context, line):
+        consumer.handle(event)
+
+# Find all tool calls
+for block in consumer.blocks:
+    if block.type == BlockType.TOOL_CALL:
+        content = block.content  # ToolCallContent
+        print(f"{content.tool_name}: {content.label}")
+        if content.result:
+            print(f"  Result: {content.result[:50]}...")
+        if content.is_error:
+            print("  (ERROR)")
 ```
 
 ### Handling Context Compaction
 
-Claude Code uses "context compaction" to manage long conversations. When a `compact_boundary` is encountered, all prior content is cleared from the state:
+Claude Code uses "context compaction" to manage long conversations. When a `compact_boundary` is encountered, all prior content is cleared:
 
 ```python
 # After compaction, only post-compaction content is visible
-state = ScreenState()
-render(state, user_message_1)    # Will be cleared
-render(state, assistant_reply_1) # Will be cleared
-render(state, compact_boundary)  # Clears all state
-render(state, user_message_2)    # Visible in output
-render(state, assistant_reply_2) # Visible in output
+# The ClearAll event is emitted, and the consumer clears its state
 ```
 
 ### Sub-Agent Sessions
 
-Task tool invocations spawn sub-agents. Their internal messages have `isSidechain=True` and are rendered as `INVISIBLE`. The Task result shows a collapsed summary:
+Task tool invocations spawn sub-agents. Their internal messages have `isSidechain=True` and are classified as `INVISIBLE`. The Task result shows a collapsed summary:
 
 ```
 ● Task(Analyze authentication system)
@@ -396,29 +396,6 @@ Task tool invocations spawn sub-agents. Their internal messages have `isSidechai
 ```
 
 Sub-agent session files (in `subagents/` directories) can be replayed but produce empty output since all their messages are sidechain messages.
-
-### Custom Rendering
-
-You can inspect individual elements before final rendering:
-
-```python
-from claude_session_player.models import ScreenState, ToolCall
-from claude_session_player.parser import read_session
-from claude_session_player.renderer import render
-
-state = ScreenState()
-for line in read_session("session.jsonl"):
-    render(state, line)
-
-# Find all tool calls
-tool_calls = [e for e in state.elements if isinstance(e, ToolCall)]
-for tc in tool_calls:
-    print(f"{tc.tool_name}: {tc.label}")
-    if tc.result:
-        print(f"  Result: {tc.result[:50]}...")
-    if tc.is_error:
-        print("  (ERROR)")
-```
 
 ### Tool Input Abbreviation
 
@@ -489,17 +466,17 @@ pytest -xvs
 pytest --cov=claude_session_player --cov-report=term-missing
 
 # Run specific test file
-pytest tests/test_renderer.py
+pytest tests/test_parser.py
 ```
 
 ### Test Structure
 
 ```
 tests/
-├── test_models.py      # Data model tests
 ├── test_parser.py      # JSONL parsing tests
-├── test_formatter.py   # Markdown formatting tests
-├── test_renderer.py    # Render function tests
+├── test_processor.py   # Event processor tests
+├── test_consumer.py    # Consumer state tests
+├── test_formatter.py   # Formatting utility tests
 ├── test_tools.py       # Tool abbreviation tests
 ├── test_integration.py # Full session replay tests
 ├── test_stress.py      # Large session stress tests
@@ -511,14 +488,28 @@ tests/
 
 ```
 claude_session_player/
-├── __init__.py       # Package init, version
-├── models.py         # ScreenState, ScreenElement dataclasses
-├── renderer.py       # render() function, dispatch logic
-├── formatter.py      # to_markdown() and formatting helpers
+├── __init__.py       # Package init, public API exports
+├── events.py         # Event and Block dataclasses
+├── processor.py      # process_line() event generator
+├── consumer.py       # ScreenStateConsumer, replay_session()
+├── formatter.py      # Duration formatting, result truncation
 ├── parser.py         # JSONL reading, line classification
 ├── tools.py          # Tool-specific abbreviation rules
 └── cli.py            # CLI entry point
 ```
+
+### Architecture
+
+The player uses an event-driven architecture:
+
+```
+JSONL line → classify_line() → process_line() → [Event...] → Consumer → to_markdown()
+```
+
+1. **Parser** (`parser.py`): Reads JSONL, classifies lines into `LineType` variants
+2. **Processor** (`processor.py`): Generates events (`AddBlock`, `UpdateBlock`, `ClearAll`)
+3. **Consumer** (`consumer.py`): Builds state from events, produces markdown
+4. **Formatter** (`formatter.py`): Utility functions for duration and truncation
 
 ## Troubleshooting
 

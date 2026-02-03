@@ -12,9 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from claude_session_player.models import ScreenState, ToolCall, AssistantText, UserMessage
+from claude_session_player.consumer import replay_session as replay_session_fn, ScreenStateConsumer
+from claude_session_player.events import Block, BlockType, ToolCallContent, AssistantContent, UserContent
 from claude_session_player.parser import read_session, classify_line, LineType
-from claude_session_player.renderer import render
+from claude_session_player.processor import process_line
+from claude_session_player.events import ProcessingContext
 
 
 # ---------------------------------------------------------------------------
@@ -61,13 +63,15 @@ SUBAGENT_FILES = [
 ]
 
 
-def replay_session(path: Path) -> tuple[ScreenState, str]:
-    """Replay a session file and return state and markdown output."""
+def replay_session(path: Path) -> tuple[ScreenStateConsumer, str]:
+    """Replay a session file and return consumer and markdown output."""
     lines = read_session(str(path))
-    state = ScreenState()
+    context = ProcessingContext()
+    consumer = ScreenStateConsumer()
     for line in lines:
-        render(state, line)
-    return state, state.to_markdown()
+        for event in process_line(context, line):
+            consumer.handle(event)
+    return consumer, consumer.to_markdown()
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +96,7 @@ class TestStressSessionSnapshots:
         assert len(lines) == expected_lines, f"Expected {expected_lines} lines, got {len(lines)}"
 
         # Replay and get markdown
-        state, output = replay_session(jsonl_path)
+        consumer, output = replay_session(jsonl_path)
 
         # Verify output is not empty
         assert output.strip(), "Output should not be empty"
@@ -123,13 +127,15 @@ class TestSubagentReplay:
         assert len(lines) > 0, "Subagent file should not be empty"
 
         # Replay should complete without raising exceptions
-        state = ScreenState()
+        context = ProcessingContext()
+        consumer = ScreenStateConsumer()
         for line in lines:
-            render(state, line)
+            for event in process_line(context, line):
+                consumer.handle(event)
 
         # Output may be empty because isSidechain messages are invisible
         # This is expected behavior - we just verify no crash
-        _ = state.to_markdown()
+        _ = consumer.to_markdown()
 
     @pytest.mark.parametrize(
         "jsonl_path",
@@ -164,10 +170,12 @@ class TestPerformance:
         start = time.perf_counter()
 
         lines = read_session(str(jsonl_path))
-        state = ScreenState()
+        context = ProcessingContext()
+        consumer = ScreenStateConsumer()
         for line in lines:
-            render(state, line)
-        _ = state.to_markdown()
+            for event in process_line(context, line):
+                consumer.handle(event)
+        _ = consumer.to_markdown()
 
         elapsed = time.perf_counter() - start
 
@@ -207,26 +215,23 @@ class TestEdgeCaseCoverage:
         assert list_content_count > 0, "Expected to find list content tool results"
 
         # Replay should handle all without errors
-        state, output = replay_session(jsonl_path)
+        consumer, output = replay_session(jsonl_path)
         assert output.strip(), "Output should not be empty"
 
     def test_long_tool_outputs_truncated(self) -> None:
         """Test that long tool outputs are truncated to 5 lines."""
         # Session 1 has 140 tool outputs with >5 lines
         jsonl_path = STRESS_SESSIONS[0][0]
-        state, output = replay_session(jsonl_path)
+        consumer, output = replay_session(jsonl_path)
 
-        # Find tool calls with results in the state
-        for elem in state.elements:
-            if isinstance(elem, ToolCall) and elem.result is not None:
-                result_lines = elem.result.split("\n")
-                assert len(result_lines) <= 5, (
-                    f"Tool result should be truncated to 5 lines, got {len(result_lines)}"
-                )
-                if len(result_lines) == 5:
-                    # Last line should be "…" if truncated
-                    # (unless result is exactly 5 lines without truncation)
-                    pass
+        # Find tool call blocks with results in the consumer
+        for block in consumer.blocks:
+            if block.type == BlockType.TOOL_CALL and isinstance(block.content, ToolCallContent):
+                if block.content.result is not None:
+                    result_lines = block.content.result.split("\n")
+                    assert len(result_lines) <= 5, (
+                        f"Tool result should be truncated to 5 lines, got {len(result_lines)}"
+                    )
 
     def test_parallel_tool_calls_rendered(self) -> None:
         """Test that parallel tool calls with same requestId are all rendered."""
@@ -253,8 +258,8 @@ class TestEdgeCaseCoverage:
         assert parallel_count > 0, "Expected to find parallel tool calls"
 
         # Replay and verify all tool calls are in output
-        state, output = replay_session(jsonl_path)
-        tool_call_count = sum(1 for e in state.elements if isinstance(e, ToolCall))
+        consumer, output = replay_session(jsonl_path)
+        tool_call_count = sum(1 for b in consumer.blocks if b.type == BlockType.TOOL_CALL)
         assert tool_call_count > parallel_count, "Should have more tool calls than parallel sequences"
 
     def test_compaction_clears_state(self) -> None:
@@ -269,12 +274,14 @@ class TestEdgeCaseCoverage:
         assert compaction_count > 0, "Expected compaction boundaries"
 
         # Replay with tracking
-        state = ScreenState()
+        context = ProcessingContext()
+        consumer = ScreenStateConsumer()
         element_counts = []
         for line in lines:
-            render(state, line)
+            for event in process_line(context, line):
+                consumer.handle(event)
             if classify_line(line) == LineType.COMPACT_BOUNDARY:
-                element_counts.append(len(state.elements))
+                element_counts.append(len(consumer.blocks))
 
         # After compaction, element count should drop to 0
         for count in element_counts:
@@ -284,7 +291,7 @@ class TestEdgeCaseCoverage:
         """Test that thinking and text with same requestId have no blank line between them."""
         # Session 3 has 242 thinking blocks
         jsonl_path = STRESS_SESSIONS[2][0]
-        state, output = replay_session(jsonl_path)
+        consumer, output = replay_session(jsonl_path)
 
         # Check that "✱ Thinking…" is not followed by a blank line before "●"
         lines = output.split("\n")
@@ -304,26 +311,28 @@ class TestStressSessionFeatures:
     def test_session_has_user_input(self) -> None:
         """Test that sessions contain rendered user input."""
         for jsonl_path, _, _ in STRESS_SESSIONS[:2]:
-            state, output = replay_session(jsonl_path)
-            user_messages = [e for e in state.elements if isinstance(e, UserMessage)]
-            assert len(user_messages) > 0, "Should have at least one user message"
+            consumer, output = replay_session(jsonl_path)
+            user_blocks = [b for b in consumer.blocks if b.type == BlockType.USER]
+            assert len(user_blocks) > 0, "Should have at least one user message"
             assert "❯" in output, "Output should contain user prompt prefix"
 
     def test_session_has_assistant_text(self) -> None:
         """Test that sessions contain rendered assistant text."""
         for jsonl_path, _, _ in STRESS_SESSIONS[:2]:
-            state, output = replay_session(jsonl_path)
-            assistant_texts = [e for e in state.elements if isinstance(e, AssistantText)]
-            assert len(assistant_texts) > 0, "Should have assistant text blocks"
+            consumer, output = replay_session(jsonl_path)
+            assistant_blocks = [b for b in consumer.blocks if b.type == BlockType.ASSISTANT]
+            assert len(assistant_blocks) > 0, "Should have assistant text blocks"
             assert "●" in output, "Output should contain assistant bullet prefix"
 
     def test_session_has_tool_results(self) -> None:
         """Test that sessions contain tool calls with results."""
         for jsonl_path, _, _ in STRESS_SESSIONS[:2]:
-            state, output = replay_session(jsonl_path)
+            consumer, output = replay_session(jsonl_path)
             tool_calls_with_results = [
-                e for e in state.elements
-                if isinstance(e, ToolCall) and e.result is not None
+                b for b in consumer.blocks
+                if b.type == BlockType.TOOL_CALL
+                and isinstance(b.content, ToolCallContent)
+                and b.content.result is not None
             ]
             assert len(tool_calls_with_results) > 0, "Should have tool calls with results"
             assert "└" in output, "Output should contain result connector"
@@ -332,5 +341,5 @@ class TestStressSessionFeatures:
         """Test that sessions contain turn duration markers."""
         # Use session 4 which has turn duration
         jsonl_path = STRESS_SESSIONS[3][0]
-        state, output = replay_session(jsonl_path)
+        consumer, output = replay_session(jsonl_path)
         assert "✱ Crunched for" in output, "Output should contain turn duration"
