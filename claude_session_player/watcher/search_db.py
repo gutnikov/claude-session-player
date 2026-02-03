@@ -32,6 +32,17 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class SearchFilters:
+    """Filters for search queries."""
+
+    query: str | None = None
+    project: str | None = None
+    since: datetime | None = None
+    until: datetime | None = None
+    include_subagents: bool = False
+
+
+@dataclass
 class IndexedSession:
     """Session metadata stored in the search index."""
 
@@ -99,6 +110,14 @@ class IndexedSession:
             has_subagents=bool(row["has_subagents"]),
             is_subagent=bool(row["is_subagent"]),
         )
+
+
+@dataclass
+class SearchResult:
+    """Search result with ranking score."""
+
+    session: IndexedSession
+    score: float
 
 
 # ---------------------------------------------------------------------------
@@ -617,3 +636,206 @@ class SearchDatabase:
         async with conn.execute("PRAGMA integrity_check") as cursor:
             result = await cursor.fetchone()
             return result[0] == "ok"
+
+    # ================================================================
+    # Search Operations
+    # ================================================================
+
+    async def search(
+        self,
+        filters: SearchFilters,
+        sort: str = "recent",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[IndexedSession], int]:
+        """Search sessions with filters.
+
+        Returns (results, total_count).
+
+        Note: This returns unranked results. Use search_ranked()
+        for results with relevance scoring.
+
+        Args:
+            filters: Search filters to apply.
+            sort: Sort order. One of: recent, oldest, size, duration, name.
+            limit: Maximum number of results to return.
+            offset: Number of results to skip.
+
+        Returns:
+            Tuple of (list of matching sessions, total count).
+        """
+        conn = await self._get_connection()
+
+        # Build WHERE clause
+        conditions: list[str] = []
+        params: list = []
+
+        if not filters.include_subagents:
+            conditions.append("is_subagent = 0")
+
+        if filters.project:
+            conditions.append("project_display_name LIKE ?")
+            params.append(f"%{filters.project}%")
+
+        if filters.since:
+            conditions.append("file_modified_at >= ?")
+            params.append(filters.since.isoformat())
+
+        if filters.until:
+            conditions.append("file_modified_at <= ?")
+            params.append(filters.until.isoformat())
+
+        # Text search
+        if filters.query:
+            if self.fts_available:
+                # Use FTS5
+                fts_query = self._build_fts_query(filters.query)
+                conditions.append(
+                    """
+                    session_id IN (
+                        SELECT session_id FROM sessions_fts
+                        WHERE sessions_fts MATCH ?
+                    )
+                """
+                )
+                params.append(fts_query)
+            else:
+                # Fallback to LIKE
+                terms = filters.query.lower().split()
+                term_conditions = []
+                for term in terms:
+                    term_conditions.append(
+                        "(LOWER(summary) LIKE ? OR LOWER(project_display_name) LIKE ?)"
+                    )
+                    params.extend([f"%{term}%", f"%{term}%"])
+                if term_conditions:
+                    conditions.append(f"({' OR '.join(term_conditions)})")
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        # Sort
+        order_by = {
+            "recent": "file_modified_at DESC",
+            "oldest": "file_modified_at ASC",
+            "size": "size_bytes DESC",
+            "duration": "COALESCE(duration_ms, 0) DESC",
+            "name": "project_display_name ASC, file_modified_at DESC",
+        }.get(sort, "file_modified_at DESC")
+
+        # Count total
+        count_sql = f"SELECT COUNT(*) FROM sessions WHERE {where_clause}"
+        async with conn.execute(count_sql, params) as cursor:
+            total = (await cursor.fetchone())[0]
+
+        # Fetch results
+        sql = f"""
+            SELECT * FROM sessions
+            WHERE {where_clause}
+            ORDER BY {order_by}
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+
+        async with conn.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            results = [IndexedSession.from_row(row) for row in rows]
+
+        return results, total
+
+    async def search_ranked(
+        self,
+        filters: SearchFilters,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> tuple[list[SearchResult], int]:
+        """Search sessions with relevance ranking.
+
+        Uses the ranking algorithm from the search API spec:
+        - Summary match: 2.0 per term
+        - Exact phrase match: +1.0 bonus
+        - Project name match: 1.0 per term
+        - Recency boost: max 1.0, decays over 30 days
+
+        Args:
+            filters: Search filters to apply.
+            limit: Maximum number of results to return.
+            offset: Number of results to skip.
+
+        Returns:
+            Tuple of (list of ranked search results, total count).
+        """
+        # Get more candidates than needed for ranking
+        candidates, _ = await self.search(
+            filters=filters,
+            sort="recent",
+            limit=limit * 3 + offset,
+            offset=0,
+        )
+
+        if not filters.query:
+            # No query = no ranking, just return by recency
+            return [
+                SearchResult(session=s, score=0.0)
+                for s in candidates[offset : offset + limit]
+            ], len(candidates)
+
+        # Rank candidates
+        terms = [t.lower() for t in filters.query.split()]
+        query_lower = filters.query.lower()
+        now = datetime.now(timezone.utc)
+
+        scored: list[SearchResult] = []
+        for session in candidates:
+            score = self._calculate_score(session, query_lower, terms, now)
+            if score > 0:
+                scored.append(SearchResult(session=session, score=score))
+
+        # Sort by score descending, then by modified_at descending for tiebreaker
+        scored.sort(key=lambda r: (-r.score, -r.session.file_modified_at.timestamp()))
+
+        return scored[offset : offset + limit], len(scored)
+
+    def _calculate_score(
+        self,
+        session: IndexedSession,
+        query_lower: str,
+        terms: list[str],
+        now: datetime,
+    ) -> float:
+        """Calculate relevance score for a session.
+
+        Implements the ranking algorithm from the search API spec.
+
+        Args:
+            session: The session to score.
+            query_lower: The lowercase query string.
+            terms: List of lowercase query terms.
+            now: Current datetime for recency calculation.
+
+        Returns:
+            Relevance score (higher is better).
+        """
+        score = 0.0
+
+        # Summary matches (weight: 2.0 per term)
+        summary_lower = (session.summary or "").lower()
+        for term in terms:
+            if term in summary_lower:
+                score += 2.0
+
+        # Exact phrase bonus
+        if query_lower in summary_lower:
+            score += 1.0
+
+        # Project name matches (weight: 1.0 per term)
+        project_lower = session.project_display_name.lower()
+        for term in terms:
+            if term in project_lower:
+                score += 1.0
+
+        # Recency boost (max 1.0 for today, decays over 30 days)
+        days_old = (now - session.file_modified_at).days
+        recency_boost = max(0.0, 1.0 - (days_old / 30))
+        score += recency_boost
+
+        return score

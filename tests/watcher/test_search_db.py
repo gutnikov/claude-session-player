@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_session_player.watcher.search_db import IndexedSession, SearchDatabase
+from claude_session_player.watcher.search_db import (
+    IndexedSession,
+    SearchDatabase,
+    SearchFilters,
+    SearchResult,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1100,3 +1105,852 @@ class TestFTS5Integration:
             rows = await cursor.fetchall()
             session_ids = {row["session_id"] for row in rows}
             assert "s1" in session_ids  # Has "authentication bug" in summary
+
+
+# ---------------------------------------------------------------------------
+# SearchFilters dataclass tests
+# ---------------------------------------------------------------------------
+
+
+class TestSearchFilters:
+    """Tests for SearchFilters dataclass."""
+
+    def test_create_search_filters_defaults(self) -> None:
+        """Create SearchFilters with default values."""
+        filters = SearchFilters()
+        assert filters.query is None
+        assert filters.project is None
+        assert filters.since is None
+        assert filters.until is None
+        assert filters.include_subagents is False
+
+    def test_create_search_filters_all_fields(self) -> None:
+        """Create SearchFilters with all fields."""
+        now = datetime.now(timezone.utc)
+        filters = SearchFilters(
+            query="auth bug",
+            project="trello",
+            since=now - timedelta(days=7),
+            until=now,
+            include_subagents=True,
+        )
+        assert filters.query == "auth bug"
+        assert filters.project == "trello"
+        assert filters.since is not None
+        assert filters.until is not None
+        assert filters.include_subagents is True
+
+
+# ---------------------------------------------------------------------------
+# SearchResult dataclass tests
+# ---------------------------------------------------------------------------
+
+
+class TestSearchResult:
+    """Tests for SearchResult dataclass."""
+
+    def test_create_search_result(self) -> None:
+        """Create SearchResult with session and score."""
+        session = create_test_session(session_id="test-result")
+        result = SearchResult(session=session, score=4.5)
+        assert result.session.session_id == "test-result"
+        assert result.score == 4.5
+
+    def test_search_result_zero_score(self) -> None:
+        """Create SearchResult with zero score."""
+        session = create_test_session(session_id="zero-score")
+        result = SearchResult(session=session, score=0.0)
+        assert result.score == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Search basic tests
+# ---------------------------------------------------------------------------
+
+
+class TestSearchBasic:
+    """Tests for basic search operations."""
+
+    @pytest.fixture
+    async def db_with_sessions(self, tmp_path: Path) -> SearchDatabase:
+        """Create database with multiple test sessions."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        sessions = [
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                summary="Fix authentication bug in login",
+                project_display_name="trello",
+                file_modified_at=now - timedelta(days=1),
+                size_bytes=1000,
+                duration_ms=60000,
+                is_subagent=False,
+            ),
+            create_test_session(
+                session_id="s2",
+                file_path="/path/s2.jsonl",
+                summary="Add user registration feature",
+                project_display_name="trello",
+                file_modified_at=now - timedelta(days=2),
+                size_bytes=2000,
+                duration_ms=120000,
+                is_subagent=False,
+            ),
+            create_test_session(
+                session_id="s3",
+                file_path="/path/s3.jsonl",
+                summary="Update API documentation",
+                project_display_name="api-docs",
+                file_modified_at=now - timedelta(days=3),
+                size_bytes=500,
+                duration_ms=30000,
+                is_subagent=False,
+            ),
+            create_test_session(
+                session_id="s4",
+                file_path="/path/s4.jsonl",
+                summary="Subagent task session",
+                project_display_name="trello",
+                file_modified_at=now - timedelta(days=1),
+                is_subagent=True,
+            ),
+            create_test_session(
+                session_id="s5",
+                file_path="/path/s5.jsonl",
+                summary="Debug authentication issues",
+                project_display_name="auth-service",
+                file_modified_at=now - timedelta(days=10),
+                size_bytes=3000,
+                duration_ms=90000,
+                is_subagent=False,
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+        yield db
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_no_filters(self, db_with_sessions: SearchDatabase) -> None:
+        """Search with no filters returns all non-subagent sessions."""
+        results, total = await db_with_sessions.search(SearchFilters())
+        assert total == 4  # Excludes subagent session
+        assert len(results) == 4
+
+    @pytest.mark.asyncio
+    async def test_search_by_query_fts(self, db_with_sessions: SearchDatabase) -> None:
+        """Search by query using FTS5 (if available)."""
+        # FTS5 uses porter stemmer, so "authentication" matches "auth" query
+        results, total = await db_with_sessions.search(SearchFilters(query="authentication"))
+        # Should find sessions with "authentication" in summary
+        session_ids = {s.session_id for s in results}
+        assert "s1" in session_ids  # "authentication bug" in summary
+        assert "s5" in session_ids  # "authentication issues" in summary
+
+    @pytest.mark.asyncio
+    async def test_search_by_query_like(self, db_with_sessions: SearchDatabase) -> None:
+        """Search by query using LIKE fallback."""
+        # Force LIKE fallback
+        db_with_sessions._fts_available = False
+
+        # LIKE does substring matching, so "auth" should find "authentication"
+        results, total = await db_with_sessions.search(SearchFilters(query="auth"))
+        session_ids = {s.session_id for s in results}
+        assert "s1" in session_ids  # "authentication" in summary
+        assert "s5" in session_ids  # "authentication" in summary, "auth" in project
+
+    @pytest.mark.asyncio
+    async def test_search_by_project(self, db_with_sessions: SearchDatabase) -> None:
+        """Search by project name filter."""
+        results, total = await db_with_sessions.search(SearchFilters(project="trello"))
+        assert total == 2  # 2 non-subagent trello sessions
+        for session in results:
+            assert session.project_display_name == "trello"
+
+    @pytest.mark.asyncio
+    async def test_search_by_since(self, db_with_sessions: SearchDatabase) -> None:
+        """Search by since date filter."""
+        since = datetime.now(timezone.utc) - timedelta(days=2, hours=1)
+        results, total = await db_with_sessions.search(SearchFilters(since=since))
+        # Should find sessions modified in last ~2 days
+        assert total == 2  # s1 (1 day), s2 (2 days)
+
+    @pytest.mark.asyncio
+    async def test_search_by_until(self, db_with_sessions: SearchDatabase) -> None:
+        """Search by until date filter."""
+        until = datetime.now(timezone.utc) - timedelta(days=2)
+        results, total = await db_with_sessions.search(SearchFilters(until=until))
+        # Should find sessions modified 2+ days ago
+        assert total >= 2  # s2, s3, s5
+
+    @pytest.mark.asyncio
+    async def test_search_combined_filters(self, db_with_sessions: SearchDatabase) -> None:
+        """Search with multiple filters combined."""
+        since = datetime.now(timezone.utc) - timedelta(days=3)
+        results, total = await db_with_sessions.search(
+            SearchFilters(project="trello", since=since)
+        )
+        # Should find trello sessions modified in last 3 days
+        assert total == 2  # s1 and s2
+        for session in results:
+            assert session.project_display_name == "trello"
+
+    @pytest.mark.asyncio
+    async def test_search_excludes_subagents(
+        self, db_with_sessions: SearchDatabase
+    ) -> None:
+        """Search excludes subagent sessions by default."""
+        results, total = await db_with_sessions.search(SearchFilters())
+        session_ids = {s.session_id for s in results}
+        assert "s4" not in session_ids  # Subagent session excluded
+
+    @pytest.mark.asyncio
+    async def test_search_includes_subagents(
+        self, db_with_sessions: SearchDatabase
+    ) -> None:
+        """Search includes subagent sessions when flag set."""
+        results, total = await db_with_sessions.search(
+            SearchFilters(include_subagents=True)
+        )
+        session_ids = {s.session_id for s in results}
+        assert "s4" in session_ids  # Subagent session included
+        assert total == 5
+
+    @pytest.mark.asyncio
+    async def test_search_pagination(self, db_with_sessions: SearchDatabase) -> None:
+        """Search pagination with offset and limit."""
+        # Get first 2
+        results1, total = await db_with_sessions.search(SearchFilters(), limit=2, offset=0)
+        assert len(results1) == 2
+        assert total == 4  # Total unchanged by pagination
+
+        # Get next 2
+        results2, _ = await db_with_sessions.search(SearchFilters(), limit=2, offset=2)
+        assert len(results2) == 2
+
+        # No overlap
+        ids1 = {s.session_id for s in results1}
+        ids2 = {s.session_id for s in results2}
+        assert ids1.isdisjoint(ids2)
+
+    @pytest.mark.asyncio
+    async def test_search_returns_total(self, db_with_sessions: SearchDatabase) -> None:
+        """Search returns accurate total count."""
+        results, total = await db_with_sessions.search(SearchFilters(), limit=2)
+        assert len(results) == 2
+        assert total == 4  # All non-subagent sessions
+
+
+# ---------------------------------------------------------------------------
+# Search sorting tests
+# ---------------------------------------------------------------------------
+
+
+class TestSearchSorting:
+    """Tests for search sort options."""
+
+    @pytest.fixture
+    async def db_with_varied_sessions(self, tmp_path: Path) -> SearchDatabase:
+        """Create database with sessions having varied attributes."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        sessions = [
+            create_test_session(
+                session_id="recent",
+                file_path="/path/recent.jsonl",
+                summary="Recent session",
+                project_display_name="alpha",
+                file_modified_at=now - timedelta(hours=1),
+                size_bytes=1000,
+                duration_ms=30000,
+            ),
+            create_test_session(
+                session_id="old",
+                file_path="/path/old.jsonl",
+                summary="Old session",
+                project_display_name="zeta",
+                file_modified_at=now - timedelta(days=30),
+                size_bytes=5000,
+                duration_ms=120000,
+            ),
+            create_test_session(
+                session_id="medium",
+                file_path="/path/medium.jsonl",
+                summary="Medium session",
+                project_display_name="beta",
+                file_modified_at=now - timedelta(days=5),
+                size_bytes=3000,
+                duration_ms=60000,
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+        yield db
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_sort_recent(
+        self, db_with_varied_sessions: SearchDatabase
+    ) -> None:
+        """Sort by most recent first."""
+        results, _ = await db_with_varied_sessions.search(SearchFilters(), sort="recent")
+        assert results[0].session_id == "recent"
+        assert results[-1].session_id == "old"
+
+    @pytest.mark.asyncio
+    async def test_search_sort_oldest(
+        self, db_with_varied_sessions: SearchDatabase
+    ) -> None:
+        """Sort by oldest first."""
+        results, _ = await db_with_varied_sessions.search(SearchFilters(), sort="oldest")
+        assert results[0].session_id == "old"
+        assert results[-1].session_id == "recent"
+
+    @pytest.mark.asyncio
+    async def test_search_sort_size(
+        self, db_with_varied_sessions: SearchDatabase
+    ) -> None:
+        """Sort by size descending."""
+        results, _ = await db_with_varied_sessions.search(SearchFilters(), sort="size")
+        assert results[0].session_id == "old"  # 5000 bytes
+        assert results[1].session_id == "medium"  # 3000 bytes
+        assert results[2].session_id == "recent"  # 1000 bytes
+
+    @pytest.mark.asyncio
+    async def test_search_sort_duration(
+        self, db_with_varied_sessions: SearchDatabase
+    ) -> None:
+        """Sort by duration descending."""
+        results, _ = await db_with_varied_sessions.search(SearchFilters(), sort="duration")
+        assert results[0].session_id == "old"  # 120000 ms
+        assert results[1].session_id == "medium"  # 60000 ms
+        assert results[2].session_id == "recent"  # 30000 ms
+
+    @pytest.mark.asyncio
+    async def test_search_sort_name(
+        self, db_with_varied_sessions: SearchDatabase
+    ) -> None:
+        """Sort by project name ascending."""
+        results, _ = await db_with_varied_sessions.search(SearchFilters(), sort="name")
+        assert results[0].project_display_name == "alpha"
+        assert results[1].project_display_name == "beta"
+        assert results[2].project_display_name == "zeta"
+
+    @pytest.mark.asyncio
+    async def test_search_sort_duration_null(self, tmp_path: Path) -> None:
+        """Sort by duration handles null values."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        sessions = [
+            create_test_session(
+                session_id="with_duration",
+                file_path="/path/with.jsonl",
+                duration_ms=60000,
+            ),
+            create_test_session(
+                session_id="no_duration",
+                file_path="/path/no.jsonl",
+                duration_ms=None,
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        results, _ = await db.search(SearchFilters(), sort="duration")
+        # Session with duration should come first
+        assert results[0].session_id == "with_duration"
+
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Search ranking tests
+# ---------------------------------------------------------------------------
+
+
+class TestSearchRanking:
+    """Tests for search ranking algorithm."""
+
+    @pytest.fixture
+    async def db_for_ranking(self, tmp_path: Path) -> SearchDatabase:
+        """Create database with sessions for ranking tests."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        sessions = [
+            create_test_session(
+                session_id="summary_match",
+                file_path="/path/summary_match.jsonl",
+                summary="Fix authentication bug in login flow",
+                project_display_name="backend",
+                file_modified_at=now - timedelta(days=15),
+            ),
+            create_test_session(
+                session_id="project_match",
+                file_path="/path/project_match.jsonl",
+                summary="Add new feature",
+                project_display_name="auth-service",
+                file_modified_at=now - timedelta(days=15),
+            ),
+            create_test_session(
+                session_id="recent_match",
+                file_path="/path/recent_match.jsonl",
+                summary="Debug auth issues",
+                project_display_name="api",
+                file_modified_at=now,  # Today
+            ),
+            create_test_session(
+                session_id="no_match",
+                file_path="/path/no_match.jsonl",
+                summary="Update docs",
+                project_display_name="docs",
+                file_modified_at=now - timedelta(days=15),
+            ),
+            create_test_session(
+                session_id="exact_phrase",
+                file_path="/path/exact_phrase.jsonl",
+                summary="auth bug in login system",
+                project_display_name="web",
+                file_modified_at=now - timedelta(days=15),
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+        yield db
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_ranking_summary_match(self, db_for_ranking: SearchDatabase) -> None:
+        """Summary match adds 2.0 per term."""
+        results, _ = await db_for_ranking.search_ranked(SearchFilters(query="authentication"))
+        # Should find session with "authentication" in summary
+        session_ids = [r.session.session_id for r in results]
+        assert "summary_match" in session_ids
+
+        # Check score
+        for r in results:
+            if r.session.session_id == "summary_match":
+                # 2.0 for "authentication" + recency boost
+                assert r.score >= 2.0
+
+    @pytest.mark.asyncio
+    async def test_ranking_exact_phrase(self, db_for_ranking: SearchDatabase) -> None:
+        """Exact phrase adds 1.0 bonus."""
+        results, _ = await db_for_ranking.search_ranked(SearchFilters(query="auth bug"))
+
+        # Find the exact phrase match session
+        exact_match = next(
+            (r for r in results if r.session.session_id == "exact_phrase"), None
+        )
+        assert exact_match is not None
+        # 2.0 for "auth" + 2.0 for "bug" + 1.0 for exact phrase + recency
+        assert exact_match.score >= 5.0
+
+    @pytest.mark.asyncio
+    async def test_ranking_project_match(self, db_for_ranking: SearchDatabase) -> None:
+        """Project name match adds 1.0 per term."""
+        results, _ = await db_for_ranking.search_ranked(SearchFilters(query="auth"))
+
+        # Find the project match session
+        project_match = next(
+            (r for r in results if r.session.session_id == "project_match"), None
+        )
+        assert project_match is not None
+        # 1.0 for "auth" in project name + recency boost
+        assert project_match.score >= 1.0
+
+    @pytest.mark.asyncio
+    async def test_ranking_recency_boost(self, db_for_ranking: SearchDatabase) -> None:
+        """Today's session adds 1.0, old sessions add less."""
+        results, _ = await db_for_ranking.search_ranked(SearchFilters(query="auth"))
+
+        # Find the recent match session
+        recent_match = next(
+            (r for r in results if r.session.session_id == "recent_match"), None
+        )
+        assert recent_match is not None
+        # Should have nearly 1.0 recency boost (today)
+        # 2.0 for "auth" in summary + ~1.0 recency = ~3.0
+        assert recent_match.score >= 2.9
+
+    @pytest.mark.asyncio
+    async def test_ranking_recency_decay(self, db_for_ranking: SearchDatabase) -> None:
+        """30 days old adds 0.0 recency boost."""
+        db = db_for_ranking
+
+        now = datetime.now(timezone.utc)
+        old_session = create_test_session(
+            session_id="very_old",
+            file_path="/path/very_old.jsonl",
+            summary="authentication check",
+            project_display_name="myproject",
+            file_modified_at=now - timedelta(days=30),
+        )
+        await db.upsert_session(old_session)
+
+        results, _ = await db.search_ranked(SearchFilters(query="authentication"))
+
+        very_old = next(
+            (r for r in results if r.session.session_id == "very_old"), None
+        )
+        assert very_old is not None
+        # 2.0 for "authentication" term match + 1.0 exact phrase bonus + 0.0 recency = 3.0
+        assert very_old.score == pytest.approx(3.0, abs=0.1)
+
+    @pytest.mark.asyncio
+    async def test_ranking_combined(self, db_for_ranking: SearchDatabase) -> None:
+        """All ranking factors combine correctly."""
+        results, _ = await db_for_ranking.search_ranked(SearchFilters(query="auth bug"))
+
+        # exact_phrase should have highest score
+        # 2.0 * 2 (two terms in summary) + 1.0 (exact phrase) + recency
+        scores = {r.session.session_id: r.score for r in results}
+
+        # Verify exact phrase match scores highest
+        if "exact_phrase" in scores:
+            for sid, score in scores.items():
+                if sid != "exact_phrase":
+                    assert scores["exact_phrase"] >= score
+
+    @pytest.mark.asyncio
+    async def test_ranking_order(self, db_for_ranking: SearchDatabase) -> None:
+        """Results are ordered by score descending."""
+        results, _ = await db_for_ranking.search_ranked(SearchFilters(query="auth"))
+
+        # Verify scores are in descending order
+        scores = [r.score for r in results]
+        assert scores == sorted(scores, reverse=True)
+
+    @pytest.mark.asyncio
+    async def test_ranking_tiebreaker(self, tmp_path: Path) -> None:
+        """Same score sorted by date (tiebreaker)."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        # Create sessions with same words but different dates
+        sessions = [
+            create_test_session(
+                session_id="older",
+                file_path="/path/older.jsonl",
+                summary="test word",
+                project_display_name="app",
+                file_modified_at=now - timedelta(days=15),
+            ),
+            create_test_session(
+                session_id="newer",
+                file_path="/path/newer.jsonl",
+                summary="test word",
+                project_display_name="app",
+                file_modified_at=now - timedelta(days=14),
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        results, _ = await db.search_ranked(SearchFilters(query="test"))
+
+        # Newer should come first (tiebreaker by date)
+        assert results[0].session.session_id == "newer"
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_ranking_no_query(self, db_for_ranking: SearchDatabase) -> None:
+        """No query returns results by recency with score 0."""
+        results, total = await db_for_ranking.search_ranked(SearchFilters())
+
+        assert total > 0
+        for result in results:
+            assert result.score == 0.0
+
+    @pytest.mark.asyncio
+    async def test_ranking_pagination(self, db_for_ranking: SearchDatabase) -> None:
+        """Ranked search supports pagination."""
+        all_results, total = await db_for_ranking.search_ranked(
+            SearchFilters(query="auth"), limit=10
+        )
+
+        if total >= 2:
+            # Get first result
+            first_result, _ = await db_for_ranking.search_ranked(
+                SearchFilters(query="auth"), limit=1, offset=0
+            )
+            # Get second result
+            second_result, _ = await db_for_ranking.search_ranked(
+                SearchFilters(query="auth"), limit=1, offset=1
+            )
+
+            assert first_result[0].session.session_id == all_results[0].session.session_id
+            assert second_result[0].session.session_id == all_results[1].session.session_id
+
+
+# ---------------------------------------------------------------------------
+# Search edge cases and integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestSearchEdgeCases:
+    """Tests for search edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_search_empty_database(self, tmp_path: Path) -> None:
+        """Search on empty database returns empty results."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        results, total = await db.search(SearchFilters())
+        assert results == []
+        assert total == 0
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_no_matches(self, tmp_path: Path) -> None:
+        """Search with no matching results."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        await db.upsert_session(
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                summary="Python programming",
+            )
+        )
+
+        results, total = await db.search(SearchFilters(query="javascript"))
+        assert total == 0
+        assert results == []
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_null_summary(self, tmp_path: Path) -> None:
+        """Search handles sessions with null summary."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        await db.upsert_session(
+            create_test_session(
+                session_id="no_summary",
+                file_path="/path/no_summary.jsonl",
+                summary=None,
+                project_display_name="uniqueproject",
+            )
+        )
+
+        # Should match on project name
+        results, total = await db.search(SearchFilters(query="uniqueproject"))
+        assert total == 1
+        assert results[0].session_id == "no_summary"
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_case_insensitive(self, tmp_path: Path) -> None:
+        """Search is case-insensitive."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        await db.upsert_session(
+            create_test_session(
+                session_id="mixed_case",
+                file_path="/path/mixed.jsonl",
+                summary="Authentication Bug Fix",
+            )
+        )
+
+        # Lowercase query should match
+        results, _ = await db.search(SearchFilters(query="authentication"))
+        assert len(results) == 1
+
+        # Uppercase query should match
+        results, _ = await db.search(SearchFilters(query="AUTHENTICATION"))
+        assert len(results) == 1
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_ranked_no_positive_scores(self, tmp_path: Path) -> None:
+        """Ranked search with no matches returns empty."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        await db.upsert_session(
+            create_test_session(
+                session_id="s1",
+                file_path="/path/s1.jsonl",
+                summary="Python programming",
+                project_display_name="backend",
+            )
+        )
+
+        # Query that won't match
+        results, total = await db.search_ranked(SearchFilters(query="javascript"))
+        assert total == 0
+        assert results == []
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_search_multiple_terms(self, tmp_path: Path) -> None:
+        """Search with multiple terms uses OR logic."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        sessions = [
+            create_test_session(
+                session_id="has_auth",
+                file_path="/path/auth.jsonl",
+                summary="Fix authentication issue",
+            ),
+            create_test_session(
+                session_id="has_bug",
+                file_path="/path/bug.jsonl",
+                summary="Fix UI bug",
+            ),
+            create_test_session(
+                session_id="has_neither",
+                file_path="/path/neither.jsonl",
+                summary="Update docs",
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        # Multi-term query should match sessions with either term
+        results, total = await db.search(SearchFilters(query="auth bug"))
+        session_ids = {r.session_id for r in results}
+
+        assert "has_auth" in session_ids
+        assert "has_bug" in session_ids
+        assert "has_neither" not in session_ids
+
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Integration tests for search with real sessions
+# ---------------------------------------------------------------------------
+
+
+class TestSearchIntegration:
+    """Integration tests for search functionality."""
+
+    @pytest.mark.asyncio
+    async def test_search_real_sessions(self, tmp_path: Path) -> None:
+        """Search against a populated database with realistic data."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        # Create realistic session data
+        sessions = [
+            create_test_session(
+                session_id="uuid-001",
+                file_path=f"{tmp_path}/projects/trello/uuid-001.jsonl",
+                summary="Implement user authentication flow with JWT tokens",
+                project_display_name="trello",
+                file_modified_at=now - timedelta(days=1),
+                size_bytes=5000,
+                duration_ms=1800000,
+            ),
+            create_test_session(
+                session_id="uuid-002",
+                file_path=f"{tmp_path}/projects/trello/uuid-002.jsonl",
+                summary="Fix bug in card drag and drop functionality",
+                project_display_name="trello",
+                file_modified_at=now - timedelta(days=3),
+                size_bytes=3000,
+                duration_ms=900000,
+            ),
+            create_test_session(
+                session_id="uuid-003",
+                file_path=f"{tmp_path}/projects/api/uuid-003.jsonl",
+                summary="Add rate limiting to API endpoints",
+                project_display_name="api-server",
+                file_modified_at=now - timedelta(days=5),
+                size_bytes=4000,
+                duration_ms=1200000,
+            ),
+            create_test_session(
+                session_id="uuid-004",
+                file_path=f"{tmp_path}/projects/api/uuid-004.jsonl",
+                summary="Debug authentication middleware issue",
+                project_display_name="api-server",
+                file_modified_at=now - timedelta(days=7),
+                size_bytes=6000,
+                duration_ms=2400000,
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        # Search for auth-related sessions (using full word that FTS5 can match)
+        results, total = await db.search(SearchFilters(query="authentication"))
+        assert total == 2
+        session_ids = {r.session_id for r in results}
+        assert "uuid-001" in session_ids
+        assert "uuid-004" in session_ids
+
+        # Search within specific project
+        results, total = await db.search(
+            SearchFilters(query="authentication", project="api")
+        )
+        assert total == 1
+        assert results[0].session_id == "uuid-004"
+
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_ranking_real_sessions(self, tmp_path: Path) -> None:
+        """Ranking produces expected order with realistic data."""
+        db = SearchDatabase(tmp_path)
+        await db.initialize()
+
+        now = datetime.now(timezone.utc)
+
+        # Create sessions with different relevance characteristics
+        sessions = [
+            # High relevance: exact phrase, recent
+            create_test_session(
+                session_id="best_match",
+                file_path=f"{tmp_path}/best.jsonl",
+                summary="Fix authentication bug in login flow",
+                project_display_name="auth-service",
+                file_modified_at=now - timedelta(hours=2),
+            ),
+            # Medium relevance: partial match, older
+            create_test_session(
+                session_id="partial_match",
+                file_path=f"{tmp_path}/partial.jsonl",
+                summary="Update authentication tests",
+                project_display_name="backend",
+                file_modified_at=now - timedelta(days=10),
+            ),
+            # Low relevance: project name only
+            create_test_session(
+                session_id="project_only",
+                file_path=f"{tmp_path}/project.jsonl",
+                summary="Add new feature",
+                project_display_name="auth-utils",
+                file_modified_at=now - timedelta(days=20),
+            ),
+        ]
+        await db.upsert_sessions_batch(sessions)
+
+        results, _ = await db.search_ranked(SearchFilters(query="authentication bug"))
+
+        # Best match should be first (exact phrase + recent + summary match)
+        assert results[0].session.session_id == "best_match"
+
+        # Verify ordering
+        assert results[0].score > results[1].score
+
+        await db.close()
