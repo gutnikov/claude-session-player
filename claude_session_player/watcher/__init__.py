@@ -15,6 +15,15 @@ from claude_session_player.watcher.deps import check_slack_available, check_tele
 from claude_session_player.watcher.destinations import AttachedDestination, DestinationManager
 from claude_session_player.watcher.event_buffer import EventBuffer, EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher, IncrementalReader
+from claude_session_player.watcher.message_state import (
+    MessageAction,
+    MessageStateTracker,
+    NoAction,
+    SendNewMessage,
+    SessionMessageState,
+    TurnState,
+    UpdateExistingMessage,
+)
 from claude_session_player.watcher.service import WatcherService
 from claude_session_player.watcher.sse import SSEConnection, SSEManager
 from claude_session_player.watcher.state import SessionState, StateManager
@@ -66,8 +75,13 @@ __all__ = [
     "format_user_message_blocks",
     "get_tool_icon",
     "IncrementalReader",
+    "MessageAction",
+    "MessageStateTracker",
+    "NoAction",
+    "SendNewMessage",
     "SessionConfig",
     "SessionDestinations",
+    "SessionMessageState",
     "SessionState",
     "SlackAuthError",
     "SlackDestination",
@@ -83,6 +97,8 @@ __all__ = [
     "TelegramError",
     "TelegramPublisher",
     "ToolCallInfo",
+    "TurnState",
+    "UpdateExistingMessage",
     "WatcherAPI",
     "WatcherService",
     "transform",
