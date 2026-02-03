@@ -47,6 +47,7 @@ class BlockType(Enum):
     USER = "user"
     ASSISTANT = "assistant"
     TOOL_CALL = "tool_call"
+    QUESTION = "question"      # AskUserQuestion tool
     THINKING = "thinking"
     DURATION = "duration"
     SYSTEM = "system"
@@ -84,7 +85,25 @@ class DurationContent:
 class SystemContent:
     text: str
 
-BlockContent = UserContent | AssistantContent | ToolCallContent | ThinkingContent | DurationContent | SystemContent
+@dataclass
+class QuestionOption:
+    label: str
+    description: str
+
+@dataclass
+class Question:
+    question: str
+    header: str
+    options: list[QuestionOption]
+    multi_select: bool = False
+
+@dataclass
+class QuestionContent:
+    tool_use_id: str
+    questions: list[Question]
+    answers: dict[str, str] | None = None  # Filled when user responds
+
+BlockContent = UserContent | AssistantContent | ToolCallContent | QuestionContent | ThinkingContent | DurationContent | SystemContent
 ```
 
 ### Events
@@ -133,6 +152,7 @@ class ProcessingContext:
 | LOCAL_COMMAND_OUTPUT | AddBlock(SYSTEM) | `uuid4()` |
 | ASSISTANT_TEXT | AddBlock(ASSISTANT) | `uuid4()` |
 | TOOL_USE | AddBlock(TOOL_CALL) | `uuid4()` (store mapping: tool_use_id → block_id) |
+| TOOL_USE (AskUserQuestion) | AddBlock(QUESTION) | `uuid4()` (store mapping: tool_use_id → block_id) |
 | THINKING | AddBlock(THINKING) | `uuid4()` |
 | TURN_DURATION | AddBlock(DURATION) | `uuid4()` |
 | Orphan TOOL_RESULT | AddBlock(SYSTEM) | `uuid4()` |
@@ -141,7 +161,8 @@ class ProcessingContext:
 
 | Line Type | Condition | Event |
 |-----------|-----------|-------|
-| TOOL_RESULT | tool_use_id in mapping | UpdateBlock(block_id, updated ToolCallContent) |
+| TOOL_RESULT | tool_use_id in mapping (ToolCall) | UpdateBlock(block_id, updated ToolCallContent) |
+| TOOL_RESULT | tool_use_id in mapping (Question) | UpdateBlock(block_id, updated QuestionContent with answers) |
 | BASH_PROGRESS | parent_tool_use_id in mapping | UpdateBlock(block_id, updated ToolCallContent) |
 | HOOK_PROGRESS | parent_tool_use_id in mapping | UpdateBlock(block_id, updated ToolCallContent) |
 | AGENT_PROGRESS | parent_tool_use_id in mapping | UpdateBlock(block_id, updated ToolCallContent) |
@@ -280,6 +301,29 @@ def replay_session(lines: list[dict]) -> str:
     return consumer.to_markdown()
 ```
 
+## AskUserQuestion Rendering
+
+When Claude asks the user a question via `AskUserQuestion` tool:
+
+**Pending (no answer yet):**
+```
+● Question: Pkg manager
+  ├ How should we manage dependencies?
+  │ ○ uv (Recommended)
+  │ ○ poetry
+  │ ○ pip + requirements.txt
+  └ (awaiting response)
+```
+
+**Answered:**
+```
+● Question: Pkg manager
+  ├ How should we manage dependencies?
+  └ ✓ uv (Recommended)
+```
+
+The answer comes from `toolUseResult.answers` in the tool_result message.
+
 ## Success Criteria
 
 1. All existing tests pass (possibly with API updates)
@@ -287,3 +331,4 @@ def replay_session(lines: list[dict]) -> str:
 3. Stress tests pass with same performance
 4. Event stream can be consumed incrementally
 5. No regression in markdown output formatting
+6. AskUserQuestion tool calls render with questions and answers
