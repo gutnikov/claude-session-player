@@ -646,3 +646,207 @@ class TestFormatHelpers:
             id="5", type=BlockType.SYSTEM, content=SystemContent(text="output")
         )
         assert format_block(system_block) == "output"
+
+
+# ---------------------------------------------------------------------------
+# Test async Consumer protocol implementation
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncOnEvent:
+    """Tests for the async on_event() method."""
+
+    @pytest.mark.asyncio
+    async def test_on_event_handles_add_block(
+        self, consumer: ScreenStateConsumer, user_block: Block
+    ) -> None:
+        """on_event() handles AddBlock events."""
+        await consumer.on_event(AddBlock(block=user_block))
+        assert len(consumer.blocks) == 1
+        assert consumer.blocks[0] is user_block
+
+    @pytest.mark.asyncio
+    async def test_on_event_handles_update_block(
+        self, consumer: ScreenStateConsumer, tool_call_block: Block
+    ) -> None:
+        """on_event() handles UpdateBlock events."""
+        await consumer.on_event(AddBlock(block=tool_call_block))
+
+        updated_content = ToolCallContent(
+            tool_name="Read",
+            tool_use_id="tool-use-1",
+            label="README.md",
+            result="File contents here",
+        )
+        await consumer.on_event(
+            UpdateBlock(block_id="block-tool-1", content=updated_content)
+        )
+
+        assert consumer.blocks[0].content.result == "File contents here"
+
+    @pytest.mark.asyncio
+    async def test_on_event_handles_clear_all(
+        self, consumer: ScreenStateConsumer, user_block: Block, assistant_block: Block
+    ) -> None:
+        """on_event() handles ClearAll events."""
+        await consumer.on_event(AddBlock(block=user_block))
+        await consumer.on_event(AddBlock(block=assistant_block))
+
+        assert len(consumer.blocks) == 2
+
+        await consumer.on_event(ClearAll())
+
+        assert len(consumer.blocks) == 0
+        assert len(consumer._block_index) == 0
+
+    @pytest.mark.asyncio
+    async def test_on_event_produces_same_result_as_handle(
+        self, user_block: Block, assistant_block: Block, tool_call_block: Block
+    ) -> None:
+        """on_event() and handle() produce identical results."""
+        # Create two consumers
+        sync_consumer = ScreenStateConsumer()
+        async_consumer = ScreenStateConsumer()
+
+        # Process same events via sync handle()
+        sync_consumer.handle(AddBlock(block=user_block))
+        sync_consumer.handle(AddBlock(block=assistant_block))
+        sync_consumer.handle(AddBlock(block=tool_call_block))
+
+        # Process same events via async on_event()
+        await async_consumer.on_event(AddBlock(block=user_block))
+        await async_consumer.on_event(AddBlock(block=assistant_block))
+        await async_consumer.on_event(AddBlock(block=tool_call_block))
+
+        # Results should be identical
+        assert sync_consumer.to_markdown() == async_consumer.to_markdown()
+
+
+class TestRenderBlock:
+    """Tests for the render_block() method."""
+
+    def test_render_block_returns_same_as_format_block(
+        self, consumer: ScreenStateConsumer, user_block: Block
+    ) -> None:
+        """render_block() returns same result as format_block()."""
+        result = consumer.render_block(user_block)
+        expected = format_block(user_block)
+        assert result == expected
+
+    def test_render_block_for_user_content(
+        self, consumer: ScreenStateConsumer
+    ) -> None:
+        """render_block() formats UserContent correctly."""
+        block = Block(
+            id="block-1",
+            type=BlockType.USER,
+            content=UserContent(text="Hello"),
+        )
+        assert consumer.render_block(block) == "❯ Hello"
+
+    def test_render_block_for_assistant_content(
+        self, consumer: ScreenStateConsumer
+    ) -> None:
+        """render_block() formats AssistantContent correctly."""
+        block = Block(
+            id="block-1",
+            type=BlockType.ASSISTANT,
+            content=AssistantContent(text="Hi there!"),
+            request_id="req-1",
+        )
+        assert consumer.render_block(block) == "● Hi there!"
+
+    def test_render_block_for_tool_call_with_result(
+        self, consumer: ScreenStateConsumer
+    ) -> None:
+        """render_block() formats ToolCallContent with result."""
+        block = Block(
+            id="block-1",
+            type=BlockType.TOOL_CALL,
+            content=ToolCallContent(
+                tool_name="Bash",
+                tool_use_id="tool-1",
+                label="List files",
+                result="file.txt",
+            ),
+            request_id="req-1",
+        )
+        assert consumer.render_block(block) == "● Bash(List files)\n  └ file.txt"
+
+    def test_render_block_for_thinking_content(
+        self, consumer: ScreenStateConsumer
+    ) -> None:
+        """render_block() formats ThinkingContent correctly."""
+        block = Block(
+            id="block-1",
+            type=BlockType.THINKING,
+            content=ThinkingContent(),
+            request_id="req-1",
+        )
+        assert consumer.render_block(block) == "✱ Thinking…"
+
+    def test_render_block_for_duration_content(
+        self, consumer: ScreenStateConsumer
+    ) -> None:
+        """render_block() formats DurationContent correctly."""
+        block = Block(
+            id="block-1",
+            type=BlockType.DURATION,
+            content=DurationContent(duration_ms=30000),
+        )
+        assert consumer.render_block(block) == "✱ Crunched for 30s"
+
+    def test_render_block_for_system_content(
+        self, consumer: ScreenStateConsumer
+    ) -> None:
+        """render_block() formats SystemContent correctly."""
+        block = Block(
+            id="block-1",
+            type=BlockType.SYSTEM,
+            content=SystemContent(text="System message"),
+        )
+        assert consumer.render_block(block) == "System message"
+
+
+class TestConsumerProtocolCompliance:
+    """Tests for Consumer protocol compliance."""
+
+    def test_consumer_implements_protocol(self) -> None:
+        """ScreenStateConsumer implements Consumer protocol."""
+        from claude_session_player.protocol import Consumer
+
+        consumer = ScreenStateConsumer()
+        assert isinstance(consumer, Consumer)
+
+    def test_consumer_can_be_used_with_emitter(self) -> None:
+        """ScreenStateConsumer can be subscribed to EventEmitter."""
+        from claude_session_player.emitter import EventEmitter
+
+        emitter = EventEmitter()
+        consumer = ScreenStateConsumer()
+
+        # Should not raise
+        emitter.subscribe(consumer)
+        assert emitter.subscriber_count == 1
+
+    @pytest.mark.asyncio
+    async def test_consumer_works_with_emitter_emit(
+        self, user_block: Block
+    ) -> None:
+        """ScreenStateConsumer processes events from EventEmitter."""
+        import asyncio
+        from claude_session_player.emitter import EventEmitter
+
+        emitter = EventEmitter()
+        consumer = ScreenStateConsumer()
+        emitter.subscribe(consumer)
+
+        # Emit an event
+        await emitter.emit(AddBlock(block=user_block))
+
+        # Wait for fire-and-forget task to complete
+        await asyncio.sleep(0.01)
+
+        # Consumer should have processed the event
+        assert len(consumer.blocks) == 1
+        assert consumer.blocks[0] is user_block
