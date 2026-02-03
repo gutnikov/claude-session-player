@@ -15,6 +15,7 @@ Features:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -636,6 +637,129 @@ class SearchDatabase:
         async with conn.execute("PRAGMA integrity_check") as cursor:
             result = await cursor.fetchone()
             return result[0] == "ok"
+
+    async def backup(self, backup_path: Path) -> None:
+        """Create a backup using SQLite backup API.
+
+        This is safe to call while the database is in use.
+
+        Args:
+            backup_path: Path where the backup will be created.
+        """
+        # Ensure parent directory exists
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+
+        conn = await self._get_connection()
+        backup_conn = await aiosqlite.connect(backup_path)
+        try:
+            await conn.backup(backup_conn)
+            logger.info(f"Database backed up to {backup_path}")
+        finally:
+            await backup_conn.close()
+
+    async def vacuum(self) -> None:
+        """Reclaim disk space from deleted rows.
+
+        Uses incremental vacuum to avoid blocking for long periods.
+        """
+        conn = await self._get_connection()
+        await conn.execute("PRAGMA incremental_vacuum")
+        await conn.commit()
+        logger.info("SearchDatabase vacuum completed")
+
+    async def checkpoint(self) -> None:
+        """Force WAL checkpoint to reduce WAL file size.
+
+        Uses TRUNCATE mode to reset WAL file.
+        """
+        conn = await self._get_connection()
+        await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        logger.info("SearchDatabase WAL checkpoint completed")
+
+    async def safe_initialize(self) -> None:
+        """Initialize with automatic corruption recovery.
+
+        Attempts normal initialization, then verifies integrity.
+        If corruption is detected, automatically recovers the database.
+        """
+        try:
+            await self.initialize()
+
+            if not await self.verify_integrity():
+                raise sqlite3.DatabaseError("Integrity check failed")
+
+        except sqlite3.DatabaseError as e:
+            logger.error(f"Database error during initialization: {e}")
+            await self._recover_database()
+
+    async def _recover_database(self) -> None:
+        """Recover from database corruption.
+
+        Steps:
+        1. Close connection
+        2. Rename corrupt DB to .corrupt
+        3. Remove WAL/SHM files
+        4. Reinitialize fresh database
+        """
+        logger.warning("Attempting database recovery...")
+
+        # Close existing connection
+        await self.close()
+
+        # Backup corrupt database
+        if self.db_path.exists():
+            corrupt_path = self.db_path.with_suffix(".db.corrupt")
+            self.db_path.rename(corrupt_path)
+            logger.info(f"Corrupt database backed up to {corrupt_path}")
+
+        # Remove WAL files
+        for suffix in ["-wal", "-shm"]:
+            wal_file = self.db_path.parent / (self.db_path.name + suffix)
+            if wal_file.exists():
+                wal_file.unlink()
+                logger.debug(f"Removed WAL file: {wal_file}")
+
+        # Reinitialize (creates fresh database)
+        await self.initialize()
+        logger.info("Database recovered - full rebuild required")
+
+    async def execute_with_retry(
+        self,
+        sql: str,
+        params: tuple = (),
+        max_retries: int = 3,
+    ) -> aiosqlite.Cursor:
+        """Execute with retry on busy/locked errors.
+
+        Args:
+            sql: The SQL statement to execute.
+            params: Parameters for the SQL statement.
+            max_retries: Maximum number of retry attempts.
+
+        Returns:
+            The cursor from the executed statement.
+
+        Raises:
+            sqlite3.OperationalError: If all retries are exhausted.
+        """
+        conn = await self._get_connection()
+
+        for attempt in range(max_retries):
+            try:
+                return await conn.execute(sql, params)
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < max_retries - 1:
+                    wait_time = 0.1 * (attempt + 1)
+                    logger.debug(
+                        f"Database locked, retrying in {wait_time}s "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
+
+        # This should not be reached, but satisfy type checker
+        raise sqlite3.OperationalError("Max retries exceeded")
 
     # ================================================================
     # Search Operations
