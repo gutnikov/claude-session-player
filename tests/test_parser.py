@@ -273,7 +273,8 @@ class TestGetProgressData:
     def test_returns_data(self, bash_progress_line: dict) -> None:
         data = get_progress_data(bash_progress_line)
         assert data["type"] == "bash_progress"
-        assert data["parentToolUseID"] == "toolu_001"
+        # Note: parentToolUseID is at the top level, not in data
+        assert "fullOutput" in data  # bash_progress has fullOutput in data
 
 
 class TestGetParentToolUseId:
