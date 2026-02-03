@@ -22,16 +22,12 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -n "$NUM_LINES" ]; then
     head -n "$NUM_LINES" "$SESSION_FILE" | python3 -c "
 import sys
+import json
 sys.path.insert(0, '$REPO_ROOT')
-from claude_session_player.models import ScreenState
-from claude_session_player.renderer import render
-from claude_session_player.formatter import to_markdown
+from claude_session_player.consumer import replay_session
 
-lines = [__import__('json').loads(line) for line in sys.stdin if line.strip()]
-state = ScreenState()
-for line in lines:
-    state = render(state, line)
-print(to_markdown(state))
+lines = [json.loads(line) for line in sys.stdin if line.strip()]
+print(replay_session(lines))
 "
 else
     python3 -m claude_session_player.cli "$SESSION_FILE"

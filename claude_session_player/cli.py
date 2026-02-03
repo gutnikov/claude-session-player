@@ -9,9 +9,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from .models import ScreenState
+from .consumer import replay_session
 from .parser import read_session
-from .renderer import render
 
 
 def main() -> None:
@@ -19,8 +18,8 @@ def main() -> None:
 
     Usage: claude-session-player <session.jsonl>
 
-    Reads the JSONL session file, processes all lines through the render
-    function, and prints the final markdown output to stdout.
+    Reads the JSONL session file, processes all lines through the event-driven
+    renderer, and prints the final markdown output to stdout.
     """
     if len(sys.argv) != 2:
         print("Usage: claude-session-player <session.jsonl>", file=sys.stderr)
@@ -33,10 +32,7 @@ def main() -> None:
         sys.exit(1)
 
     lines = read_session(path)
-    state = ScreenState()
-    for line in lines:
-        render(state, line)
-    print(state.to_markdown())
+    print(replay_session(lines))
 
 
 if __name__ == "__main__":
