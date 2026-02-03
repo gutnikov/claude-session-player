@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from .formatter import format_assistant_text, format_user_text
+from .formatter import format_assistant_text, format_user_text, truncate_result
 from .models import AssistantText, ScreenState, SystemOutput, ToolCall, UserMessage
-from .parser import LineType, classify_line, get_local_command_text, get_request_id, get_tool_use_info, get_user_text
+from .parser import LineType, classify_line, get_local_command_text, get_request_id, get_tool_result_info, get_tool_use_info, get_user_text
 from .tools import abbreviate_tool_input
 
 
@@ -28,6 +28,8 @@ def render(state: ScreenState, line: dict) -> ScreenState:
         _render_assistant_text(state, line)
     elif line_type is LineType.TOOL_USE:
         _render_tool_use(state, line)
+    elif line_type is LineType.TOOL_RESULT:
+        _render_tool_result(state, line)
     # INVISIBLE and unhandled types: do nothing (future issues add more cases)
 
     return state
@@ -78,3 +80,32 @@ def _render_tool_use(state: ScreenState, line: dict) -> None:
     state.elements.append(tool_call)
     state.tool_calls[tool_use_id] = len(state.elements) - 1
     state.current_request_id = request_id
+
+
+def _render_tool_result(state: ScreenState, line: dict) -> None:
+    """Render tool result(s) by matching to existing tool calls.
+
+    For each tool result:
+    - If tool_use_id matches a tool call in state.tool_calls, update that ToolCall
+      element with the truncated result and is_error flag.
+    - If no match found (orphan result), append a SystemOutput with the content.
+
+    Tool results break assistant grouping, so current_request_id is reset to None.
+    """
+    results = get_tool_result_info(line)
+
+    for tool_use_id, content, is_error in results:
+        if tool_use_id in state.tool_calls:
+            # Found matching tool call - update it
+            index = state.tool_calls[tool_use_id]
+            element = state.elements[index]
+            if isinstance(element, ToolCall):
+                element.result = truncate_result(content)
+                element.is_error = is_error
+        else:
+            # Orphan result - render as system output
+            truncated = truncate_result(content)
+            state.elements.append(SystemOutput(text=truncated))
+
+    # Tool result breaks assistant grouping
+    state.current_request_id = None

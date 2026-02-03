@@ -467,13 +467,14 @@ class TestRenderToolUseMarkdown:
         assert "\u2514" not in md
 
     def test_tool_call_with_result(self) -> None:
-        """Preview: tool call with result set produces └ line."""
+        """Preview: tool call with result set produces └ line with proper indentation."""
         from claude_session_player.formatter import format_element
 
         tc = ToolCall(tool_name="Bash", tool_use_id="t1", label="ls", result="file1.py\nfile2.py")
         formatted = format_element(tc)
         assert "\u25cf Bash(ls)" in formatted
-        assert "  \u2514 file1.py\nfile2.py" in formatted
+        assert "  \u2514 file1.py" in formatted
+        assert "    file2.py" in formatted
 
     def test_tool_call_with_error_result(self) -> None:
         """Preview: tool call with error result produces ✗ line."""
@@ -512,3 +513,498 @@ class TestRenderToolUseMarkdown:
         render(empty_state, tool_line)
         md = empty_state.to_markdown()
         assert md == "\u276f do something\n\n\u25cf Bash(echo hi)"
+
+
+class TestRenderToolResult:
+    """Tests for rendering tool_result user messages."""
+
+    def test_result_matches_existing_tool_call(
+        self, empty_state: ScreenState, tool_use_line: dict, tool_result_line: dict
+    ) -> None:
+        """Tool result matches existing tool call → result field updated."""
+        render(empty_state, tool_use_line)
+        render(empty_state, tool_result_line)
+        # No new element added; existing ToolCall updated
+        assert len(empty_state.elements) == 1
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.result == "file1.py\nfile2.py"
+        assert element.is_error is False
+
+    def test_result_with_is_error_true(
+        self, empty_state: ScreenState, tool_result_error_line: dict
+    ) -> None:
+        """Tool result with is_error=true → is_error flag set on ToolCall."""
+        # First create a tool call with matching id
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_002", "name": "Bash", "input": {"command": "foo"}}],
+            },
+        }
+        render(empty_state, tool_use)
+        render(empty_state, tool_result_error_line)
+        element = empty_state.elements[0]
+        assert isinstance(element, ToolCall)
+        assert element.result == "command not found: foo"
+        assert element.is_error is True
+
+    def test_result_unknown_tool_use_id_creates_system_output(self, empty_state: ScreenState) -> None:
+        """Tool result with unknown tool_use_id → rendered as SystemOutput."""
+        orphan_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "unknown_tool_id",
+                        "content": "orphan result text",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, orphan_result)
+        assert len(empty_state.elements) == 1
+        element = empty_state.elements[0]
+        assert isinstance(element, SystemOutput)
+        assert element.text == "orphan result text"
+
+    def test_result_resets_current_request_id(
+        self, empty_state: ScreenState, tool_use_line: dict, tool_result_line: dict
+    ) -> None:
+        """Tool result resets current_request_id to None."""
+        render(empty_state, tool_use_line)
+        assert empty_state.current_request_id == "req_001"
+        render(empty_state, tool_result_line)
+        assert empty_state.current_request_id is None
+
+    def test_multiple_sequential_results_matched_correctly(self, empty_state: ScreenState) -> None:
+        """Multiple sequential tool results for different tool calls → each matched correctly."""
+        tool_use_1 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_A", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        }
+        tool_use_2 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_B", "name": "Read", "input": {"file_path": "/a.py"}}],
+            },
+        }
+        result_1 = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_A", "content": "output A", "is_error": False}],
+            },
+        }
+        result_2 = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_B", "content": "output B", "is_error": False}],
+            },
+        }
+        render(empty_state, tool_use_1)
+        render(empty_state, tool_use_2)
+        render(empty_state, result_1)
+        render(empty_state, result_2)
+
+        assert len(empty_state.elements) == 2
+        assert empty_state.elements[0].result == "output A"
+        assert empty_state.elements[1].result == "output B"
+
+
+class TestRenderToolResultTruncation:
+    """Tests for tool result truncation."""
+
+    def test_short_result_not_truncated(self, empty_state: ScreenState) -> None:
+        """Short result (1-5 lines) → not truncated."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        }
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": "line1\nline2\nline3\nline4\nline5",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, tool_use)
+        render(empty_state, tool_result)
+        assert empty_state.elements[0].result == "line1\nline2\nline3\nline4\nline5"
+
+    def test_long_result_truncated(self, empty_state: ScreenState) -> None:
+        """Long result (>5 lines) → truncated to 4 lines + …."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        }
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": "line1\nline2\nline3\nline4\nline5\nline6\nline7",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, tool_use)
+        render(empty_state, tool_result)
+        assert empty_state.elements[0].result == "line1\nline2\nline3\nline4\n…"
+
+    def test_empty_result_shows_no_output(self, empty_state: ScreenState) -> None:
+        """Empty result → '(no output)'."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "ls"}}],
+            },
+        }
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": "",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, tool_use)
+        render(empty_state, tool_result)
+        assert empty_state.elements[0].result == "(no output)"
+
+    def test_single_line_result(self, empty_state: ScreenState) -> None:
+        """Single-line result → single line."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"command": "echo hi"}}],
+            },
+        }
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": "hi",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, tool_use)
+        render(empty_state, tool_result)
+        assert empty_state.elements[0].result == "hi"
+
+
+class TestRenderToolResultMarkdown:
+    """Tests for tool result markdown output."""
+
+    def test_tool_call_plus_success_result_markdown(self, empty_state: ScreenState) -> None:
+        """Tool call + success result → ● Tool(label)\\n  └ output."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "List files"}}],
+            },
+        }
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": "file.txt",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, tool_use)
+        render(empty_state, tool_result)
+        md = empty_state.to_markdown()
+        assert md == "\u25cf Bash(List files)\n  \u2514 file.txt"
+
+    def test_tool_call_plus_error_result_markdown(self, empty_state: ScreenState) -> None:
+        """Tool call + error result → ● Tool(label)\\n  ✗ error message."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "Bad command"}}],
+            },
+        }
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": "command not found",
+                        "is_error": True,
+                    }
+                ],
+            },
+        }
+        render(empty_state, tool_use)
+        render(empty_state, tool_result)
+        md = empty_state.to_markdown()
+        assert md == "\u25cf Bash(Bad command)\n  \u2717 command not found"
+
+    def test_tool_call_plus_multiline_result_markdown(self, empty_state: ScreenState) -> None:
+        """Tool call + multi-line result → proper indentation."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "Git status"}}],
+            },
+        }
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": "On branch main\nYour branch is up to date",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, tool_use)
+        render(empty_state, tool_result)
+        md = empty_state.to_markdown()
+        expected = "\u25cf Bash(Git status)\n  \u2514 On branch main\n    Your branch is up to date"
+        assert md == expected
+
+    def test_tool_call_plus_truncated_result_markdown(self, empty_state: ScreenState) -> None:
+        """Tool call + truncated result → … on last line."""
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "Long output"}}],
+            },
+        }
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": "1\n2\n3\n4\n5\n6\n7",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, tool_use)
+        render(empty_state, tool_result)
+        md = empty_state.to_markdown()
+        expected = "\u25cf Bash(Long output)\n  \u2514 1\n    2\n    3\n    4\n    …"
+        assert md == expected
+
+    def test_parallel_tool_calls_with_results_markdown(self, empty_state: ScreenState) -> None:
+        """Parallel tool calls + their results → all matched, all rendered correctly."""
+        tool_use_1 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_A", "name": "Bash", "input": {"description": "cmd A"}}],
+            },
+        }
+        tool_use_2 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_B", "name": "Read", "input": {"file_path": "/a.py"}}],
+            },
+        }
+        result_1 = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_A", "content": "result A", "is_error": False}],
+            },
+        }
+        result_2 = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_B", "content": "result B", "is_error": False}],
+            },
+        }
+        render(empty_state, tool_use_1)
+        render(empty_state, tool_use_2)
+        render(empty_state, result_1)
+        render(empty_state, result_2)
+        md = empty_state.to_markdown()
+        expected = "\u25cf Bash(cmd A)\n  \u2514 result A\n\u25cf Read(a.py)\n  \u2514 result B"
+        assert md == expected
+
+
+class TestRenderToolResultFullFlow:
+    """Full flow integration tests for tool results."""
+
+    def test_user_input_to_tool_use_to_result_markdown(self, empty_state: ScreenState) -> None:
+        """User input → assistant tool_use → tool_result → correct final markdown."""
+        user_line = {
+            "type": "user",
+            "isMeta": False,
+            "message": {"role": "user", "content": "run ls"},
+        }
+        tool_use = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_001", "name": "Bash", "input": {"description": "List files"}}],
+            },
+        }
+        tool_result = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "content": "file.txt\ndir/",
+                        "is_error": False,
+                    }
+                ],
+            },
+        }
+        render(empty_state, user_line)
+        render(empty_state, tool_use)
+        render(empty_state, tool_result)
+        md = empty_state.to_markdown()
+        expected = "\u276f run ls\n\n\u25cf Bash(List files)\n  \u2514 file.txt\n    dir/"
+        assert md == expected
+
+    def test_two_parallel_tool_uses_two_results_all_matched(self, empty_state: ScreenState) -> None:
+        """User → 2 parallel tool_uses → 2 tool_results → all matched, all rendered."""
+        user_line = {
+            "type": "user",
+            "isMeta": False,
+            "message": {"role": "user", "content": "check both"},
+        }
+        tool_use_1 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_X", "name": "Bash", "input": {"description": "cmd X"}}],
+            },
+        }
+        tool_use_2 = {
+            "type": "assistant",
+            "requestId": "req_001",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_Y", "name": "Bash", "input": {"description": "cmd Y"}}],
+            },
+        }
+        result_1 = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_X", "content": "X output", "is_error": False}],
+            },
+        }
+        result_2 = {
+            "type": "user",
+            "isMeta": False,
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_Y", "content": "Y output", "is_error": False}],
+            },
+        }
+        render(empty_state, user_line)
+        render(empty_state, tool_use_1)
+        render(empty_state, tool_use_2)
+        render(empty_state, result_1)
+        render(empty_state, result_2)
+
+        md = empty_state.to_markdown()
+        # Tool calls grouped (same request_id), then results update in place
+        expected = (
+            "\u276f check both\n\n"
+            "\u25cf Bash(cmd X)\n  \u2514 X output\n"
+            "\u25cf Bash(cmd Y)\n  \u2514 Y output"
+        )
+        assert md == expected
