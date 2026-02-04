@@ -37,6 +37,10 @@ class MessageDebouncer:
     New message creation is immediate (not debounced), but subsequent
     updates to the same message are debounced.
 
+    Additionally, this class tracks the last pushed content per message
+    and skips scheduling updates if the content is unchanged. This prevents
+    unnecessary API calls when the same content would be pushed multiple times.
+
     Attributes:
         telegram_delay_ms: Debounce delay for Telegram updates (default: 500ms)
         slack_delay_ms: Debounce delay for Slack updates (default: 2000ms)
@@ -59,6 +63,10 @@ class MessageDebouncer:
         # Pending updates: (destination_type, identifier, message_id) -> PendingUpdate
         self._pending: dict[tuple[str, str, str], PendingUpdate] = {}
 
+        # Last pushed content per message for change detection
+        # Key: (destination_type, identifier, message_id) -> content string
+        self._last_pushed_content: dict[tuple[str, str, str], str] = {}
+
     def _get_delay(self, destination_type: DestinationType) -> float:
         """Get the delay in seconds for a destination type."""
         return self._telegram_delay if destination_type == "telegram" else self._slack_delay
@@ -70,12 +78,15 @@ class MessageDebouncer:
         message_id: str,
         update_fn: Callable[[], Awaitable[None]],
         content: Any,
-    ) -> None:
+    ) -> bool:
         """Schedule a debounced update.
 
         If an update is already pending for this message, cancel it and
         schedule a new one with the latest content. The update function
         will be called after the debounce delay expires.
+
+        If the content is identical to the last pushed content for this
+        message, the update is skipped entirely (no scheduling, no API call).
 
         Args:
             destination_type: "telegram" or "slack"
@@ -83,9 +94,25 @@ class MessageDebouncer:
             message_id: The message being updated
             update_fn: Async function to call when debounce expires.
                        This function should capture the content it needs.
-            content: The latest content (stored for potential inspection/coalescing)
+            content: The latest content (stored for potential inspection/coalescing).
+                     Used for change detection - should be a string for comparison.
+
+        Returns:
+            True if update was scheduled, False if skipped due to unchanged content.
         """
         key = (destination_type, identifier, message_id)
+
+        # Check if content is unchanged from last push
+        # Content must be a string for change detection to work
+        if isinstance(content, str) and key in self._last_pushed_content:
+            if content == self._last_pushed_content[key]:
+                logger.debug(
+                    "Skipped update for %s/%s/%s: content unchanged",
+                    destination_type,
+                    identifier,
+                    message_id,
+                )
+                return False
 
         # Cancel existing pending update if any
         if key in self._pending:
@@ -113,6 +140,9 @@ class MessageDebouncer:
                 del self._pending[key]
             try:
                 await update_fn()
+                # Update last pushed content after successful push
+                if isinstance(content, str):
+                    self._last_pushed_content[key] = content
                 logger.debug(
                     "Executed debounced update for %s/%s/%s",
                     destination_type,
@@ -137,6 +167,7 @@ class MessageDebouncer:
             message_id,
             delay,
         )
+        return True
 
     async def flush(self, session_id: str | None = None) -> None:
         """Flush all pending updates immediately.
@@ -165,6 +196,9 @@ class MessageDebouncer:
             # Execute update immediately
             try:
                 await pending.update_fn()
+                # Update last pushed content after successful flush
+                if isinstance(pending.content, str):
+                    self._last_pushed_content[key] = pending.content
                 logger.debug(
                     "Flushed update for %s/%s/%s",
                     key[0],
@@ -220,3 +254,44 @@ class MessageDebouncer:
         if key in self._pending:
             return self._pending[key].content
         return None
+
+    def clear_content(
+        self, destination_type: str, identifier: str, message_id: str
+    ) -> None:
+        """Clear the tracked last pushed content for a message.
+
+        Call this when a message binding is removed to free memory.
+        This removes the change detection tracking for the specified message.
+
+        Args:
+            destination_type: "telegram" or "slack"
+            identifier: chat_id (Telegram) or channel (Slack)
+            message_id: The message ID to clear tracking for
+        """
+        key = (destination_type, identifier, message_id)
+        if key in self._last_pushed_content:
+            del self._last_pushed_content[key]
+            logger.debug(
+                "Cleared content tracking for %s/%s/%s",
+                destination_type,
+                identifier,
+                message_id,
+            )
+
+    def get_last_pushed_content(
+        self, destination_type: str, identifier: str, message_id: str
+    ) -> str | None:
+        """Get the last pushed content for a message, if any.
+
+        This is useful for testing and debugging change detection.
+
+        Args:
+            destination_type: "telegram" or "slack"
+            identifier: chat_id (Telegram) or channel (Slack)
+            message_id: The message ID to query
+
+        Returns:
+            The last pushed content string, or None if not tracked.
+        """
+        key = (destination_type, identifier, message_id)
+        return self._last_pushed_content.get(key)
