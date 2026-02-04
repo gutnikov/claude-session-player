@@ -160,6 +160,41 @@ def _truncate_message(text: str, max_length: int = _MAX_MESSAGE_LENGTH) -> str:
     return text[: max_length - 20] + "\n\n... [truncated]"
 
 
+# ---------------------------------------------------------------------------
+# TTL Keyboard Formatting
+# ---------------------------------------------------------------------------
+
+
+def format_ttl_keyboard(message_id: int, is_live: bool = True) -> InlineKeyboardMarkup:
+    """Create TTL control keyboard for session messages.
+
+    Shows a live indicator and +30s button when active, or just the
+    +30s button when expired.
+
+    Args:
+        message_id: The message ID for callback data.
+        is_live: Whether the binding is currently active.
+
+    Returns:
+        InlineKeyboardMarkup with TTL control buttons.
+    """
+    try:
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    except ImportError:
+        # Return empty markup if aiogram not available
+        return None  # type: ignore
+
+    buttons = []
+    if is_live:
+        # Show live indicator (no-op callback)
+        buttons.append(InlineKeyboardButton(text="⚡ Live", callback_data="noop"))
+    # Always show +30s button
+    # Callback format: extend:{message_id}
+    buttons.append(InlineKeyboardButton(text="+30s", callback_data=f"extend:{message_id}"))
+
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
 class TelegramPublisher:
     """Publisher for sending messages via Telegram Bot API.
 
@@ -354,6 +389,7 @@ class TelegramPublisher:
         chat_id: str,
         message_id: int,
         content: str,
+        is_live: bool = True,
     ) -> bool:
         """Update pre-rendered session content wrapped in <pre> tags.
 
@@ -361,16 +397,19 @@ class TelegramPublisher:
             chat_id: Telegram chat ID.
             message_id: ID of the message to edit.
             content: Pre-rendered session content (plain text).
+            is_live: Whether the binding is currently active (for TTL keyboard).
 
         Returns:
             True if edited successfully, False if message not found/editable.
         """
         html_text = f"<pre>{escape_html(content)}</pre>"
+        keyboard = format_ttl_keyboard(message_id, is_live)
         return await self.edit_message(
             chat_id=chat_id,
             message_id=message_id,
             text=html_text,
             parse_mode="HTML",
+            reply_markup=keyboard,
         )
 
     async def send_question(

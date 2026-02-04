@@ -18,6 +18,7 @@ from claude_session_player.watcher.telegram_publisher import (
     escape_html,
     format_question_keyboard,
     format_question_text,
+    format_ttl_keyboard,
 )
 
 
@@ -1045,3 +1046,79 @@ class TestFormatQuestionText:
         text = format_question_text(content)
 
         assert "<b>❓ Question</b>" in text
+
+
+# ---------------------------------------------------------------------------
+# format_ttl_keyboard tests
+# ---------------------------------------------------------------------------
+
+
+class TestFormatTTLKeyboard:
+    """Tests for format_ttl_keyboard function."""
+
+    def test_live_keyboard_has_both_buttons(self) -> None:
+        """Live keyboard has ⚡ Live indicator and +30s button."""
+        keyboard = format_ttl_keyboard(message_id=12345, is_live=True)
+
+        assert keyboard is not None
+        assert len(keyboard.inline_keyboard) == 1
+        row = keyboard.inline_keyboard[0]
+        assert len(row) == 2
+
+        # First button is live indicator
+        assert row[0].text == "⚡ Live"
+        assert row[0].callback_data == "noop"
+
+        # Second button is +30s
+        assert row[1].text == "+30s"
+        assert row[1].callback_data == "extend:12345"
+
+    def test_expired_keyboard_has_only_extend_button(self) -> None:
+        """Expired keyboard has only +30s button."""
+        keyboard = format_ttl_keyboard(message_id=67890, is_live=False)
+
+        assert keyboard is not None
+        assert len(keyboard.inline_keyboard) == 1
+        row = keyboard.inline_keyboard[0]
+        assert len(row) == 1
+
+        # Only +30s button
+        assert row[0].text == "+30s"
+        assert row[0].callback_data == "extend:67890"
+
+    def test_callback_data_format(self) -> None:
+        """Callback data follows extend:{message_id} format."""
+        keyboard = format_ttl_keyboard(message_id=999, is_live=True)
+
+        assert keyboard is not None
+        row = keyboard.inline_keyboard[0]
+        extend_button = row[1]  # Second button
+
+        assert extend_button.callback_data == "extend:999"
+        assert extend_button.callback_data.startswith("extend:")
+        parts = extend_button.callback_data.split(":")
+        assert len(parts) == 2
+        assert parts[0] == "extend"
+        assert parts[1] == "999"
+
+    def test_callback_data_within_limit(self) -> None:
+        """Callback data fits within 64-byte limit."""
+        # Test with a large message_id
+        keyboard = format_ttl_keyboard(message_id=999999999999, is_live=True)
+
+        assert keyboard is not None
+        row = keyboard.inline_keyboard[0]
+        extend_button = row[1]
+
+        # Telegram's callback_data limit is 64 bytes
+        assert len(extend_button.callback_data.encode("utf-8")) <= 64
+
+    def test_default_is_live(self) -> None:
+        """Default is_live parameter is True."""
+        keyboard = format_ttl_keyboard(message_id=123)
+
+        assert keyboard is not None
+        row = keyboard.inline_keyboard[0]
+        # Should have both buttons since is_live defaults to True
+        assert len(row) == 2
+        assert row[0].text == "⚡ Live"

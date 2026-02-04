@@ -744,6 +744,9 @@ class WatcherService:
 
         dest = binding.destination
 
+        # Capture is_live state at schedule time for the callback
+        is_live = not binding.is_expired()
+
         async def do_update() -> None:
             try:
                 if dest.type == "telegram" and self.telegram_publisher:
@@ -752,6 +755,7 @@ class WatcherService:
                         chat_id=chat_id,
                         message_id=int(binding.message_id),
                         content=content,
+                        is_live=is_live,
                     )
                 elif dest.type == "slack" and self.slack_publisher:
                     await self.slack_publisher.update_session_message(
