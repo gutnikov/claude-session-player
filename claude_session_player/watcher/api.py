@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from claude_session_player.watcher.config import BotConfig, ConfigManager
     from claude_session_player.watcher.destinations import DestinationManager
     from claude_session_player.watcher.event_buffer import EventBufferManager
-    from claude_session_player.watcher.indexer import SessionIndexer
+    from claude_session_player.watcher.indexer import SessionIndexer, SQLiteSessionIndexer
     from claude_session_player.watcher.rate_limit import RateLimiter
     from claude_session_player.watcher.search import SearchEngine
     from claude_session_player.watcher.sse import SSEManager
@@ -72,6 +72,7 @@ class WatcherAPI:
 
     # Optional search components (injected by WatcherService)
     indexer: SessionIndexer | None = None
+    sqlite_indexer: SQLiteSessionIndexer | None = None
     search_engine: SearchEngine | None = None
 
     # Rate limiters for search endpoints
@@ -499,6 +500,12 @@ class WatcherAPI:
                 "bots": {
                     "telegram": "configured",  # or "not_configured"
                     "slack": "not_configured"
+                },
+                "index": {
+                    "sessions": 100,
+                    "projects": 5,
+                    "fts_enabled": true,
+                    "last_refresh": "2024-01-15T10:30:00Z"
                 }
             }
         """
@@ -510,8 +517,33 @@ class WatcherAPI:
         sessions_indexed = 0
         projects_indexed = 0
         index_age_seconds = 0
+        index_stats: dict | None = None
 
-        if self.indexer is not None:
+        # Prefer SQLite indexer stats if available
+        if self.sqlite_indexer is not None:
+            try:
+                stats = await self.sqlite_indexer.get_stats()
+                sessions_indexed = stats.get("total_sessions", 0)
+                projects_indexed = stats.get("total_projects", 0)
+                index_stats = {
+                    "sessions": sessions_indexed,
+                    "projects": projects_indexed,
+                    "fts_enabled": stats.get("fts_available", False),
+                    "last_refresh": stats.get("last_incremental_index"),
+                }
+                # Calculate index age from last_incremental_index
+                last_refresh = stats.get("last_incremental_index")
+                if last_refresh:
+                    try:
+                        last_dt = datetime.fromisoformat(last_refresh)
+                        index_age_seconds = int((datetime.now(timezone.utc) - last_dt).total_seconds())
+                    except ValueError:
+                        pass
+            except Exception:
+                pass  # Index not available
+
+        # Fall back to legacy indexer if SQLite not available
+        elif self.indexer is not None:
             try:
                 index = await self.indexer.get_index()
                 sessions_indexed = len(index.sessions)
@@ -520,7 +552,7 @@ class WatcherAPI:
             except Exception:
                 pass  # Index not available
 
-        return web.json_response({
+        response_data = {
             "status": "healthy",
             "sessions_watched": len(sessions),
             "sessions_indexed": sessions_indexed,
@@ -531,7 +563,13 @@ class WatcherAPI:
                 "telegram": "configured" if bot_config.telegram_token else "not_configured",
                 "slack": "configured" if bot_config.slack_token else "not_configured",
             },
-        })
+        }
+
+        # Add detailed index stats if available
+        if index_stats:
+            response_data["index"] = index_stats
+
+        return web.json_response(response_data)
 
     # =========================================================================
     # Search Endpoints
