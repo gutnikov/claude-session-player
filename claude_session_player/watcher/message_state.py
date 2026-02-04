@@ -32,14 +32,9 @@ from claude_session_player.events import (
 )
 from claude_session_player.watcher.telegram_publisher import escape_html
 from claude_session_player.watcher.slack_publisher import (
-    ToolCallInfo as SlackToolCallInfo,
+    escape_mrkdwn,
     format_answered_question_blocks,
-    format_context_compacted_blocks,
     format_question_blocks,
-    format_system_message_blocks,
-    format_turn_message_blocks,
-    format_user_message_blocks,
-    get_tool_icon as slack_get_tool_icon,
 )
 
 
@@ -140,6 +135,142 @@ def format_system_message(text: str) -> str:
 def format_context_compacted() -> str:
     """Format context compaction notice for Telegram in terminal style."""
     return f"<b>⚡ Context compacted</b>\n<pre>{BOX_H * 30}\nPrevious messages cleared\n{BOX_H * 30}</pre>"
+
+
+# ---------------------------------------------------------------------------
+# Slack Formatting Utilities (local to message_state)
+# ---------------------------------------------------------------------------
+
+
+# Tool name to icon mapping for Slack
+_SLACK_TOOL_ICONS = {
+    "Read": "📖",
+    "Write": "📝",
+    "Edit": "✏️",
+    "Bash": "🔧",
+    "Glob": "🔍",
+    "Grep": "🔍",
+    "Task": "🤖",
+    "WebSearch": "🌐",
+    "WebFetch": "🌐",
+}
+
+
+def slack_get_tool_icon(tool_name: str) -> str:
+    """Get the icon for a tool name for Slack."""
+    return _SLACK_TOOL_ICONS.get(tool_name, "⚙️")
+
+
+@dataclass
+class SlackToolCallInfo:
+    """Information about a tool call for Slack formatting."""
+
+    name: str
+    label: str
+    icon: str
+    result: str | None = None
+    is_error: bool = False
+
+
+def format_user_message_blocks(text: str) -> list[dict]:
+    """Format a user message as Block Kit blocks for Slack.
+
+    Args:
+        text: User message text.
+
+    Returns:
+        List of Block Kit blocks.
+    """
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"👤 *User*\n\n{escape_mrkdwn(text)}"},
+        }
+    ]
+
+
+def format_turn_message_blocks(
+    assistant_text: str | None,
+    tool_calls: list[SlackToolCallInfo],
+    duration_ms: int | None,
+) -> list[dict]:
+    """Format a complete turn message as Block Kit blocks for Slack.
+
+    Args:
+        assistant_text: Optional assistant response text.
+        tool_calls: List of tool call information.
+        duration_ms: Optional turn duration in milliseconds.
+
+    Returns:
+        List of Block Kit blocks.
+    """
+    blocks: list[dict] = []
+
+    # Assistant header + text
+    header_text = "🤖 *Assistant*"
+    if assistant_text:
+        header_text += f"\n\n{escape_mrkdwn(assistant_text)}"
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": header_text}})
+
+    # Tool calls
+    for tool in tool_calls:
+        blocks.append({"type": "divider"})
+        tool_text = f"{tool.icon} *{tool.name}* `{tool.label}`"
+        if tool.result:
+            # Truncate long results
+            result = escape_mrkdwn(tool.result[:1000])
+            if len(tool.result) > 1000:
+                result += "..."
+            tool_text += f"\n✓ {result}"
+        elif tool.is_error:
+            tool_text += "\n✗ Error"
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": tool_text}})
+
+    # Duration footer
+    if duration_ms:
+        seconds = duration_ms / 1000
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"⏱ {seconds:.1f}s"}],
+            }
+        )
+
+    return blocks
+
+
+def format_system_message_blocks(text: str) -> list[dict]:
+    """Format a system message as Block Kit blocks for Slack.
+
+    Args:
+        text: System message text.
+
+    Returns:
+        List of Block Kit blocks.
+    """
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"⚡ *{escape_mrkdwn(text)}*"},
+        }
+    ]
+
+
+def format_context_compacted_blocks() -> list[dict]:
+    """Format context compaction notice as Block Kit blocks for Slack.
+
+    Returns:
+        List of Block Kit blocks.
+    """
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "⚡ *Context compacted* — previous messages cleared",
+            },
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from claude_session_player.watcher.deps import check_slack_available
@@ -52,144 +51,6 @@ def escape_mrkdwn(text: str) -> str:
     text = text.replace("<", "&lt;")
     text = text.replace(">", "&gt;")
     return text
-
-
-@dataclass
-class ToolCallInfo:
-    """Information about a tool call for formatting."""
-
-    name: str
-    label: str
-    icon: str
-    result: str | None = None
-    is_error: bool = False
-
-
-# Tool name to icon mapping (same as Telegram)
-_TOOL_ICONS = {
-    "Read": "📖",
-    "Write": "📝",
-    "Edit": "✏️",
-    "Bash": "🔧",
-    "Glob": "🔍",
-    "Grep": "🔍",
-    "Task": "🤖",
-    "WebSearch": "🌐",
-    "WebFetch": "🌐",
-}
-
-
-def get_tool_icon(tool_name: str) -> str:
-    """Get the icon for a tool name.
-
-    Args:
-        tool_name: Name of the tool.
-
-    Returns:
-        Emoji icon for the tool.
-    """
-    return _TOOL_ICONS.get(tool_name, "⚙️")
-
-
-def format_user_message_blocks(text: str) -> list[dict]:
-    """Format a user message as Block Kit blocks.
-
-    Args:
-        text: User message text.
-
-    Returns:
-        List of Block Kit blocks.
-    """
-    return [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"👤 *User*\n\n{escape_mrkdwn(text)}"},
-        }
-    ]
-
-
-def format_turn_message_blocks(
-    assistant_text: str | None,
-    tool_calls: list[ToolCallInfo],
-    duration_ms: int | None,
-) -> list[dict]:
-    """Format a complete turn message as Block Kit blocks.
-
-    Args:
-        assistant_text: Optional assistant response text.
-        tool_calls: List of tool call information.
-        duration_ms: Optional turn duration in milliseconds.
-
-    Returns:
-        List of Block Kit blocks.
-    """
-    blocks: list[dict] = []
-
-    # Assistant header + text
-    header_text = "🤖 *Assistant*"
-    if assistant_text:
-        header_text += f"\n\n{escape_mrkdwn(assistant_text)}"
-    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": header_text}})
-
-    # Tool calls
-    for tool in tool_calls:
-        blocks.append({"type": "divider"})
-        tool_text = f"{tool.icon} *{tool.name}* `{tool.label}`"
-        if tool.result:
-            # Truncate long results
-            result = escape_mrkdwn(tool.result[:1000])
-            if len(tool.result) > 1000:
-                result += "..."
-            tool_text += f"\n✓ {result}"
-        elif tool.is_error:
-            tool_text += "\n✗ Error"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": tool_text}})
-
-    # Duration footer
-    if duration_ms:
-        seconds = duration_ms / 1000
-        blocks.append(
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"⏱ {seconds:.1f}s"}],
-            }
-        )
-
-    return blocks
-
-
-def format_system_message_blocks(text: str) -> list[dict]:
-    """Format a system message as Block Kit blocks.
-
-    Args:
-        text: System message text.
-
-    Returns:
-        List of Block Kit blocks.
-    """
-    return [
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"⚡ *{escape_mrkdwn(text)}*"},
-        }
-    ]
-
-
-def format_context_compacted_blocks() -> list[dict]:
-    """Format context compaction notice as Block Kit blocks.
-
-    Returns:
-        List of Block Kit blocks.
-    """
-    return [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "⚡ *Context compacted* — previous messages cleared",
-            },
-        }
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +203,18 @@ def _truncate_blocks(blocks: list[dict], max_blocks: int = _MAX_BLOCKS) -> list[
         }
     )
     return truncated
+
+
+def _wrap_in_code_block(content: str) -> list[dict]:
+    """Wrap content in a Block Kit code block.
+
+    Args:
+        content: Pre-rendered content to wrap.
+
+    Returns:
+        List containing a single section block with code formatting.
+    """
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": f"```{content}```"}}]
 
 
 class SlackPublisher:
@@ -500,6 +373,39 @@ class SlackPublisher:
             except SlackApiError as e2:
                 logger.warning(f"Failed to update Slack message {ts}: {e2}")
                 return False
+
+    async def send_session_message(self, channel: str, content: str) -> str:
+        """Send a session message with pre-rendered content.
+
+        Wraps the content in a code block and sends to the channel.
+
+        Args:
+            channel: Channel ID or name.
+            content: Pre-rendered session content.
+
+        Returns:
+            Message timestamp (ts) for future updates.
+
+        Raises:
+            SlackError: On API failure after retry.
+        """
+        blocks = _wrap_in_code_block(content)
+        return await self.send_message(channel=channel, text=content, blocks=blocks)
+
+    async def update_session_message(
+        self, channel: str, ts: str, content: str
+    ) -> None:
+        """Update a session message with pre-rendered content.
+
+        Wraps the content in a code block and updates the message.
+
+        Args:
+            channel: Channel ID or name.
+            ts: Message timestamp to update.
+            content: Pre-rendered session content.
+        """
+        blocks = _wrap_in_code_block(content)
+        await self.update_message(channel=channel, ts=ts, text=content, blocks=blocks)
 
     async def close(self) -> None:
         """Close the client session."""
