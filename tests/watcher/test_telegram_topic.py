@@ -480,198 +480,8 @@ class MockTelegramPublisherWithThreads:
         pass
 
 
-class TestSendMessageToTopic:
-    """Integration tests for sending messages to Telegram topics."""
-
-    @pytest.mark.asyncio
-    async def test_send_message_includes_thread_id(
-        self,
-        destination_manager: DestinationManager,
-        session_jsonl: Path,
-    ) -> None:
-        """Messages sent to topic destination include thread_id."""
-        from claude_session_player.watcher.config import BotConfig, ConfigManager
-        from claude_session_player.watcher.service import WatcherService
-
-        # Create temporary config
-        config_path = session_jsonl.parent / "config.yaml"
-        state_dir = session_jsonl.parent / "state"
-        state_dir.mkdir()
-
-        config_manager = ConfigManager(config_path)
-        config_manager._bot_config = BotConfig(telegram_token="test-token")
-
-        mock_publisher = MockTelegramPublisherWithThreads(token="test-token")
-
-        service = WatcherService(
-            config_path=config_path,
-            state_dir=state_dir,
-            config_manager=config_manager,
-            telegram_publisher=mock_publisher,
-            port=18080,
-        )
-
-        try:
-            await service.start()
-            await service.watch("test-session", session_jsonl)
-
-            # Attach to a topic (thread_id=123)
-            identifier = make_telegram_identifier("-1001234567890", 123)
-            await service.destination_manager.attach(
-                session_id="test-session",
-                path=session_jsonl,
-                destination_type="telegram",
-                identifier=identifier,
-            )
-
-            # Send a user block event
-            from claude_session_player.events import (
-                AddBlock,
-                Block,
-                BlockType,
-                UserContent,
-            )
-
-            user_block = Block(
-                id="user-1",
-                type=BlockType.USER,
-                content=UserContent(text="Hello from topic!"),
-            )
-            await service._publish_to_messaging("test-session", AddBlock(block=user_block))
-
-            # Verify message was sent with thread_id
-            assert len(mock_publisher.sent_messages) == 1
-            msg = mock_publisher.sent_messages[0]
-            assert msg["chat_id"] == "-1001234567890"
-            assert msg["message_thread_id"] == 123
-
-        finally:
-            await service.stop()
-
-    @pytest.mark.asyncio
-    async def test_send_message_without_thread_id(
-        self,
-        destination_manager: DestinationManager,
-        session_jsonl: Path,
-    ) -> None:
-        """Messages sent to chat without topic have thread_id=None."""
-        from claude_session_player.watcher.config import BotConfig, ConfigManager
-        from claude_session_player.watcher.service import WatcherService
-
-        config_path = session_jsonl.parent / "config.yaml"
-        state_dir = session_jsonl.parent / "state"
-        state_dir.mkdir()
-
-        config_manager = ConfigManager(config_path)
-        config_manager._bot_config = BotConfig(telegram_token="test-token")
-
-        mock_publisher = MockTelegramPublisherWithThreads(token="test-token")
-
-        service = WatcherService(
-            config_path=config_path,
-            state_dir=state_dir,
-            config_manager=config_manager,
-            telegram_publisher=mock_publisher,
-            port=18081,
-        )
-
-        try:
-            await service.start()
-            await service.watch("test-session", session_jsonl)
-
-            # Attach without thread_id
-            await service.destination_manager.attach(
-                session_id="test-session",
-                path=session_jsonl,
-                destination_type="telegram",
-                identifier="-1001234567890",
-            )
-
-            from claude_session_player.events import (
-                AddBlock,
-                Block,
-                BlockType,
-                UserContent,
-            )
-
-            user_block = Block(
-                id="user-1",
-                type=BlockType.USER,
-                content=UserContent(text="Hello from General!"),
-            )
-            await service._publish_to_messaging("test-session", AddBlock(block=user_block))
-
-            # Verify message was sent without thread_id
-            assert len(mock_publisher.sent_messages) == 1
-            msg = mock_publisher.sent_messages[0]
-            assert msg["chat_id"] == "-1001234567890"
-            assert msg["message_thread_id"] is None
-
-        finally:
-            await service.stop()
-
-    @pytest.mark.asyncio
-    async def test_replay_includes_thread_id(
-        self,
-        session_jsonl: Path,
-    ) -> None:
-        """Replay to topic destination includes thread_id."""
-        from claude_session_player.watcher.config import BotConfig, ConfigManager
-        from claude_session_player.watcher.service import WatcherService
-        from claude_session_player.events import (
-            AddBlock,
-            Block,
-            BlockType,
-            UserContent,
-        )
-
-        config_path = session_jsonl.parent / "config.yaml"
-        state_dir = session_jsonl.parent / "state"
-        state_dir.mkdir()
-
-        config_manager = ConfigManager(config_path)
-        config_manager._bot_config = BotConfig(telegram_token="test-token")
-
-        mock_publisher = MockTelegramPublisherWithThreads(token="test-token")
-
-        service = WatcherService(
-            config_path=config_path,
-            state_dir=state_dir,
-            config_manager=config_manager,
-            telegram_publisher=mock_publisher,
-            port=18082,
-        )
-
-        try:
-            await service.start()
-            await service.watch("test-session", session_jsonl)
-
-            # Add events to buffer
-            for i in range(3):
-                user_block = Block(
-                    id=f"user-{i}",
-                    type=BlockType.USER,
-                    content=UserContent(text=f"Message {i}"),
-                )
-                service.event_buffer.add_event("test-session", AddBlock(block=user_block))
-
-            # Replay to topic
-            identifier = make_telegram_identifier("-1001234567890", 456)
-            replayed = await service.replay_to_destination(
-                session_id="test-session",
-                destination_type="telegram",
-                identifier=identifier,
-                count=3,
-            )
-
-            assert replayed == 3
-            assert len(mock_publisher.sent_messages) == 1
-            msg = mock_publisher.sent_messages[0]
-            assert msg["chat_id"] == "-1001234567890"
-            assert msg["message_thread_id"] == 456
-
-        finally:
-            await service.stop()
+# NOTE: TestSendMessageToTopic class was removed in Issue #160
+# The tests used WatcherService._publish_to_messaging which was removed in Issue #157
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +524,7 @@ class TestAPIThreadIdValidation:
                     json={
                         "session_id": "test-session",
                         "path": str(session_jsonl),
+                        "preset": "desktop",
                         "destination": {
                             "type": "telegram",
                             "chat_id": "-1001234567890",
@@ -766,6 +577,7 @@ class TestAPIThreadIdValidation:
                         json={
                             "session_id": "test-session",
                             "path": str(session_jsonl),
+                            "preset": "desktop",
                             "destination": {
                                 "type": "telegram",
                                 "chat_id": "-1001234567890",
