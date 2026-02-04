@@ -40,7 +40,9 @@ from claude_session_player.watcher.telegram_publisher import (
 )
 from claude_session_player.watcher.slack_publisher import (
     ToolCallInfo as SlackToolCallInfo,
+    format_answered_question_blocks,
     format_context_compacted_blocks,
+    format_question_blocks,
     format_system_message_blocks,
     format_turn_message_blocks,
     format_user_message_blocks,
@@ -628,38 +630,12 @@ class MessageStateTracker:
         return "\n".join(lines).strip()
 
     def _format_question_blocks(self, content: QuestionContent) -> list[dict]:
-        """Format question for initial Slack display."""
-        blocks: list[dict] = []
-        for q in content.questions:
-            header = q.header or "Question"
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"❓ *{header}*\n{q.question}",
-                },
-            })
-        blocks.append({
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": "_(respond in CLI)_"}],
-        })
-        return blocks
+        """Format question for initial Slack display with action buttons."""
+        return format_question_blocks(content)
 
     def _format_answered_question_blocks(self, content: QuestionContent) -> list[dict]:
-        """Format answered question for Slack display."""
-        blocks: list[dict] = []
-        for q in content.questions:
-            header = q.header or "Question"
-            answer = content.answers.get(q.question) if content.answers else None
-            answer_text = f"\n✓ Selected: {answer}" if answer else ""
-            blocks.append({
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"❓ *{header}*\n{q.question}{answer_text}",
-                },
-            })
-        return blocks
+        """Format answered question for Slack display (no action buttons)."""
+        return format_answered_question_blocks(content)
 
     def record_question_message_id(
         self,

@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from claude_session_player.watcher.deps import check_slack_available
+
+if TYPE_CHECKING:
+    from claude_session_player.events import QuestionContent
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +190,126 @@ def format_context_compacted_blocks() -> list[dict]:
             },
         }
     ]
+
+
+# ---------------------------------------------------------------------------
+# Question Block Kit Formatting
+# ---------------------------------------------------------------------------
+
+
+# Maximum number of buttons per actions block for questions
+MAX_QUESTION_BUTTONS = 5
+
+
+def format_question_blocks(content: QuestionContent) -> list[dict]:
+    """Format question blocks with action buttons for Slack.
+
+    Builds Block Kit blocks with inline action buttons for unanswered questions.
+    Each question gets a section with header and text, followed by an actions
+    block with buttons for options (up to MAX_QUESTION_BUTTONS).
+
+    Args:
+        content: QuestionContent with questions and options.
+
+    Returns:
+        List of Block Kit blocks.
+    """
+    blocks: list[dict] = []
+
+    for q_idx, question in enumerate(content.questions):
+        header = question.header or "Question"
+
+        # Section with question header and text
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":question: *{escape_mrkdwn(header)}*\n{escape_mrkdwn(question.question)}",
+            },
+        })
+
+        # Actions block with option buttons
+        buttons: list[dict] = []
+        for opt_idx, option in enumerate(question.options[:MAX_QUESTION_BUTTONS]):
+            # Truncate label to fit Slack's button text limit (75 chars)
+            label = option.label
+            if len(label) > 30:
+                label = label[:27] + "..."
+            buttons.append({
+                "type": "button",
+                "text": {"type": "plain_text", "text": label, "emoji": True},
+                "action_id": f"question_opt_{q_idx}_{opt_idx}",
+                "value": f"{content.tool_use_id}:{q_idx}:{opt_idx}",
+            })
+
+        if buttons:
+            blocks.append({
+                "type": "actions",
+                "block_id": f"q_{content.tool_use_id}_{q_idx}",
+                "elements": buttons,
+            })
+
+        # Overflow notice if more than MAX_QUESTION_BUTTONS options
+        total_options = len(question.options)
+        if total_options > MAX_QUESTION_BUTTONS:
+            overflow_count = total_options - MAX_QUESTION_BUTTONS
+            blocks.append({
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": f"_and {overflow_count} more option{'s' if overflow_count > 1 else ''} in CLI_",
+                }],
+            })
+
+        # Divider between questions (not after last)
+        if q_idx < len(content.questions) - 1:
+            blocks.append({"type": "divider"})
+
+    # Final context prompting CLI response
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": "_respond in CLI_"}],
+    })
+
+    return blocks
+
+
+def format_answered_question_blocks(content: QuestionContent) -> list[dict]:
+    """Format answered question blocks for Slack (no action buttons).
+
+    Builds Block Kit blocks showing answered questions with the selected
+    answer displayed. Does not include action buttons.
+
+    Args:
+        content: QuestionContent with questions and answers.
+
+    Returns:
+        List of Block Kit blocks.
+    """
+    blocks: list[dict] = []
+
+    for question in content.questions:
+        header = question.header or "Question"
+
+        # Build section text with question header and text
+        section_text = f":question: *{escape_mrkdwn(header)}*\n{escape_mrkdwn(question.question)}"
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": section_text},
+        })
+
+        # Show the selected answer
+        answer = content.answers.get(question.question) if content.answers else None
+        if answer:
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f":white_check_mark: Selected: _{escape_mrkdwn(answer)}_",
+                },
+            })
+
+    return blocks
 
 
 # ---------------------------------------------------------------------------

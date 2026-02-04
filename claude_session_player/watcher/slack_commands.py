@@ -855,3 +855,24 @@ class SlackCommandHandler:
             await session.post(response_url, json=response_data)
         except Exception as e:
             logger.warning("Failed to send ephemeral response: %s", e)
+
+    async def handle_question_button_interaction(
+        self,
+        action_id: str,
+        value: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Handle question button click interaction.
+
+        Sends an ephemeral message directing users to respond in the CLI.
+        Buttons are display-only and do not trigger any action.
+
+        Args:
+            action_id: The action ID (e.g., "question_opt_0_0").
+            value: The button value (e.g., "tool_use_id:0:0").
+            payload: Full Slack interaction payload.
+        """
+        await self._respond_ephemeral(
+            payload,
+            "Please respond to this question in the Claude Code CLI.",
+        )

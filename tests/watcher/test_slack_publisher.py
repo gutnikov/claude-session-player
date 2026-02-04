@@ -7,14 +7,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from slack_sdk.errors import SlackApiError
 
+from claude_session_player.events import Question, QuestionContent, QuestionOption
 from claude_session_player.watcher.slack_publisher import (
+    MAX_QUESTION_BUTTONS,
     SlackAuthError,
     SlackError,
     SlackPublisher,
     ToolCallInfo,
     _truncate_blocks,
     escape_mrkdwn,
+    format_answered_question_blocks,
     format_context_compacted_blocks,
+    format_question_blocks,
     format_system_message_blocks,
     format_turn_message_blocks,
     format_user_message_blocks,
@@ -761,3 +765,468 @@ class TestModuleImports:
         assert "format_turn_message_blocks" in watcher.__all__
         assert "format_system_message_blocks" in watcher.__all__
         assert "format_context_compacted_blocks" in watcher.__all__
+
+
+# ---------------------------------------------------------------------------
+# Question Block Kit formatting tests
+# ---------------------------------------------------------------------------
+
+
+class TestFormatQuestionBlocksStructure:
+    """Tests for format_question_blocks function block structure."""
+
+    def test_single_question_produces_section_actions_context(self) -> None:
+        """Single question produces section + actions + context blocks."""
+        content = QuestionContent(
+            tool_use_id="test-123",
+            questions=[
+                Question(
+                    question="Which option?",
+                    header="Choose an option",
+                    options=[
+                        QuestionOption(label="Option A", description="First option"),
+                        QuestionOption(label="Option B", description="Second option"),
+                    ],
+                    multi_select=False,
+                )
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+
+        # Should have: section (question), actions (buttons), context (CLI prompt)
+        assert len(blocks) == 3
+        assert blocks[0]["type"] == "section"
+        assert blocks[1]["type"] == "actions"
+        assert blocks[2]["type"] == "context"
+
+        # Check section content
+        assert ":question:" in blocks[0]["text"]["text"]
+        assert "*Choose an option*" in blocks[0]["text"]["text"]
+        assert "Which option?" in blocks[0]["text"]["text"]
+
+        # Check actions block
+        assert len(blocks[1]["elements"]) == 2
+        assert blocks[1]["elements"][0]["type"] == "button"
+        assert blocks[1]["elements"][0]["text"]["text"] == "Option A"
+        assert blocks[1]["elements"][1]["text"]["text"] == "Option B"
+
+        # Check context
+        assert "_respond in CLI_" in blocks[2]["elements"][0]["text"]
+
+    def test_button_action_ids_and_values(self) -> None:
+        """Buttons have correct action_id and value format."""
+        content = QuestionContent(
+            tool_use_id="tool-abc",
+            questions=[
+                Question(
+                    question="Pick one",
+                    header="Options",
+                    options=[
+                        QuestionOption(label="A", description=""),
+                        QuestionOption(label="B", description=""),
+                    ],
+                )
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+        actions_block = blocks[1]
+
+        # First button
+        assert actions_block["elements"][0]["action_id"] == "question_opt_0_0"
+        assert actions_block["elements"][0]["value"] == "tool-abc:0:0"
+
+        # Second button
+        assert actions_block["elements"][1]["action_id"] == "question_opt_0_1"
+        assert actions_block["elements"][1]["value"] == "tool-abc:0:1"
+
+    def test_actions_block_id_format(self) -> None:
+        """Actions block has correct block_id format."""
+        content = QuestionContent(
+            tool_use_id="xyz-789",
+            questions=[
+                Question(
+                    question="Q",
+                    header="H",
+                    options=[QuestionOption(label="O", description="")],
+                )
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+        assert blocks[1]["block_id"] == "q_xyz-789_0"
+
+    def test_escapes_mrkdwn_in_header_and_question(self) -> None:
+        """Escapes mrkdwn special characters in header and question text."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="Choose <item> & stuff",
+                    header="Header > title",
+                    options=[QuestionOption(label="A", description="")],
+                )
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+        section_text = blocks[0]["text"]["text"]
+
+        # Should be escaped
+        assert "&lt;item&gt;" in section_text
+        assert "&amp;" in section_text
+        assert "Header &gt; title" in section_text
+
+
+class TestFormatQuestionBlocksTruncation:
+    """Tests for format_question_blocks truncation at MAX_QUESTION_BUTTONS."""
+
+    def test_truncates_at_max_buttons(self) -> None:
+        """More than MAX_QUESTION_BUTTONS options shows only MAX buttons with overflow."""
+        options = [
+            QuestionOption(label=f"Option {i}", description=f"Desc {i}")
+            for i in range(8)
+        ]
+        content = QuestionContent(
+            tool_use_id="test-id",
+            questions=[
+                Question(
+                    question="Which one?",
+                    header="Choose",
+                    options=options,
+                )
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+
+        # Find actions block
+        actions_block = next(b for b in blocks if b["type"] == "actions")
+        assert len(actions_block["elements"]) == MAX_QUESTION_BUTTONS
+
+        # Check button labels
+        for i in range(MAX_QUESTION_BUTTONS):
+            assert actions_block["elements"][i]["text"]["text"] == f"Option {i}"
+
+        # Find overflow context
+        context_blocks = [b for b in blocks if b["type"] == "context"]
+        # Should have overflow context + final CLI context
+        assert len(context_blocks) == 2
+        overflow_text = context_blocks[0]["elements"][0]["text"]
+        assert "3 more options" in overflow_text
+
+    def test_exactly_max_buttons_no_overflow(self) -> None:
+        """Exactly MAX_QUESTION_BUTTONS options shows no overflow notice."""
+        options = [
+            QuestionOption(label=f"Option {i}", description=f"Desc {i}")
+            for i in range(MAX_QUESTION_BUTTONS)
+        ]
+        content = QuestionContent(
+            tool_use_id="test-id",
+            questions=[
+                Question(
+                    question="Which one?",
+                    header="Choose",
+                    options=options,
+                )
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+
+        # Only one context block (the final CLI prompt)
+        context_blocks = [b for b in blocks if b["type"] == "context"]
+        assert len(context_blocks) == 1
+        assert "_respond in CLI_" in context_blocks[0]["elements"][0]["text"]
+
+    def test_truncates_long_button_labels(self) -> None:
+        """Long button labels are truncated."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="Q",
+                    header="H",
+                    options=[
+                        QuestionOption(
+                            label="This is a very long option label that exceeds the limit",
+                            description="",
+                        )
+                    ],
+                )
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+        button_text = blocks[1]["elements"][0]["text"]["text"]
+
+        # Should be truncated with ellipsis
+        assert len(button_text) <= 30
+        assert button_text.endswith("...")
+
+    def test_overflow_singular_option(self) -> None:
+        """Overflow notice uses singular 'option' for one extra."""
+        options = [
+            QuestionOption(label=f"Option {i}", description="")
+            for i in range(MAX_QUESTION_BUTTONS + 1)
+        ]
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(question="Q", header="H", options=options)
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+        context_blocks = [b for b in blocks if b["type"] == "context"]
+        overflow_text = context_blocks[0]["elements"][0]["text"]
+
+        assert "1 more option in CLI" in overflow_text
+        assert "options" not in overflow_text
+
+
+class TestFormatQuestionBlocksMultipleQuestions:
+    """Tests for format_question_blocks with multiple questions."""
+
+    def test_multiple_questions_separated_by_dividers(self) -> None:
+        """Multiple questions are separated by dividers."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="First question?",
+                    header="Q1",
+                    options=[QuestionOption(label="A1", description="")],
+                ),
+                Question(
+                    question="Second question?",
+                    header="Q2",
+                    options=[QuestionOption(label="A2", description="")],
+                ),
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+
+        # Count dividers (should be 1 between questions, not after last)
+        divider_count = sum(1 for b in blocks if b["type"] == "divider")
+        assert divider_count == 1
+
+        # Verify structure: section, actions, divider, section, actions, context
+        assert blocks[0]["type"] == "section"
+        assert blocks[1]["type"] == "actions"
+        assert blocks[2]["type"] == "divider"
+        assert blocks[3]["type"] == "section"
+        assert blocks[4]["type"] == "actions"
+        assert blocks[5]["type"] == "context"
+
+    def test_three_questions_two_dividers(self) -> None:
+        """Three questions produce two dividers."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question=f"Question {i}?",
+                    header=f"Q{i}",
+                    options=[QuestionOption(label=f"A{i}", description="")],
+                )
+                for i in range(3)
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+        divider_count = sum(1 for b in blocks if b["type"] == "divider")
+        assert divider_count == 2
+
+    def test_multiple_questions_button_indices(self) -> None:
+        """Button indices are scoped per question."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="Q1?",
+                    header="H1",
+                    options=[
+                        QuestionOption(label="Q1-A", description=""),
+                        QuestionOption(label="Q1-B", description=""),
+                    ],
+                ),
+                Question(
+                    question="Q2?",
+                    header="H2",
+                    options=[
+                        QuestionOption(label="Q2-A", description=""),
+                    ],
+                ),
+            ],
+            answers=None,
+        )
+
+        blocks = format_question_blocks(content)
+
+        # First question actions
+        q1_actions = blocks[1]
+        assert q1_actions["block_id"] == "q_test_0"
+        assert q1_actions["elements"][0]["action_id"] == "question_opt_0_0"
+        assert q1_actions["elements"][1]["action_id"] == "question_opt_0_1"
+
+        # Second question actions (after divider)
+        q2_actions = blocks[4]
+        assert q2_actions["block_id"] == "q_test_1"
+        assert q2_actions["elements"][0]["action_id"] == "question_opt_1_0"
+
+
+class TestFormatAnsweredQuestionBlocks:
+    """Tests for format_answered_question_blocks function."""
+
+    def test_answered_question_shows_selection(self) -> None:
+        """Answered question shows the selected answer."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="Which option?",
+                    header="Choose",
+                    options=[
+                        QuestionOption(label="Option A", description=""),
+                        QuestionOption(label="Option B", description=""),
+                    ],
+                )
+            ],
+            answers={"Which option?": "Option A"},
+        )
+
+        blocks = format_answered_question_blocks(content)
+
+        # Should have question section + answer section
+        assert len(blocks) == 2
+        assert blocks[0]["type"] == "section"
+        assert blocks[1]["type"] == "section"
+
+        # Check question section
+        assert ":question:" in blocks[0]["text"]["text"]
+        assert "*Choose*" in blocks[0]["text"]["text"]
+        assert "Which option?" in blocks[0]["text"]["text"]
+
+        # Check answer section
+        assert ":white_check_mark:" in blocks[1]["text"]["text"]
+        assert "Selected:" in blocks[1]["text"]["text"]
+        assert "_Option A_" in blocks[1]["text"]["text"]
+
+    def test_answered_question_no_actions_block(self) -> None:
+        """Answered question has no actions block."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="Q?",
+                    header="H",
+                    options=[QuestionOption(label="A", description="")],
+                )
+            ],
+            answers={"Q?": "A"},
+        )
+
+        blocks = format_answered_question_blocks(content)
+
+        # No actions blocks
+        actions_count = sum(1 for b in blocks if b["type"] == "actions")
+        assert actions_count == 0
+
+    def test_answered_question_escapes_answer(self) -> None:
+        """Answer text is escaped."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="Q?",
+                    header="H",
+                    options=[QuestionOption(label="<answer>", description="")],
+                )
+            ],
+            answers={"Q?": "<special> & stuff"},
+        )
+
+        blocks = format_answered_question_blocks(content)
+        answer_text = blocks[1]["text"]["text"]
+
+        assert "&lt;special&gt;" in answer_text
+        assert "&amp;" in answer_text
+
+    def test_answered_question_no_answer_in_dict(self) -> None:
+        """Question without answer in dict doesn't show selection."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="Q?",
+                    header="H",
+                    options=[QuestionOption(label="A", description="")],
+                )
+            ],
+            answers={"Other question?": "Other answer"},
+        )
+
+        blocks = format_answered_question_blocks(content)
+
+        # Only question section, no answer section
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "section"
+
+    def test_answered_question_multiple_questions(self) -> None:
+        """Multiple answered questions each show their answer."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="Q1?",
+                    header="H1",
+                    options=[QuestionOption(label="A1", description="")],
+                ),
+                Question(
+                    question="Q2?",
+                    header="H2",
+                    options=[QuestionOption(label="A2", description="")],
+                ),
+            ],
+            answers={"Q1?": "Answer 1", "Q2?": "Answer 2"},
+        )
+
+        blocks = format_answered_question_blocks(content)
+
+        # Q1 section + answer, Q2 section + answer = 4 blocks
+        assert len(blocks) == 4
+
+        # Check first answer
+        assert "Answer 1" in blocks[1]["text"]["text"]
+
+        # Check second answer
+        assert "Answer 2" in blocks[3]["text"]["text"]
+
+    def test_answered_question_uses_question_header_default(self) -> None:
+        """Uses 'Question' as default header if none provided."""
+        content = QuestionContent(
+            tool_use_id="test",
+            questions=[
+                Question(
+                    question="What?",
+                    header="",  # Empty header
+                    options=[QuestionOption(label="A", description="")],
+                )
+            ],
+            answers={"What?": "A"},
+        )
+
+        blocks = format_answered_question_blocks(content)
+        assert "*Question*" in blocks[0]["text"]["text"]
