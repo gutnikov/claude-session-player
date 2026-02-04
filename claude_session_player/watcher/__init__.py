@@ -83,7 +83,6 @@ from claude_session_player.watcher.telegram_publisher import (
     TelegramError,
     TelegramPublisher,
     escape_html,
-    escape_markdown,
     format_question_keyboard,
     format_question_text,
 )
@@ -113,7 +112,6 @@ __all__ = [
     "DestinationManager",
     "MessageDebouncer",
     "PendingUpdate",
-    "escape_markdown",
     "escape_mrkdwn",
     "EventBuffer",
     "EventBufferManager",

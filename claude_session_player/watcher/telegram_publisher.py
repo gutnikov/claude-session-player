@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import TYPE_CHECKING
 
 from claude_session_player.watcher.deps import check_telegram_available
@@ -51,24 +50,6 @@ def escape_html(text: str) -> str:
         Text with HTML entities escaped.
     """
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-# Legacy markdown escape for backwards compatibility
-_MARKDOWN_ESCAPE_CHARS = re.compile(r"([_*`\[])")
-
-
-def escape_markdown(text: str) -> str:
-    """Escape special characters for Telegram Markdown.
-
-    Escapes: _ * ` [
-
-    Args:
-        text: Raw text to escape.
-
-    Returns:
-        Text with special characters escaped.
-    """
-    return _MARKDOWN_ESCAPE_CHARS.sub(r"\\\1", text)
 
 
 # ---------------------------------------------------------------------------
