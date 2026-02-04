@@ -917,6 +917,81 @@ class WatcherService:
 
         return True
 
+    async def extend_binding_ttl(
+        self,
+        destination_type: str,
+        identifier: str,
+        message_id: str,
+        seconds: int = 30,
+    ) -> bool:
+        """Extend TTL on a message binding.
+
+        Finds a binding by destination and message_id, then extends its TTL.
+        If the binding was expired, triggers reactivation (updates the message).
+
+        Args:
+            destination_type: Type of destination ("telegram" or "slack").
+            identifier: Destination identifier (chat_id or channel).
+            message_id: The platform message ID.
+            seconds: Number of seconds to add to TTL (default 30).
+
+        Returns:
+            True if binding was found and TTL extended, False otherwise.
+        """
+        if not self.message_bindings:
+            return False
+
+        binding = self.message_bindings.find_binding_by_message_id(
+            destination_type, identifier, message_id
+        )
+
+        if not binding:
+            logger.debug(
+                "Binding not found for TTL extension",
+                extra={
+                    "destination_type": destination_type,
+                    "identifier": identifier,
+                    "message_id": message_id,
+                },
+            )
+            return False
+
+        # Track if binding was expired before extension
+        was_expired = binding.is_expired()
+
+        # Extend TTL
+        binding.extend_ttl(seconds)
+
+        logger.info(
+            "Extended binding TTL",
+            extra={
+                "session_id": binding.session_id,
+                "destination_type": destination_type,
+                "message_id": message_id,
+                "ttl_seconds": binding.ttl_seconds,
+                "was_expired": was_expired,
+            },
+        )
+
+        # If binding was expired, trigger reactivation
+        if was_expired:
+            # TODO: Issue #182 - Implement full reactivation logic
+            # For now, just push the current cached content to update the message
+            logger.debug(
+                "Binding reactivated from expired state, triggering update",
+                extra={
+                    "session_id": binding.session_id,
+                    "destination_type": destination_type,
+                    "message_id": message_id,
+                },
+            )
+            if self.render_cache:
+                content = self.render_cache.get(binding.session_id, binding.preset)
+                if content:
+                    await self._push_binding_content(binding, content)
+
+        return True
+
     async def _periodic_refresh(self) -> None:
         """Background task for periodic index refresh.
 

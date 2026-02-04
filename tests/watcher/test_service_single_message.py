@@ -880,3 +880,201 @@ class TestTTLExpiryChecking:
 
         # Binding should still be expired
         assert binding.expired is True
+
+
+# --- Extend Binding TTL Tests ---
+
+
+class TestExtendBindingTTL:
+    """Tests for extend_binding_ttl() method."""
+
+    @pytest.mark.asyncio
+    async def test_extends_ttl_for_existing_binding(
+        self,
+        watcher_service: WatcherService,
+        telegram_dest: AttachedDestination,
+    ) -> None:
+        """extend_binding_ttl() extends TTL on existing binding."""
+        session_id = "test-session"
+        message_id = "999"
+
+        # Create binding with low TTL
+        binding = MessageBinding(
+            session_id=session_id,
+            preset="desktop",
+            destination=telegram_dest,
+            message_id=message_id,
+            ttl_seconds=30,
+        )
+        watcher_service.message_bindings.add_binding(binding)
+
+        # Extend TTL
+        result = await watcher_service.extend_binding_ttl(
+            destination_type=telegram_dest.type,
+            identifier=telegram_dest.identifier,
+            message_id=message_id,
+            seconds=30,
+        )
+
+        assert result is True
+        assert binding.ttl_seconds == 60
+
+    @pytest.mark.asyncio
+    async def test_extends_ttl_capped_at_max(
+        self,
+        watcher_service: WatcherService,
+        telegram_dest: AttachedDestination,
+    ) -> None:
+        """extend_binding_ttl() caps TTL at MAX_TTL_SECONDS (300)."""
+        session_id = "test-session"
+        message_id = "999"
+
+        # Create binding with high TTL
+        binding = MessageBinding(
+            session_id=session_id,
+            preset="desktop",
+            destination=telegram_dest,
+            message_id=message_id,
+            ttl_seconds=290,
+        )
+        watcher_service.message_bindings.add_binding(binding)
+
+        # Extend TTL by 30s (would be 320, capped at 300)
+        result = await watcher_service.extend_binding_ttl(
+            destination_type=telegram_dest.type,
+            identifier=telegram_dest.identifier,
+            message_id=message_id,
+            seconds=30,
+        )
+
+        assert result is True
+        assert binding.ttl_seconds == 300  # Capped at max
+
+    @pytest.mark.asyncio
+    async def test_returns_false_for_nonexistent_binding(
+        self,
+        watcher_service: WatcherService,
+    ) -> None:
+        """extend_binding_ttl() returns False for nonexistent binding."""
+        result = await watcher_service.extend_binding_ttl(
+            destination_type="telegram",
+            identifier="999999",
+            message_id="nonexistent",
+        )
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_reactivates_expired_binding(
+        self,
+        watcher_service: WatcherService,
+        telegram_dest: AttachedDestination,
+    ) -> None:
+        """extend_binding_ttl() reactivates expired binding."""
+        from datetime import timedelta, timezone
+
+        session_id = "test-session"
+        message_id = "999"
+
+        # Create an expired binding
+        binding = MessageBinding(
+            session_id=session_id,
+            preset="desktop",
+            destination=telegram_dest,
+            message_id=message_id,
+            created_at=datetime.now(timezone.utc) - timedelta(seconds=60),
+            ttl_seconds=30,
+            expired=True,
+        )
+        watcher_service.message_bindings.add_binding(binding)
+
+        # Build cache for reactivation push
+        events = [
+            AddBlock(
+                block=Block(
+                    id="b1",
+                    type=BlockType.USER,
+                    content=UserContent(text="test content"),
+                )
+            )
+        ]
+        watcher_service.render_cache.rebuild(session_id, events)
+
+        # Extend TTL on expired binding
+        result = await watcher_service.extend_binding_ttl(
+            destination_type=telegram_dest.type,
+            identifier=telegram_dest.identifier,
+            message_id=message_id,
+        )
+
+        assert result is True
+        assert binding.expired is False
+        assert binding.ttl_seconds == 60  # 30 + 30
+
+    @pytest.mark.asyncio
+    async def test_finds_binding_across_sessions(
+        self,
+        watcher_service: WatcherService,
+        telegram_dest: AttachedDestination,
+    ) -> None:
+        """extend_binding_ttl() finds binding across multiple sessions."""
+        message_id = "999"
+
+        # Create bindings in different sessions
+        binding_1 = MessageBinding(
+            session_id="session-1",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="111",
+            ttl_seconds=30,
+        )
+        binding_2 = MessageBinding(
+            session_id="session-2",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id=message_id,  # This is the one we're looking for
+            ttl_seconds=30,
+        )
+        watcher_service.message_bindings.add_binding(binding_1)
+        watcher_service.message_bindings.add_binding(binding_2)
+
+        # Extend TTL on binding_2
+        result = await watcher_service.extend_binding_ttl(
+            destination_type=telegram_dest.type,
+            identifier=telegram_dest.identifier,
+            message_id=message_id,
+        )
+
+        assert result is True
+        assert binding_2.ttl_seconds == 60
+        assert binding_1.ttl_seconds == 30  # Unchanged
+
+    @pytest.mark.asyncio
+    async def test_custom_extension_seconds(
+        self,
+        watcher_service: WatcherService,
+        telegram_dest: AttachedDestination,
+    ) -> None:
+        """extend_binding_ttl() uses custom seconds value."""
+        session_id = "test-session"
+        message_id = "999"
+
+        binding = MessageBinding(
+            session_id=session_id,
+            preset="desktop",
+            destination=telegram_dest,
+            message_id=message_id,
+            ttl_seconds=30,
+        )
+        watcher_service.message_bindings.add_binding(binding)
+
+        # Extend by 60 seconds
+        result = await watcher_service.extend_binding_ttl(
+            destination_type=telegram_dest.type,
+            identifier=telegram_dest.identifier,
+            message_id=message_id,
+            seconds=60,
+        )
+
+        assert result is True
+        assert binding.ttl_seconds == 90
