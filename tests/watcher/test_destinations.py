@@ -74,23 +74,14 @@ def on_session_start() -> AsyncMock:
 
 
 @pytest.fixture
-def on_session_stop() -> AsyncMock:
-    """Create async mock for on_session_stop callback."""
-    return AsyncMock()
-
-
-@pytest.fixture
 def destination_manager(
     mock_config_manager: MagicMock,
     on_session_start: AsyncMock,
-    on_session_stop: AsyncMock,
 ) -> DestinationManager:
     """Create a DestinationManager with mocks."""
     return DestinationManager(
         _config=mock_config_manager,
         _on_session_start=on_session_start,
-        _on_session_stop=on_session_stop,
-        _keep_alive_seconds=1,  # Short timeout for tests
     )
 
 
@@ -363,112 +354,6 @@ class TestDetach:
         assert isinstance(call_args[0][1], TelegramDestination)
         assert call_args[0][1].chat_id == "123456789"
 
-    @pytest.mark.asyncio
-    async def test_last_detach_starts_keep_alive(
-        self,
-        destination_manager: DestinationManager,
-        on_session_stop: AsyncMock,
-        session_jsonl: Path,
-    ) -> None:
-        """Last detach starts keep-alive timer."""
-        # Attach
-        await destination_manager.attach(
-            session_id="test-session",
-            path=session_jsonl,
-            destination_type="telegram",
-            identifier="123456789",
-        )
-
-        # Detach
-        await destination_manager.detach(
-            session_id="test-session",
-            destination_type="telegram",
-            identifier="123456789",
-        )
-
-        # on_session_stop should NOT be called immediately
-        on_session_stop.assert_not_called()
-
-        # Wait for keep-alive to expire (1 second in tests)
-        await asyncio.sleep(1.5)
-
-        # Now on_session_stop should have been called
-        on_session_stop.assert_called_once_with("test-session")
-
-
-# ---------------------------------------------------------------------------
-# Keep-alive tests
-# ---------------------------------------------------------------------------
-
-
-class TestKeepAlive:
-    """Tests for keep-alive timer behavior."""
-
-    @pytest.mark.asyncio
-    async def test_keep_alive_expiry_stops_session(
-        self,
-        destination_manager: DestinationManager,
-        on_session_stop: AsyncMock,
-        session_jsonl: Path,
-    ) -> None:
-        """Keep-alive expiry stops file watching."""
-        # Attach and detach
-        await destination_manager.attach(
-            session_id="test-session",
-            path=session_jsonl,
-            destination_type="telegram",
-            identifier="123456789",
-        )
-        await destination_manager.detach(
-            session_id="test-session",
-            destination_type="telegram",
-            identifier="123456789",
-        )
-
-        # Wait for keep-alive to expire
-        await asyncio.sleep(1.5)
-
-        on_session_stop.assert_called_once_with("test-session")
-
-    @pytest.mark.asyncio
-    async def test_new_attach_during_keep_alive_cancels_timer(
-        self,
-        destination_manager: DestinationManager,
-        on_session_start: AsyncMock,
-        on_session_stop: AsyncMock,
-        session_jsonl: Path,
-    ) -> None:
-        """New attach during keep-alive cancels timer."""
-        # Attach and detach
-        await destination_manager.attach(
-            session_id="test-session",
-            path=session_jsonl,
-            destination_type="telegram",
-            identifier="123456789",
-        )
-        await destination_manager.detach(
-            session_id="test-session",
-            destination_type="telegram",
-            identifier="123456789",
-        )
-
-        # Immediately re-attach before keep-alive expires
-        await destination_manager.attach(
-            session_id="test-session",
-            path=session_jsonl,
-            destination_type="slack",
-            identifier="C0123456789",
-        )
-
-        # Wait for what would have been keep-alive expiry
-        await asyncio.sleep(1.5)
-
-        # on_session_stop should NOT have been called
-        on_session_stop.assert_not_called()
-
-        # on_session_start should only be called once (first attach)
-        assert on_session_start.call_count == 1
-
 
 # ---------------------------------------------------------------------------
 # Restore from config tests
@@ -483,7 +368,6 @@ class TestRestoreFromConfig:
         self,
         mock_config_manager: MagicMock,
         on_session_start: AsyncMock,
-        on_session_stop: AsyncMock,
         session_jsonl: Path,
     ) -> None:
         """restore_from_config starts file watching for sessions with destinations."""
@@ -510,7 +394,6 @@ class TestRestoreFromConfig:
         manager = DestinationManager(
             _config=mock_config_manager,
             _on_session_start=on_session_start,
-            _on_session_stop=on_session_stop,
         )
 
         await manager.restore_from_config()
@@ -523,7 +406,6 @@ class TestRestoreFromConfig:
         self,
         mock_config_manager: MagicMock,
         on_session_start: AsyncMock,
-        on_session_stop: AsyncMock,
         session_jsonl: Path,
     ) -> None:
         """restore_from_config populates runtime state."""
@@ -541,7 +423,6 @@ class TestRestoreFromConfig:
         manager = DestinationManager(
             _config=mock_config_manager,
             _on_session_start=on_session_start,
-            _on_session_stop=on_session_stop,
         )
 
         await manager.restore_from_config()
@@ -556,7 +437,6 @@ class TestRestoreFromConfig:
         self,
         mock_config_manager: MagicMock,
         on_session_start: AsyncMock,
-        on_session_stop: AsyncMock,
         session_jsonl: Path,
     ) -> None:
         """restore_from_config skips sessions with no destinations."""
@@ -571,7 +451,6 @@ class TestRestoreFromConfig:
         manager = DestinationManager(
             _config=mock_config_manager,
             _on_session_start=on_session_start,
-            _on_session_stop=on_session_stop,
         )
 
         await manager.restore_from_config()
@@ -673,45 +552,6 @@ class TestQueryMethods:
     ) -> None:
         """has_destinations returns False when no destinations."""
         assert destination_manager.has_destinations("unknown-session") is False
-
-
-# ---------------------------------------------------------------------------
-# Shutdown tests
-# ---------------------------------------------------------------------------
-
-
-class TestShutdown:
-    """Tests for shutdown behavior."""
-
-    @pytest.mark.asyncio
-    async def test_shutdown_cancels_keep_alive_tasks(
-        self,
-        destination_manager: DestinationManager,
-        on_session_stop: AsyncMock,
-        session_jsonl: Path,
-    ) -> None:
-        """shutdown cancels all keep-alive tasks."""
-        # Attach and detach to start keep-alive
-        await destination_manager.attach(
-            session_id="test-session",
-            path=session_jsonl,
-            destination_type="telegram",
-            identifier="123456789",
-        )
-        await destination_manager.detach(
-            session_id="test-session",
-            destination_type="telegram",
-            identifier="123456789",
-        )
-
-        # Shutdown immediately
-        await destination_manager.shutdown()
-
-        # Wait to ensure keep-alive would have expired
-        await asyncio.sleep(1.5)
-
-        # on_session_stop should NOT have been called (task was cancelled)
-        on_session_stop.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

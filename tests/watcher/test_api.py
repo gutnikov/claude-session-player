@@ -102,11 +102,6 @@ async def dummy_session_start(session_id: str, path: Path) -> None:
     pass
 
 
-async def dummy_session_stop(session_id: str) -> None:
-    """Dummy callback for session stop."""
-    pass
-
-
 @pytest.fixture
 def config_manager(temp_config_path: Path) -> ConfigManager:
     """Create a ConfigManager instance."""
@@ -119,7 +114,6 @@ def destination_manager(config_manager: ConfigManager) -> DestinationManager:
     return DestinationManager(
         _config=config_manager,
         _on_session_start=dummy_session_start,
-        _on_session_stop=dummy_session_stop,
     )
 
 

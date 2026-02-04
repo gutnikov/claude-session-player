@@ -188,23 +188,14 @@ def on_session_start() -> AsyncMock:
 
 
 @pytest.fixture
-def on_session_stop() -> AsyncMock:
-    """Create async mock for on_session_stop callback."""
-    return AsyncMock()
-
-
-@pytest.fixture
 def destination_manager(
     mock_config_manager: MagicMock,
     on_session_start: AsyncMock,
-    on_session_stop: AsyncMock,
 ) -> DestinationManager:
     """Create a DestinationManager with mocks."""
     return DestinationManager(
         _config=mock_config_manager,
         _on_session_start=on_session_start,
-        _on_session_stop=on_session_stop,
-        _keep_alive_seconds=1,
     )
 
 
@@ -374,7 +365,6 @@ class TestRestoreFromConfigWithThreadId:
         self,
         mock_config_manager: MagicMock,
         on_session_start: AsyncMock,
-        on_session_stop: AsyncMock,
         session_jsonl: Path,
     ) -> None:
         """restore_from_config preserves thread_id in identifier."""
@@ -395,7 +385,6 @@ class TestRestoreFromConfigWithThreadId:
         manager = DestinationManager(
             _config=mock_config_manager,
             _on_session_start=on_session_start,
-            _on_session_stop=on_session_stop,
         )
 
         await manager.restore_from_config()

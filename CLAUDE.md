@@ -491,7 +491,7 @@ For each event:
 - **transformer()**: Stateless function that converts JSONL lines to events
 - **EventBufferManager**: Per-session ring buffer (last 20 events) for replay
 - **SSEManager**: Manages SSE connections, broadcasts events, handles keepalive
-- **DestinationManager**: Track attached destinations, manage keep-alive timer
+- **DestinationManager**: Track attached destinations, coordinate with ConfigManager
 - **TelegramPublisher**: Telegram Bot API via aiogram (send/edit messages)
 - **SlackPublisher**: Slack Web API via slack-sdk (post/update messages)
 - **MessageStateTracker**: Map turns to message IDs, handle turn finalization
