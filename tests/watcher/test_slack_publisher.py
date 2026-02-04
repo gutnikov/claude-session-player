@@ -13,16 +13,11 @@ from claude_session_player.watcher.slack_publisher import (
     SlackAuthError,
     SlackError,
     SlackPublisher,
-    ToolCallInfo,
     _truncate_blocks,
+    _wrap_in_code_block,
     escape_mrkdwn,
     format_answered_question_blocks,
-    format_context_compacted_blocks,
     format_question_blocks,
-    format_system_message_blocks,
-    format_turn_message_blocks,
-    format_user_message_blocks,
-    get_tool_icon,
 )
 
 
@@ -82,207 +77,6 @@ class TestEscapeMrkdwn:
 
 
 # ---------------------------------------------------------------------------
-# Tool icon tests
-# ---------------------------------------------------------------------------
-
-
-class TestGetToolIcon:
-    """Tests for get_tool_icon function."""
-
-    def test_read_icon(self) -> None:
-        """Read tool has book icon."""
-        assert get_tool_icon("Read") == "📖"
-
-    def test_write_icon(self) -> None:
-        """Write tool has memo icon."""
-        assert get_tool_icon("Write") == "📝"
-
-    def test_edit_icon(self) -> None:
-        """Edit tool has pencil icon."""
-        assert get_tool_icon("Edit") == "✏️"
-
-    def test_bash_icon(self) -> None:
-        """Bash tool has wrench icon."""
-        assert get_tool_icon("Bash") == "🔧"
-
-    def test_task_icon(self) -> None:
-        """Task tool has robot icon."""
-        assert get_tool_icon("Task") == "🤖"
-
-    def test_unknown_tool_icon(self) -> None:
-        """Unknown tool gets gear icon."""
-        assert get_tool_icon("UnknownTool") == "⚙️"
-
-
-# ---------------------------------------------------------------------------
-# Block Kit formatting tests
-# ---------------------------------------------------------------------------
-
-
-class TestFormatUserMessageBlocks:
-    """Tests for format_user_message_blocks function."""
-
-    def test_basic_message(self) -> None:
-        """Formats basic user message as blocks."""
-        result = format_user_message_blocks("Hello world")
-        assert len(result) == 1
-        assert result[0]["type"] == "section"
-        assert result[0]["text"]["type"] == "mrkdwn"
-        assert "👤 *User*" in result[0]["text"]["text"]
-        assert "Hello world" in result[0]["text"]["text"]
-
-    def test_escapes_mrkdwn(self) -> None:
-        """Escapes mrkdwn in user text."""
-        result = format_user_message_blocks("Hello <world>")
-        assert "&lt;world&gt;" in result[0]["text"]["text"]
-
-    def test_multiline_message(self) -> None:
-        """Handles multiline message."""
-        result = format_user_message_blocks("Line 1\nLine 2")
-        assert "Line 1\nLine 2" in result[0]["text"]["text"]
-
-
-class TestFormatTurnMessageBlocks:
-    """Tests for format_turn_message_blocks function."""
-
-    def test_assistant_text_only(self) -> None:
-        """Formats turn with assistant text only."""
-        result = format_turn_message_blocks(
-            assistant_text="Hello world",
-            tool_calls=[],
-            duration_ms=None,
-        )
-        assert len(result) == 1
-        assert "🤖 *Assistant*" in result[0]["text"]["text"]
-        assert "Hello world" in result[0]["text"]["text"]
-
-    def test_with_duration(self) -> None:
-        """Includes duration footer."""
-        result = format_turn_message_blocks(
-            assistant_text="Hello",
-            tool_calls=[],
-            duration_ms=5000,
-        )
-        # Last block should be context with duration
-        assert result[-1]["type"] == "context"
-        assert "5.0s" in result[-1]["elements"][0]["text"]
-
-    def test_with_tool_call(self) -> None:
-        """Formats tool call."""
-        result = format_turn_message_blocks(
-            assistant_text=None,
-            tool_calls=[
-                ToolCallInfo(
-                    name="Read",
-                    label="file.txt",
-                    icon="📖",
-                    result="contents",
-                    is_error=False,
-                )
-            ],
-            duration_ms=None,
-        )
-        # Should have header, divider, tool call section
-        assert len(result) == 3
-        assert result[1]["type"] == "divider"
-        tool_text = result[2]["text"]["text"]
-        assert "*Read*" in tool_text
-        assert "`file.txt`" in tool_text
-        assert "✓ contents" in tool_text
-
-    def test_tool_call_with_error(self) -> None:
-        """Formats tool call error."""
-        result = format_turn_message_blocks(
-            assistant_text=None,
-            tool_calls=[
-                ToolCallInfo(
-                    name="Bash",
-                    label="ls -la",
-                    icon="🔧",
-                    result=None,
-                    is_error=True,
-                )
-            ],
-            duration_ms=None,
-        )
-        tool_text = result[2]["text"]["text"]
-        assert "✗ Error" in tool_text
-
-    def test_multiple_tool_calls(self) -> None:
-        """Handles multiple tool calls."""
-        result = format_turn_message_blocks(
-            assistant_text=None,
-            tool_calls=[
-                ToolCallInfo(name="Read", label="a.txt", icon="📖", result="a", is_error=False),
-                ToolCallInfo(name="Read", label="b.txt", icon="📖", result="b", is_error=False),
-            ],
-            duration_ms=None,
-        )
-        # Header + (divider + tool) * 2 = 5 blocks
-        assert len(result) == 5
-        # Count dividers
-        dividers = [b for b in result if b["type"] == "divider"]
-        assert len(dividers) == 2
-
-    def test_truncates_long_tool_result(self) -> None:
-        """Truncates long tool results."""
-        long_result = "x" * 1500
-        result = format_turn_message_blocks(
-            assistant_text=None,
-            tool_calls=[
-                ToolCallInfo(
-                    name="Read",
-                    label="big.txt",
-                    icon="📖",
-                    result=long_result,
-                    is_error=False,
-                )
-            ],
-            duration_ms=None,
-        )
-        tool_text = result[2]["text"]["text"]
-        assert "..." in tool_text
-        # Should be truncated to ~1000 chars + overhead
-        assert len(tool_text) < 1200
-
-    def test_escapes_assistant_text(self) -> None:
-        """Escapes mrkdwn in assistant text."""
-        result = format_turn_message_blocks(
-            assistant_text="Hello <world>",
-            tool_calls=[],
-            duration_ms=None,
-        )
-        assert "&lt;world&gt;" in result[0]["text"]["text"]
-
-
-class TestFormatSystemMessageBlocks:
-    """Tests for format_system_message_blocks function."""
-
-    def test_basic_system_message(self) -> None:
-        """Formats system message as blocks."""
-        result = format_system_message_blocks("Session started")
-        assert len(result) == 1
-        assert result[0]["type"] == "section"
-        assert "⚡ *Session started*" in result[0]["text"]["text"]
-
-    def test_escapes_mrkdwn(self) -> None:
-        """Escapes mrkdwn in system text."""
-        result = format_system_message_blocks("Error: <failed>")
-        assert "&lt;failed&gt;" in result[0]["text"]["text"]
-
-
-class TestFormatContextCompactedBlocks:
-    """Tests for format_context_compacted_blocks function."""
-
-    def test_compaction_message(self) -> None:
-        """Returns context compacted message blocks."""
-        result = format_context_compacted_blocks()
-        assert len(result) == 1
-        assert "⚡ *Context compacted*" in result[0]["text"]["text"]
-        assert "previous messages cleared" in result[0]["text"]["text"]
-
-
-# ---------------------------------------------------------------------------
 # Block truncation tests
 # ---------------------------------------------------------------------------
 
@@ -318,6 +112,41 @@ class TestTruncateBlocks:
         result = _truncate_blocks(blocks, max_blocks=10)
         assert len(result) == 10
         assert "truncated" in result[-1]["text"]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Code block wrapping tests
+# ---------------------------------------------------------------------------
+
+
+class TestWrapInCodeBlock:
+    """Tests for _wrap_in_code_block function."""
+
+    def test_wraps_content_in_code_block(self) -> None:
+        """Wraps content in triple backticks."""
+        result = _wrap_in_code_block("Hello World")
+        assert len(result) == 1
+        assert result[0]["type"] == "section"
+        assert result[0]["text"]["type"] == "mrkdwn"
+        assert result[0]["text"]["text"] == "```Hello World```"
+
+    def test_wraps_multiline_content(self) -> None:
+        """Wraps multiline content correctly."""
+        content = "Line 1\nLine 2\nLine 3"
+        result = _wrap_in_code_block(content)
+        assert result[0]["text"]["text"] == f"```{content}```"
+
+    def test_wraps_empty_content(self) -> None:
+        """Wraps empty string."""
+        result = _wrap_in_code_block("")
+        assert result[0]["text"]["text"] == "``````"
+
+    def test_wraps_content_with_special_chars(self) -> None:
+        """Wraps content with special characters."""
+        content = "<pre> & stuff > here"
+        result = _wrap_in_code_block(content)
+        # Content is NOT escaped when wrapped in code block
+        assert result[0]["text"]["text"] == f"```{content}```"
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +511,97 @@ class TestSlackPublisherUpdateMessage:
         assert "truncated" in sent_blocks[-1]["text"]["text"]
 
 
+class TestSlackPublisherSessionMessage:
+    """Tests for SlackPublisher.send_session_message() and update_session_message()."""
+
+    @pytest.fixture
+    def validated_publisher(self) -> SlackPublisher:
+        """Create a pre-validated publisher with mock client."""
+        publisher = SlackPublisher(token="xoxb-test-token")
+        publisher._validated = True
+        publisher._client = MagicMock()
+        return publisher
+
+    @pytest.mark.asyncio
+    async def test_send_session_message_wraps_in_code_block(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """send_session_message wraps content in code block."""
+        validated_publisher._client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1234567890.123456"}
+        )
+
+        ts = await validated_publisher.send_session_message(
+            channel="C0123456789",
+            content="Session content here",
+        )
+
+        assert ts == "1234567890.123456"
+        call_args = validated_publisher._client.chat_postMessage.call_args
+        assert call_args.kwargs["text"] == "Session content here"
+        blocks = call_args.kwargs["blocks"]
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "section"
+        assert blocks[0]["text"]["text"] == "```Session content here```"
+
+    @pytest.mark.asyncio
+    async def test_send_session_message_multiline(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """send_session_message handles multiline content."""
+        validated_publisher._client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1234567890.123456"}
+        )
+
+        content = "Line 1\nLine 2\nLine 3"
+        await validated_publisher.send_session_message(
+            channel="C0123456789",
+            content=content,
+        )
+
+        call_args = validated_publisher._client.chat_postMessage.call_args
+        blocks = call_args.kwargs["blocks"]
+        assert blocks[0]["text"]["text"] == f"```{content}```"
+
+    @pytest.mark.asyncio
+    async def test_update_session_message_wraps_in_code_block(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """update_session_message wraps content in code block."""
+        validated_publisher._client.chat_update = AsyncMock(
+            return_value={"ok": True}
+        )
+
+        await validated_publisher.update_session_message(
+            channel="C0123456789",
+            ts="1234567890.123456",
+            content="Updated session content",
+        )
+
+        call_args = validated_publisher._client.chat_update.call_args
+        assert call_args.kwargs["text"] == "Updated session content"
+        blocks = call_args.kwargs["blocks"]
+        assert len(blocks) == 1
+        assert blocks[0]["text"]["text"] == "```Updated session content```"
+
+    @pytest.mark.asyncio
+    async def test_update_session_message_returns_none(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """update_session_message returns None."""
+        validated_publisher._client.chat_update = AsyncMock(
+            return_value={"ok": True}
+        )
+
+        result = await validated_publisher.update_session_message(
+            channel="C0123456789",
+            ts="1234567890.123456",
+            content="Content",
+        )
+
+        assert result is None
+
+
 class TestSlackPublisherClose:
     """Tests for SlackPublisher.close()."""
 
@@ -730,41 +650,23 @@ class TestModuleImports:
         assert SE is SlackError
         assert SAE is SlackAuthError
 
-    def test_import_formatting_functions_from_watcher(self) -> None:
-        """Can import formatting functions from watcher package."""
-        from claude_session_player.watcher import (
-            escape_mrkdwn as em,
-            format_context_compacted_blocks as fccb,
-            format_system_message_blocks as fsmb,
-            format_turn_message_blocks as ftmb,
-            format_user_message_blocks as fumb,
-        )
+    def test_import_escape_mrkdwn_from_watcher(self) -> None:
+        """Can import escape_mrkdwn from watcher package."""
+        from claude_session_player.watcher import escape_mrkdwn as em
 
         assert em is escape_mrkdwn
-        assert fccb is format_context_compacted_blocks
-        assert fsmb is format_system_message_blocks
-        assert ftmb is format_turn_message_blocks
-        assert fumb is format_user_message_blocks
-
-    def test_import_slack_tool_call_info_from_watcher(self) -> None:
-        """Can import SlackToolCallInfo from watcher package."""
-        from claude_session_player.watcher import SlackToolCallInfo as STCI
-
-        assert STCI is ToolCallInfo
 
     def test_exports_in_all(self) -> None:
-        """All exports are in __all__."""
+        """Key exports are in __all__."""
         from claude_session_player import watcher
 
         assert "SlackPublisher" in watcher.__all__
         assert "SlackError" in watcher.__all__
         assert "SlackAuthError" in watcher.__all__
-        assert "SlackToolCallInfo" in watcher.__all__
         assert "escape_mrkdwn" in watcher.__all__
-        assert "format_user_message_blocks" in watcher.__all__
-        assert "format_turn_message_blocks" in watcher.__all__
-        assert "format_system_message_blocks" in watcher.__all__
-        assert "format_context_compacted_blocks" in watcher.__all__
+        assert "format_question_blocks" in watcher.__all__
+        assert "format_answered_question_blocks" in watcher.__all__
+        assert "SLACK_MAX_QUESTION_BUTTONS" in watcher.__all__
 
 
 # ---------------------------------------------------------------------------
