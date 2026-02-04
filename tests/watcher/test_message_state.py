@@ -993,37 +993,28 @@ class TestModuleImports:
         assert UpdateExistingMessage is not None
 
     def test_import_from_watcher_init(self) -> None:
-        """Test imports from watcher __init__."""
+        """Test imports from watcher __init__ - new architecture components."""
         from claude_session_player.watcher import (
-            MessageAction,
-            MessageStateTracker,
-            NoAction,
-            SendNewMessage,
-            SessionMessageState,
-            TurnState,
-            UpdateExistingMessage,
+            RenderCache,
+            ScreenRenderer,
+            MessageBinding,
+            MessageBindingManager,
         )
 
-        assert MessageAction is not None
-        assert MessageStateTracker is not None
-        assert NoAction is not None
-        assert SendNewMessage is not None
-        assert SessionMessageState is not None
-        assert TurnState is not None
-        assert UpdateExistingMessage is not None
+        assert RenderCache is not None
+        assert ScreenRenderer is not None
+        assert MessageBinding is not None
+        assert MessageBindingManager is not None
 
     def test_all_exports(self) -> None:
-        """Test that all exports are in __all__."""
+        """Test that new architecture exports are in __all__."""
         from claude_session_player.watcher import __all__
 
         expected = [
-            "MessageAction",
-            "MessageStateTracker",
-            "NoAction",
-            "SendNewMessage",
-            "SessionMessageState",
-            "TurnState",
-            "UpdateExistingMessage",
+            "RenderCache",
+            "ScreenRenderer",
+            "MessageBinding",
+            "MessageBindingManager",
         ]
         for name in expected:
             assert name in __all__, f"{name} not in __all__"
