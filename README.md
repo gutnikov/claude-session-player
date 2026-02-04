@@ -190,10 +190,13 @@ claude-session-player index search "auth bug" --limit 10
 ├─────────────────────────────────────────────────────────────────┤
 │                      Watcher Service (Optional)                  │
 ├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────┐    ┌───────────┐    ┌──────────────────────────┐ │
-│  │  File    │───▶│ Transform │───▶│  SSE  │  TG  │  Slack   │ │
-│  │ Watcher  │    │           │    └──────────────────────────┘ │
-│  └──────────┘    └───────────┘                                  │
+│  ┌──────────┐    ┌───────────┐    ┌───────────┐    ┌─────────┐ │
+│  │  File    │───▶│ Transform │───▶│  Render   │───▶│ Publish │ │
+│  │ Watcher  │    │           │    │  Cache    │    │ TG/Slack│ │
+│  └──────────┘    └───────────┘    └───────────┘    └─────────┘ │
+│                                          │                      │
+│                                          ▼                      │
+│                                    SSE + Search                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -214,11 +217,13 @@ Example: `/Users/me/my-project` → `-Users-me-my--project`
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/attach` | POST | Attach destination to session |
+| `/attach` | POST | Attach destination to session (requires `preset`: "desktop" or "mobile") |
 | `/detach` | POST | Detach destination |
 | `/sessions` | GET | List watched sessions |
 | `/sessions/{id}/events` | GET | SSE event stream |
 | `/search` | GET | Search sessions |
+| `/projects` | GET | List indexed projects |
+| `/index/refresh` | POST | Refresh search index |
 | `/health` | GET | Health check |
 
 See [API Reference](https://github.com/gutnikov/claude-session-player/wiki/API-Reference) for details.
