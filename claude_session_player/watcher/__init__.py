@@ -35,6 +35,7 @@ from claude_session_player.watcher.destinations import (
 )
 from claude_session_player.watcher.event_buffer import EventBuffer, EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher, IncrementalReader
+from claude_session_player.watcher.render_cache import CachedRender, RenderCache
 from claude_session_player.watcher.message_state import (
     MessageAction,
     MessageStateTracker,
@@ -144,6 +145,8 @@ __all__ = [
     "MessageStateTracker",
     "NoAction",
     "QuestionState",
+    "RenderCache",
+    "CachedRender",
     "SearchConfig",
     "SendNewMessage",
     "SessionConfig",
