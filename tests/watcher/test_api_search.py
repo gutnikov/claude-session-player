@@ -607,6 +607,7 @@ class TestHandleSearchWatchSuccess:
                         "type": "telegram",
                         "chat_id": "123456789",
                     },
+                    "preset": "desktop",
                 }
             )
 
@@ -616,6 +617,7 @@ class TestHandleSearchWatchSuccess:
             data = json.loads(response.body)
             assert data["attached"] is True
             assert data["session_id"] == "test-session-id"
+            assert data["preset"] == "desktop"
             assert data["session_summary"] == "Test session summary"
 
     async def test_search_watch_default_replay_count(
@@ -636,6 +638,7 @@ class TestHandleSearchWatchSuccess:
                         "type": "telegram",
                         "chat_id": "123456789",
                     },
+                    "preset": "mobile",
                 }
             )
 
@@ -689,6 +692,23 @@ class TestHandleSearchWatchErrors:
         data = json.loads(response.body)
         assert "destination required" in data["error"]
 
+    async def test_search_watch_missing_preset(
+        self, watcher_api_with_search: WatcherAPI
+    ) -> None:
+        """POST /search/watch returns 400 for missing preset."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "test-session-id",
+                "destination": {"type": "telegram", "chat_id": "123"},
+            }
+        )
+
+        response = await watcher_api_with_search.handle_search_watch(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "preset must be" in data["error"]
+
     async def test_search_watch_session_not_found(
         self, watcher_api_with_search: WatcherAPI
     ) -> None:
@@ -697,6 +717,7 @@ class TestHandleSearchWatchErrors:
             _json_data={
                 "session_id": "nonexistent-session",
                 "destination": {"type": "telegram", "chat_id": "123"},
+                "preset": "desktop",
             }
         )
 

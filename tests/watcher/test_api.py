@@ -219,6 +219,7 @@ class TestHandleAttachSuccess:
                         "type": "telegram",
                         "chat_id": "123456789",
                     },
+                    "preset": "desktop",
                 }
             )
 
@@ -230,6 +231,8 @@ class TestHandleAttachSuccess:
             assert data["session_id"] == "test-session"
             assert data["destination"]["type"] == "telegram"
             assert data["destination"]["chat_id"] == "123456789"
+            assert data["preset"] == "desktop"
+            assert data["message_id"] is None  # Set by WatcherService
             assert data["replayed_events"] == 0
 
     async def test_attach_slack_success(
@@ -247,6 +250,7 @@ class TestHandleAttachSuccess:
                         "type": "slack",
                         "channel": "C0123456789",
                     },
+                    "preset": "mobile",
                 }
             )
 
@@ -258,6 +262,8 @@ class TestHandleAttachSuccess:
             assert data["session_id"] == "test-session"
             assert data["destination"]["type"] == "slack"
             assert data["destination"]["channel"] == "C0123456789"
+            assert data["preset"] == "mobile"
+            assert data["message_id"] is None  # Set by WatcherService
 
     async def test_attach_idempotent(
         self, watcher_api_with_telegram_token: WatcherAPI, session_file: Path
@@ -274,6 +280,7 @@ class TestHandleAttachSuccess:
                         "type": "telegram",
                         "chat_id": "123456789",
                     },
+                    "preset": "desktop",
                 }
             )
 
@@ -311,6 +318,7 @@ class TestHandleAttachSuccess:
                         "type": "telegram",
                         "chat_id": "123456789",
                     },
+                    "preset": "desktop",
                     "replay_count": 5,
                 }
             )
@@ -396,6 +404,7 @@ class TestHandleAttachValidationErrors:
                 "session_id": "test-session",
                 "path": str(session_file),
                 "destination": {"type": "telegram"},
+                "preset": "desktop",
             }
         )
 
@@ -414,6 +423,7 @@ class TestHandleAttachValidationErrors:
                 "session_id": "test-session",
                 "path": str(session_file),
                 "destination": {"type": "slack"},
+                "preset": "desktop",
             }
         )
 
@@ -423,6 +433,43 @@ class TestHandleAttachValidationErrors:
         data = json.loads(response.body)
         assert "channel required" in data["error"]
 
+    async def test_missing_preset(
+        self, watcher_api: WatcherAPI, session_file: Path
+    ) -> None:
+        """POST /attach without preset returns 400."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "test-session",
+                "path": str(session_file),
+                "destination": {"type": "telegram", "chat_id": "123"},
+            }
+        )
+
+        response = await watcher_api.handle_attach(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "preset must be" in data["error"]
+
+    async def test_invalid_preset(
+        self, watcher_api: WatcherAPI, session_file: Path
+    ) -> None:
+        """POST /attach with invalid preset returns 400."""
+        request = MockRequest(
+            _json_data={
+                "session_id": "test-session",
+                "path": str(session_file),
+                "destination": {"type": "telegram", "chat_id": "123"},
+                "preset": "tablet",
+            }
+        )
+
+        response = await watcher_api.handle_attach(request)
+
+        assert response.status == 400
+        data = json.loads(response.body)
+        assert "preset must be" in data["error"]
+
     async def test_relative_path(self, watcher_api: WatcherAPI) -> None:
         """POST /attach with relative path returns 400."""
         request = MockRequest(
@@ -430,6 +477,7 @@ class TestHandleAttachValidationErrors:
                 "session_id": "test-session",
                 "path": "relative/path.jsonl",
                 "destination": {"type": "telegram", "chat_id": "123"},
+                "preset": "desktop",
             }
         )
 
@@ -450,6 +498,7 @@ class TestHandleAttachNotFound:
                 "session_id": "test-session",
                 "path": "/nonexistent/path/session.jsonl",
                 "destination": {"type": "telegram", "chat_id": "123"},
+                "preset": "desktop",
             }
         )
 
@@ -472,6 +521,7 @@ class TestHandleAttachAuthErrors:
                 "session_id": "test-session",
                 "path": str(session_file),
                 "destination": {"type": "telegram", "chat_id": "123"},
+                "preset": "desktop",
             }
         )
 
@@ -490,6 +540,7 @@ class TestHandleAttachAuthErrors:
                 "session_id": "test-session",
                 "path": str(session_file),
                 "destination": {"type": "slack", "channel": "C123"},
+                "preset": "desktop",
             }
         )
 
@@ -516,6 +567,7 @@ class TestHandleAttachAuthErrors:
                     "session_id": "test-session",
                     "path": str(session_file),
                     "destination": {"type": "telegram", "chat_id": "123"},
+                    "preset": "desktop",
                 }
             )
 
@@ -542,6 +594,7 @@ class TestHandleAttachAuthErrors:
                     "session_id": "test-session",
                     "path": str(session_file),
                     "destination": {"type": "slack", "channel": "C123"},
+                    "preset": "desktop",
                 }
             )
 
@@ -571,6 +624,7 @@ class TestHandleDetachSuccess:
                     "session_id": "test-session",
                     "path": str(session_file),
                     "destination": {"type": "telegram", "chat_id": "123"},
+                    "preset": "desktop",
                 }
             )
             await watcher_api_with_telegram_token.handle_attach(attach_request)
@@ -708,6 +762,7 @@ class TestHandleListSessions:
                     "session_id": "test-session",
                     "path": str(session_file),
                     "destination": {"type": "telegram", "chat_id": "123456789"},
+                    "preset": "desktop",
                 }
             )
             await watcher_api_with_telegram_token.handle_attach(attach_request)
@@ -741,6 +796,7 @@ class TestHandleListSessions:
                         "session_id": "test-session",
                         "path": str(session_file),
                         "destination": {"type": "telegram", "chat_id": "111"},
+                        "preset": "desktop",
                     }
                 )
             )
@@ -751,6 +807,7 @@ class TestHandleListSessions:
                     _json_data={
                         "session_id": "test-session",
                         "destination": {"type": "telegram", "chat_id": "222"},
+                        "preset": "mobile",
                     }
                 )
             )
@@ -903,6 +960,7 @@ class TestIntegrationAttachDetachFlow:
                         "session_id": "test-session",
                         "path": str(session_file),
                         "destination": {"type": "telegram", "chat_id": "123"},
+                        "preset": "desktop",
                     }
                 )
             )
