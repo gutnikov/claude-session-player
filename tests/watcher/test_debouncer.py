@@ -544,3 +544,284 @@ class TestModuleImports:
 
         assert "MessageDebouncer" in watcher.__all__
         assert "PendingUpdate" in watcher.__all__
+
+
+# ---------------------------------------------------------------------------
+# Test Change Detection
+# ---------------------------------------------------------------------------
+
+
+class TestChangeDetection:
+    """Tests for content change detection to avoid duplicate pushes."""
+
+    @pytest.mark.asyncio
+    async def test_no_duplicate_pushes_for_same_content(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that identical content does not trigger duplicate updates."""
+        update_fn = AsyncMock()
+        content = "same content"
+
+        # First update - should be scheduled
+        result1 = await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, content
+        )
+        assert result1 is True
+        assert fast_debouncer.pending_count() == 1
+
+        # Wait for first update to complete
+        await asyncio.sleep(0.02)
+        update_fn.assert_called_once()
+        assert fast_debouncer.pending_count() == 0
+
+        # Second update with same content - should be skipped
+        result2 = await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, content
+        )
+        assert result2 is False
+        assert fast_debouncer.pending_count() == 0
+
+        # Update function should still have been called only once
+        update_fn.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_different_content_triggers_update(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that different content triggers a new update."""
+        update_fn = AsyncMock()
+
+        # First update
+        result1 = await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, "content v1"
+        )
+        assert result1 is True
+
+        # Wait for completion
+        await asyncio.sleep(0.02)
+        assert update_fn.call_count == 1
+
+        # Second update with different content - should be scheduled
+        result2 = await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, "content v2"
+        )
+        assert result2 is True
+        assert fast_debouncer.pending_count() == 1
+
+        # Wait for completion
+        await asyncio.sleep(0.02)
+        assert update_fn.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_rate_limiting_still_enforced_for_rapid_changes(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that rate limiting is still enforced even with different content."""
+        call_times: list[float] = []
+
+        async def tracked_update() -> None:
+            call_times.append(asyncio.get_event_loop().time())
+
+        # Schedule several updates with different content rapidly
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", tracked_update, "content v1"
+        )
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", tracked_update, "content v2"
+        )
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", tracked_update, "content v3"
+        )
+
+        # Only one pending (coalesced)
+        assert fast_debouncer.pending_count() == 1
+
+        # Wait for execution
+        await asyncio.sleep(0.02)
+
+        # Only one actual API call (the last one)
+        assert len(call_times) == 1
+
+    @pytest.mark.asyncio
+    async def test_change_detection_per_message(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that change detection is tracked per message independently."""
+        update1 = AsyncMock()
+        update2 = AsyncMock()
+        content = "same content"
+
+        # First message
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update1, content
+        )
+        await asyncio.sleep(0.02)
+
+        # Second message with same content - should be scheduled (different message)
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg2", update2, content
+        )
+        await asyncio.sleep(0.02)
+
+        # Both should have been called
+        update1.assert_called_once()
+        update2.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_non_string_content_not_tracked(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that non-string content bypasses change detection."""
+        update_fn = AsyncMock()
+        content = {"data": "test"}  # Dict, not string
+
+        # First update
+        result1 = await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, content
+        )
+        assert result1 is True
+        await asyncio.sleep(0.02)
+
+        # Second update with same dict - should still schedule (no tracking for non-strings)
+        result2 = await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, content
+        )
+        assert result2 is True
+
+    @pytest.mark.asyncio
+    async def test_get_last_pushed_content(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test get_last_pushed_content returns the last pushed string."""
+        update_fn = AsyncMock()
+
+        # Initially no content tracked
+        assert fast_debouncer.get_last_pushed_content("telegram", "123", "msg1") is None
+
+        # Push content
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, "hello world"
+        )
+        await asyncio.sleep(0.02)
+
+        # Now content should be tracked
+        assert fast_debouncer.get_last_pushed_content("telegram", "123", "msg1") == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_flush_updates_last_pushed_content(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that flush also updates the last pushed content tracking."""
+        update_fn = AsyncMock()
+
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, "flushed content"
+        )
+
+        # Flush immediately
+        await fast_debouncer.flush()
+
+        # Content should be tracked after flush
+        assert fast_debouncer.get_last_pushed_content("telegram", "123", "msg1") == "flushed content"
+
+        # Subsequent update with same content should be skipped
+        result = await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, "flushed content"
+        )
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Test Memory Cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryCleanup:
+    """Tests for memory cleanup when bindings are removed."""
+
+    @pytest.mark.asyncio
+    async def test_clear_content_removes_tracking(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that clear_content removes the tracked content."""
+        update_fn = AsyncMock()
+
+        # Push content
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, "test content"
+        )
+        await asyncio.sleep(0.02)
+
+        # Verify content is tracked
+        assert fast_debouncer.get_last_pushed_content("telegram", "123", "msg1") == "test content"
+
+        # Clear content
+        fast_debouncer.clear_content("telegram", "123", "msg1")
+
+        # Content should no longer be tracked
+        assert fast_debouncer.get_last_pushed_content("telegram", "123", "msg1") is None
+
+    @pytest.mark.asyncio
+    async def test_clear_content_allows_same_content_again(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that after clear_content, same content can be pushed again."""
+        update_fn = AsyncMock()
+        content = "same content"
+
+        # First push
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, content
+        )
+        await asyncio.sleep(0.02)
+        assert update_fn.call_count == 1
+
+        # Same content would be skipped
+        result = await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, content
+        )
+        assert result is False
+        assert update_fn.call_count == 1
+
+        # Clear content tracking
+        fast_debouncer.clear_content("telegram", "123", "msg1")
+
+        # Now same content can be pushed again
+        result = await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, content
+        )
+        assert result is True
+        await asyncio.sleep(0.02)
+        assert update_fn.call_count == 2
+
+    def test_clear_content_nonexistent_is_noop(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that clearing non-existent content is a no-op (no error)."""
+        # Should not raise
+        fast_debouncer.clear_content("telegram", "nonexistent", "msg")
+
+    @pytest.mark.asyncio
+    async def test_clear_content_only_affects_specified_message(
+        self, fast_debouncer: MessageDebouncer
+    ) -> None:
+        """Test that clear_content only clears the specified message."""
+        update_fn = AsyncMock()
+
+        # Push to multiple messages
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg1", update_fn, "content1"
+        )
+        await fast_debouncer.schedule_update(
+            "telegram", "123", "msg2", update_fn, "content2"
+        )
+        await asyncio.sleep(0.03)
+
+        # Clear only msg1
+        fast_debouncer.clear_content("telegram", "123", "msg1")
+
+        # msg1 should be cleared
+        assert fast_debouncer.get_last_pushed_content("telegram", "123", "msg1") is None
+
+        # msg2 should still be tracked
+        assert fast_debouncer.get_last_pushed_content("telegram", "123", "msg2") == "content2"
