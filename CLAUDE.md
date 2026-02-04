@@ -4,6 +4,16 @@
 
 Claude Session Player is a Python tool that replays Claude Code JSONL session files as readable markdown output. It uses an event-driven architecture where each JSONL line is processed into events that build the final output state.
 
+## Specifications
+
+Design documents for major features:
+
+- `.claude/specs/sqlite-search-index.md` - SQLite search index design
+- `.claude/specs/session-search-api.md` - Search API design
+- `.claude/specs/messaging-integration.md` - Telegram/Slack messaging integration
+- `.claude/specs/event-driven-renderer.md` - Event-driven architecture spec
+- `.claude/specs/claude-session-player.md` - Original spec
+
 ## Quick Commands
 
 ```bash
@@ -104,6 +114,33 @@ QUERY_UPDATE, SEARCH_RESULTS, WAITING_FOR_TASK
 INVISIBLE
 ```
 
+### Search Database
+
+The `SearchDatabase` class provides SQLite-based persistence for the session search index.
+
+- `watcher/search_db.py` - SQLite database wrapper
+  - Schema management with automatic migration
+  - CRUD operations for sessions
+  - FTS5 full-text search with graceful fallback
+  - Maintenance operations (backup, vacuum, checkpoint)
+
+#### Database Schema
+
+```sql
+-- sessions: Session metadata with project info, summary, timestamps
+-- sessions_fts: Full-text search virtual table (FTS5)
+-- index_metadata: Index statistics and state
+-- file_mtimes: Incremental update tracking by file mtime
+```
+
+#### Search Ranking
+
+Results are ranked using weighted scoring:
+- Summary match: 2.0 per term
+- Exact phrase: +1.0 bonus
+- Project match: 1.0 per term
+- Recency: 0.0-1.0 (decays over 30 days)
+
 ## Coding Conventions
 
 ### Python Version
@@ -197,6 +234,7 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `claude_session_player/watcher/deps.py` - Optional dependency checking
 
 ### Search Module
+- `claude_session_player/watcher/search_db.py` - SQLite search database
 - `claude_session_player/watcher/indexer.py` - Session indexer (path encoding, metadata extraction)
 - `claude_session_player/watcher/search.py` - Search engine (query parsing, ranking)
 - `claude_session_player/watcher/search_state.py` - Search state manager (pagination)
@@ -205,6 +243,11 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `claude_session_player/watcher/slack_commands.py` - Slack /search command handler
 - `claude_session_player/watcher/telegram_commands.py` - Telegram /search command handler
 - `claude_session_player/watcher/telegram_bot.py` - Telegram webhook setup and polling
+
+### Database Files
+- `{state_dir}/search.db` - SQLite database file
+- `{state_dir}/search.db-wal` - WAL journal (auto-managed)
+- `{state_dir}/search.db-shm` - Shared memory (auto-managed)
 
 ### Tests
 - `tests/test_parser.py` - Parser tests
@@ -225,6 +268,11 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `tests/watcher/test_slack_commands.py` - Slack command handler tests
 - `tests/watcher/test_telegram_commands.py` - Telegram command handler tests
 - `tests/watcher/test_search_e2e.py` - End-to-end search flow tests
+- `tests/watcher/test_search_db.py` - SQLite database unit tests
+- `tests/watcher/test_search_db_fts.py` - FTS5 full-text search tests
+- `tests/watcher/test_search_db_ranking.py` - Search ranking algorithm tests
+- `tests/watcher/test_search_db_maintenance.py` - Database maintenance tests
+- `tests/watcher/test_search_db_integration.py` - SQLite integration tests
 
 ### Example Data
 - `examples/projects/*/sessions/*.jsonl` - Real session files
@@ -363,6 +411,40 @@ curl "http://localhost:8080/projects"
 curl "http://localhost:8080/sessions/930c1604-5137-4684-a344-863b511a914c/preview"
 ```
 
+### Working with the Search Database
+
+```python
+from pathlib import Path
+from claude_session_player.watcher.search_db import SearchDatabase, SearchFilters
+
+async def example():
+    # Connect to database
+    db = SearchDatabase(Path("~/.claude-session-player/state").expanduser())
+    await db.initialize()
+
+    # Search sessions
+    results, total = await db.search(SearchFilters(
+        query="auth bug",
+        project="trello",
+    ))
+
+    for session in results:
+        print(f"{session.project_display_name}: {session.summary}")
+
+    # Get ranked results with relevance scoring
+    ranked, total = await db.search_ranked(SearchFilters(query="auth"))
+    for result in ranked:
+        print(f"[{result.score:.2f}] {result.session.summary}")
+
+    # Get statistics
+    stats = await db.get_stats()
+    print(f"Indexed: {stats['total_sessions']} sessions")
+    print(f"FTS5 available: {stats['fts_available']}")
+
+    # Cleanup
+    await db.close()
+```
+
 ## Watcher Architecture
 
 The watcher service uses a layered architecture:
@@ -419,6 +501,7 @@ For each event:
 
 ### Search Components
 
+- **SearchDatabase**: SQLite-based search index with FTS5 full-text search
 - **SessionIndexer**: Scans `.claude/projects` directories, builds/persists session index
 - **SearchEngine**: Query parsing, filtering, and ranking algorithm
 - **SearchStateManager**: Manages pagination state per chat for bot interactions
@@ -435,6 +518,23 @@ bots:
     token: "BOT_TOKEN"
   slack:
     token: "xoxb-..."
+
+# Search index configuration
+index:
+  paths:
+    - "~/.claude/projects"
+  refresh_interval: 300
+  include_subagents: false
+
+# SQLite database settings
+database:
+  state_dir: "~/.claude-session-player/state"
+  checkpoint_interval: 300
+  vacuum_on_startup: false
+  backup:
+    enabled: false
+    path: "~/.claude-session-player/backups"
+    keep_count: 3
 
 sessions:
   my-session:

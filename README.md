@@ -75,6 +75,12 @@ print(markdown)
 python -m claude_session_player.watcher --port 8080
 ```
 
+### Search Sessions via API
+
+```bash
+curl "http://localhost:8080/search?q=auth"
+```
+
 ## Documentation
 
 Full documentation is available in the **[Wiki](https://github.com/gutnikov/claude-session-player/wiki)**:
@@ -99,6 +105,69 @@ Full documentation is available in the **[Wiki](https://github.com/gutnikov/clau
 ### Reference
 - [Troubleshooting](https://github.com/gutnikov/claude-session-player/wiki/Troubleshooting)
 - [Development Guide](https://github.com/gutnikov/claude-session-player/wiki/Development)
+
+## Database Configuration
+
+The session search index uses SQLite for storage:
+
+```yaml
+# config.yaml
+database:
+  # Directory for search.db
+  state_dir: "~/.claude-session-player/state"
+
+  # WAL checkpoint interval (seconds, 0 = auto)
+  checkpoint_interval: 300
+
+  # Reclaim space on startup
+  vacuum_on_startup: false
+
+  # Automatic backups
+  backup:
+    enabled: false
+    path: "~/.claude-session-player/backups"
+    keep_count: 3
+```
+
+## Index Management
+
+```bash
+# Rebuild the search index
+claude-session-player index rebuild
+
+# Incremental update
+claude-session-player index update
+
+# Show index statistics
+claude-session-player index stats
+
+# Verify database integrity
+claude-session-player index verify
+
+# Reclaim disk space
+claude-session-player index vacuum
+
+# Create backup
+claude-session-player index backup --output /path/to/backup.db
+
+# Test search (debugging)
+claude-session-player index search "auth bug" --limit 10
+```
+
+## Troubleshooting
+
+**Search returns no results:**
+1. Check index is built: `claude-session-player index stats`
+2. Rebuild if needed: `claude-session-player index rebuild`
+
+**Database corruption:**
+1. The service will auto-recover on next start
+2. Manual recovery: delete `state/search.db*` and rebuild
+
+**FTS5 not available:**
+- This is normal on some systems
+- Search still works via LIKE queries (slightly slower)
+- Check with: `claude-session-player index stats`
 
 ## Architecture
 
