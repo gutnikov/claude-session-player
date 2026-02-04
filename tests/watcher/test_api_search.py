@@ -91,13 +91,9 @@ def destination_manager(config_manager: ConfigManager) -> DestinationManager:
     async def dummy_start(sid: str, path: Path) -> None:
         pass
 
-    async def dummy_stop(sid: str) -> None:
-        pass
-
     return DestinationManager(
         _config=config_manager,
         _on_session_start=dummy_start,
-        _on_session_stop=dummy_stop,
     )
 
 
