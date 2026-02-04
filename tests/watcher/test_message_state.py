@@ -11,6 +11,9 @@ from claude_session_player.events import (
     BlockType,
     ClearAll,
     DurationContent,
+    Question,
+    QuestionContent,
+    QuestionOption,
     SystemContent,
     ThinkingContent,
     ToolCallContent,
@@ -21,6 +24,7 @@ from claude_session_player.watcher.message_state import (
     MessageAction,
     MessageStateTracker,
     NoAction,
+    QuestionState,
     SendNewMessage,
     SessionMessageState,
     TurnState,
@@ -103,6 +107,71 @@ def make_thinking_block(block_id: str = "th1") -> Block:
         id=block_id,
         type=BlockType.THINKING,
         content=ThinkingContent(),
+    )
+
+
+def make_question_block(
+    block_id: str = "q1",
+    tool_use_id: str = "q_123",
+    header: str = "Config",
+    question: str = "Which format?",
+    options: list[tuple[str, str]] | None = None,
+    multi_select: bool = False,
+    answers: dict[str, str] | None = None,
+) -> Block:
+    """Create a question block for testing."""
+    if options is None:
+        options = [("YAML", "YAML format"), ("JSON", "JSON format")]
+    return Block(
+        id=block_id,
+        type=BlockType.QUESTION,
+        content=QuestionContent(
+            tool_use_id=tool_use_id,
+            questions=[
+                Question(
+                    header=header,
+                    question=question,
+                    options=[QuestionOption(label=o[0], description=o[1]) for o in options],
+                    multi_select=multi_select,
+                )
+            ],
+            answers=answers,
+        ),
+    )
+
+
+def make_multi_question_block(
+    block_id: str = "q1",
+    tool_use_id: str = "q_123",
+    questions_data: list[tuple[str, str, list[tuple[str, str]]]] | None = None,
+    answers: dict[str, str] | None = None,
+) -> Block:
+    """Create a question block with multiple questions for testing.
+
+    Args:
+        questions_data: List of (header, question, options) tuples.
+    """
+    if questions_data is None:
+        questions_data = [
+            ("Config", "Which format?", [("YAML", "YAML format"), ("JSON", "JSON format")]),
+            ("Style", "Which style?", [("Dark", "Dark theme"), ("Light", "Light theme")]),
+        ]
+    return Block(
+        id=block_id,
+        type=BlockType.QUESTION,
+        content=QuestionContent(
+            tool_use_id=tool_use_id,
+            questions=[
+                Question(
+                    header=header,
+                    question=question,
+                    options=[QuestionOption(label=o[0], description=o[1]) for o in options],
+                    multi_select=False,
+                )
+                for header, question, options in questions_data
+            ],
+            answers=answers,
+        ),
     )
 
 
@@ -958,3 +1027,379 @@ class TestModuleImports:
         ]
         for name in expected:
             assert name in __all__, f"{name} not in __all__"
+
+
+# ---------------------------------------------------------------------------
+# Test MessageStateTracker - QUESTION Block Handling
+# ---------------------------------------------------------------------------
+
+
+class TestHandleQuestionBlock:
+    """Tests for QUESTION block handling."""
+
+    def test_question_block_returns_send_action(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Question blocks should return SendNewMessage, not NoAction."""
+        block = make_question_block(
+            tool_use_id="q_123",
+            header="Config",
+            question="Which format?",
+            options=[("YAML", "YAML format"), ("JSON", "JSON format")],
+        )
+        event = AddBlock(block=block)
+
+        action = tracker.handle_event("sess-1", event)
+
+        assert isinstance(action, SendNewMessage)
+        assert action.message_type == "question"
+        assert "❓ Config" in action.content
+        assert "Which format?" in action.content
+        assert "_(respond in CLI)_" in action.content
+
+    def test_question_block_tracks_state(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Question blocks should be tracked in session state."""
+        block = make_question_block(tool_use_id="q_123")
+        tracker.handle_event("sess-1", AddBlock(block=block))
+
+        state = tracker.get_session_state("sess-1")
+        assert "q_123" in state.questions
+        assert state.questions["q_123"].tool_use_id == "q_123"
+
+    def test_question_block_metadata(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Question block SendNewMessage should include metadata."""
+        block = make_question_block(tool_use_id="q_456")
+        action = tracker.handle_event("sess-1", AddBlock(block=block))
+
+        assert isinstance(action, SendNewMessage)
+        assert action.metadata.get("tool_use_id") == "q_456"
+        assert action.metadata.get("block_type") == "question"
+
+    def test_question_block_turn_id(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Question block turn_id should include tool_use_id."""
+        block = make_question_block(tool_use_id="q_789")
+        action = tracker.handle_event("sess-1", AddBlock(block=block))
+
+        assert isinstance(action, SendNewMessage)
+        assert action.turn_id == "question-q_789"
+
+    def test_question_block_slack_blocks(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Question block should have Slack blocks formatted."""
+        block = make_question_block(
+            header="Config",
+            question="Which format?",
+        )
+        action = tracker.handle_event("sess-1", AddBlock(block=block))
+
+        assert isinstance(action, SendNewMessage)
+        assert len(action.blocks) >= 1
+        # Check section block has the question
+        section = action.blocks[0]
+        assert section["type"] == "section"
+        assert "Config" in section["text"]["text"]
+        assert "Which format?" in section["text"]["text"]
+
+
+class TestHandleQuestionUpdate:
+    """Tests for question update handling."""
+
+    def test_question_update_returns_update_action(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Answered question should return UpdateExistingMessage."""
+        # First, add the question
+        block = make_question_block(tool_use_id="q_123", question="Which format?")
+        action1 = tracker.handle_event("sess-1", AddBlock(block=block))
+        assert isinstance(action1, SendNewMessage)
+
+        # Record message IDs
+        tracker.record_question_message_id(
+            "sess-1", "q_123", "telegram", "chat_123", 456
+        )
+
+        # Now update with answer
+        updated_content = QuestionContent(
+            tool_use_id="q_123",
+            questions=[
+                Question(
+                    header="Config",
+                    question="Which format?",
+                    options=[
+                        QuestionOption("YAML", "YAML format"),
+                        QuestionOption("JSON", "JSON format"),
+                    ],
+                    multi_select=False,
+                )
+            ],
+            answers={"Which format?": "YAML"},
+        )
+        event = UpdateBlock(block_id="q1", content=updated_content)
+
+        action = tracker.handle_event("sess-1", event)
+
+        assert isinstance(action, UpdateExistingMessage)
+        assert "✓ Selected: YAML" in action.content
+        assert action.metadata.get("remove_keyboard") is True
+        assert action.metadata.get("answered") is True
+
+    def test_question_update_without_message_id(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Question update without recorded message ID returns SendNewMessage."""
+        # Add question but don't record message ID
+        block = make_question_block(tool_use_id="q_123", question="Which format?")
+        tracker.handle_event("sess-1", AddBlock(block=block))
+
+        # Update with answer
+        updated_content = QuestionContent(
+            tool_use_id="q_123",
+            questions=[
+                Question(
+                    header="Config",
+                    question="Which format?",
+                    options=[
+                        QuestionOption("YAML", "YAML format"),
+                        QuestionOption("JSON", "JSON format"),
+                    ],
+                    multi_select=False,
+                )
+            ],
+            answers={"Which format?": "JSON"},
+        )
+        event = UpdateBlock(block_id="q1", content=updated_content)
+
+        action = tracker.handle_event("sess-1", event)
+
+        # Without message ID, it sends a new message
+        assert isinstance(action, SendNewMessage)
+        assert "✓ Selected: JSON" in action.content
+
+    def test_question_update_unknown_tool_use_id(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Question update for unknown tool_use_id returns NoAction."""
+        updated_content = QuestionContent(
+            tool_use_id="unknown_q",
+            questions=[
+                Question(
+                    header="Config",
+                    question="Which format?",
+                    options=[QuestionOption("A", "A"), QuestionOption("B", "B")],
+                    multi_select=False,
+                )
+            ],
+            answers={"Which format?": "A"},
+        )
+        event = UpdateBlock(block_id="q1", content=updated_content)
+
+        action = tracker.handle_event("sess-1", event)
+
+        assert isinstance(action, NoAction)
+        assert "unknown question" in action.reason
+
+
+class TestMultipleQuestionsInBlock:
+    """Tests for multiple questions in a single block."""
+
+    def test_multiple_questions_render_in_single_message(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Multiple questions render in single message."""
+        block = make_multi_question_block(
+            tool_use_id="q_multi",
+            questions_data=[
+                ("Format", "Which format?", [("YAML", ""), ("JSON", "")]),
+                ("Style", "Which style?", [("Dark", ""), ("Light", "")]),
+            ],
+        )
+        action = tracker.handle_event("sess-1", AddBlock(block=block))
+
+        assert isinstance(action, SendNewMessage)
+        # Both questions should be in the content
+        assert "❓ Format" in action.content
+        assert "Which format?" in action.content
+        assert "❓ Style" in action.content
+        assert "Which style?" in action.content
+
+    def test_multiple_questions_slack_blocks(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Multiple questions have separate Slack section blocks."""
+        block = make_multi_question_block(
+            tool_use_id="q_multi",
+            questions_data=[
+                ("Format", "Which format?", [("YAML", ""), ("JSON", "")]),
+                ("Style", "Which style?", [("Dark", ""), ("Light", "")]),
+            ],
+        )
+        action = tracker.handle_event("sess-1", AddBlock(block=block))
+
+        assert isinstance(action, SendNewMessage)
+        # Should have 2 section blocks + 1 context block
+        section_blocks = [b for b in action.blocks if b["type"] == "section"]
+        assert len(section_blocks) == 2
+
+
+class TestMultiSelectAnswerFormatting:
+    """Tests for multi-select answer formatting."""
+
+    def test_multi_select_answer_formatting(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Multi-select answers show all selections."""
+        # Add question
+        block = make_question_block(
+            tool_use_id="q_multi_sel",
+            question="Which features?",
+            multi_select=True,
+        )
+        tracker.handle_event("sess-1", AddBlock(block=block))
+        tracker.record_question_message_id(
+            "sess-1", "q_multi_sel", "telegram", "chat_1", 123
+        )
+
+        # Update with multi-select answer (comma-separated)
+        updated_content = QuestionContent(
+            tool_use_id="q_multi_sel",
+            questions=[
+                Question(
+                    header="Config",
+                    question="Which features?",
+                    options=[
+                        QuestionOption("Feature A", ""),
+                        QuestionOption("Feature B", ""),
+                        QuestionOption("Feature C", ""),
+                    ],
+                    multi_select=True,
+                )
+            ],
+            answers={"Which features?": "Feature A, Feature B"},
+        )
+        event = UpdateBlock(block_id="q1", content=updated_content)
+
+        action = tracker.handle_event("sess-1", event)
+
+        assert isinstance(action, UpdateExistingMessage)
+        assert "✓ Selected: Feature A, Feature B" in action.content
+
+
+class TestQuestionMessageIdTracking:
+    """Tests for question message ID tracking."""
+
+    def test_record_telegram_question_message_id(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Test recording Telegram message ID for questions."""
+        block = make_question_block(tool_use_id="q_123")
+        tracker.handle_event("sess-1", AddBlock(block=block))
+
+        tracker.record_question_message_id(
+            "sess-1", "q_123", "telegram", "chat_456", 789
+        )
+
+        msg_id = tracker.get_question_message_id(
+            "sess-1", "q_123", "telegram", "chat_456"
+        )
+        assert msg_id == 789
+
+    def test_record_slack_question_message_id(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Test recording Slack message ID for questions."""
+        block = make_question_block(tool_use_id="q_123")
+        tracker.handle_event("sess-1", AddBlock(block=block))
+
+        tracker.record_question_message_id(
+            "sess-1", "q_123", "slack", "C123", "ts123.456"
+        )
+
+        msg_id = tracker.get_question_message_id(
+            "sess-1", "q_123", "slack", "C123"
+        )
+        assert msg_id == "ts123.456"
+
+    def test_get_question_message_id_unknown_question(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Test getting message ID for unknown question returns None."""
+        msg_id = tracker.get_question_message_id(
+            "sess-1", "unknown_q", "telegram", "chat_1"
+        )
+        assert msg_id is None
+
+    def test_get_question_message_id_unknown_identifier(
+        self, tracker: MessageStateTracker
+    ) -> None:
+        """Test getting message ID for unknown identifier returns None."""
+        block = make_question_block(tool_use_id="q_123")
+        tracker.handle_event("sess-1", AddBlock(block=block))
+        tracker.record_question_message_id(
+            "sess-1", "q_123", "telegram", "chat_1", 123
+        )
+
+        msg_id = tracker.get_question_message_id(
+            "sess-1", "q_123", "telegram", "chat_999"
+        )
+        assert msg_id is None
+
+
+class TestQuestionState:
+    """Tests for QuestionState dataclass."""
+
+    def test_create_question_state(self) -> None:
+        """Test creating QuestionState."""
+        content = QuestionContent(
+            tool_use_id="q_123",
+            questions=[
+                Question(
+                    header="Config",
+                    question="Which format?",
+                    options=[QuestionOption("A", ""), QuestionOption("B", "")],
+                    multi_select=False,
+                )
+            ],
+            answers=None,
+        )
+        state = QuestionState(
+            tool_use_id="q_123",
+            block_id="b1",
+            content=content,
+        )
+
+        assert state.tool_use_id == "q_123"
+        assert state.block_id == "b1"
+        assert state.telegram_messages == {}
+        assert state.slack_messages == {}
+
+    def test_question_state_message_tracking(self) -> None:
+        """Test QuestionState message tracking fields."""
+        content = QuestionContent(
+            tool_use_id="q_123",
+            questions=[
+                Question(
+                    header="Config",
+                    question="Which?",
+                    options=[QuestionOption("A", ""), QuestionOption("B", "")],
+                    multi_select=False,
+                )
+            ],
+            answers=None,
+        )
+        state = QuestionState(
+            tool_use_id="q_123",
+            block_id="b1",
+            content=content,
+            telegram_messages={"chat_1": 123},
+            slack_messages={"C123": "ts123"},
+        )
+
+        assert state.telegram_messages == {"chat_1": 123}
+        assert state.slack_messages == {"C123": "ts123"}

@@ -24,6 +24,7 @@ from claude_session_player.events import (
     ClearAll,
     DurationContent,
     Event,
+    QuestionContent,
     SystemContent,
     ToolCallContent,
     UpdateBlock,
@@ -71,11 +72,25 @@ class TurnState:
 
 
 @dataclass
+class QuestionState:
+    """State for a question block."""
+
+    tool_use_id: str
+    block_id: str
+    content: QuestionContent
+    # Message IDs per destination
+    telegram_messages: dict[str, int] = field(default_factory=dict)  # chat_id -> message_id
+    slack_messages: dict[str, str] = field(default_factory=dict)  # channel -> ts
+
+
+@dataclass
 class SessionMessageState:
     """Message state for a single session."""
 
     session_id: str
     current_turn: TurnState | None = None
+    # Track questions by tool_use_id for updates
+    questions: dict[str, QuestionState] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +103,11 @@ class SendNewMessage:
     """Send a new message to all destinations."""
 
     turn_id: str
-    message_type: Literal["user", "turn", "system"]
+    message_type: Literal["user", "turn", "system", "question"]
     content: str  # For Telegram
     blocks: list[dict]  # For Slack
     text_fallback: str  # For Slack notifications
+    metadata: dict[str, str | bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,6 +118,7 @@ class UpdateExistingMessage:
     content: str  # For Telegram
     blocks: list[dict]  # For Slack
     text_fallback: str  # For Slack notifications
+    metadata: dict[str, str | bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -327,8 +344,7 @@ class MessageStateTracker:
             # Thinking blocks don't produce messages
             return NoAction(reason="Thinking blocks are not displayed")
         elif block.type == BlockType.QUESTION:
-            # Questions are handled like tool calls but we don't have special formatting yet
-            return NoAction(reason="Question blocks not yet supported in messaging")
+            return self._handle_question_block(state, block)
         else:
             return NoAction(reason=f"Unhandled block type: {block.type}")
 
@@ -432,11 +448,20 @@ class MessageStateTracker:
     def _handle_update_block(
         self, state: SessionMessageState, event: UpdateBlock
     ) -> MessageAction:
-        """Handle an UpdateBlock event - update tool result in current turn."""
+        """Handle an UpdateBlock event - update tool result or answered question."""
+        # Handle question updates (answered questions)
+        if isinstance(event.content, QuestionContent):
+            tool_use_id = event.content.tool_use_id
+            if tool_use_id in state.questions:
+                question_state = state.questions[tool_use_id]
+                question_state.content = event.content
+                return self._render_question_update(question_state)
+            return NoAction(reason="Update for unknown question")
+
+        # Handle tool call updates
         if not state.current_turn:
             return NoAction(reason="Update without current turn")
 
-        # UpdateBlock contains updated content, usually ToolCallContent with result
         if isinstance(event.content, ToolCallContent):
             tool_use_id = event.content.tool_use_id
             if tool_use_id in state.current_turn.tool_use_id_to_index:
@@ -514,3 +539,176 @@ class MessageStateTracker:
                 blocks=blocks,
                 text_fallback=text_fallback,
             )
+
+    def _handle_question_block(
+        self, state: SessionMessageState, block: Block
+    ) -> MessageAction:
+        """Handle a QUESTION block - creates standalone question message."""
+        if not isinstance(block.content, QuestionContent):
+            return NoAction(reason="Invalid question content")
+
+        content = block.content
+        turn_id = f"question-{content.tool_use_id}"
+
+        # Track the question for later updates
+        state.questions[content.tool_use_id] = QuestionState(
+            tool_use_id=content.tool_use_id,
+            block_id=block.id,
+            content=content,
+        )
+
+        # Format for Telegram and Slack
+        text = self._format_question_text(content)
+        blocks = self._format_question_blocks(content)
+        text_fallback = f"Question: {content.questions[0].question[:50]}..." if content.questions else "Question"
+
+        return SendNewMessage(
+            turn_id=turn_id,
+            message_type="question",
+            content=text,
+            blocks=blocks,
+            text_fallback=text_fallback,
+            metadata={"tool_use_id": content.tool_use_id, "block_type": "question"},
+        )
+
+    def _render_question_update(self, question_state: QuestionState) -> MessageAction:
+        """Render an answered question update."""
+        content = question_state.content
+        turn_id = f"question-{content.tool_use_id}"
+
+        # Format for Telegram and Slack
+        text = self._format_answered_question(content)
+        blocks = self._format_answered_question_blocks(content)
+        text_fallback = "Question answered"
+
+        # If we have message IDs, it's an update
+        if question_state.telegram_messages or question_state.slack_messages:
+            return UpdateExistingMessage(
+                turn_id=turn_id,
+                content=text,
+                blocks=blocks,
+                text_fallback=text_fallback,
+                metadata={"answered": True, "remove_keyboard": True},
+            )
+        else:
+            # No message IDs yet - this shouldn't normally happen
+            return SendNewMessage(
+                turn_id=turn_id,
+                message_type="question",
+                content=text,
+                blocks=blocks,
+                text_fallback=text_fallback,
+                metadata={"tool_use_id": content.tool_use_id, "answered": True},
+            )
+
+    def _format_question_text(self, content: QuestionContent) -> str:
+        """Format question for initial Telegram display."""
+        lines: list[str] = []
+        for q in content.questions:
+            header = q.header or "Question"
+            lines.append(f"❓ {header}")
+            lines.append(q.question)
+            lines.append("")
+        lines.append("_(respond in CLI)_")
+        return "\n".join(lines)
+
+    def _format_answered_question(self, content: QuestionContent) -> str:
+        """Format question after answer received for Telegram."""
+        lines: list[str] = []
+        for q in content.questions:
+            header = q.header or "Question"
+            lines.append(f"❓ {header}")
+            lines.append(q.question)
+
+            answer = content.answers.get(q.question) if content.answers else None
+            if answer:
+                # Handle multi-select (comma-separated answers)
+                lines.append(f"\n✓ Selected: {answer}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def _format_question_blocks(self, content: QuestionContent) -> list[dict]:
+        """Format question for initial Slack display."""
+        blocks: list[dict] = []
+        for q in content.questions:
+            header = q.header or "Question"
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"❓ *{header}*\n{q.question}",
+                },
+            })
+        blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": "_(respond in CLI)_"}],
+        })
+        return blocks
+
+    def _format_answered_question_blocks(self, content: QuestionContent) -> list[dict]:
+        """Format answered question for Slack display."""
+        blocks: list[dict] = []
+        for q in content.questions:
+            header = q.header or "Question"
+            answer = content.answers.get(q.question) if content.answers else None
+            answer_text = f"\n✓ Selected: {answer}" if answer else ""
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"❓ *{header}*\n{q.question}{answer_text}",
+                },
+            })
+        return blocks
+
+    def record_question_message_id(
+        self,
+        session_id: str,
+        tool_use_id: str,
+        destination_type: str,
+        identifier: str,
+        message_id: int | str,
+    ) -> None:
+        """Record the message ID for a question after sending.
+
+        Args:
+            session_id: The session identifier.
+            tool_use_id: The question's tool_use_id.
+            destination_type: "telegram" or "slack".
+            identifier: chat_id for Telegram, channel for Slack.
+            message_id: The message ID (int for Telegram, str for Slack).
+        """
+        state = self.get_session_state(session_id)
+        if tool_use_id in state.questions:
+            question_state = state.questions[tool_use_id]
+            if destination_type == "telegram":
+                question_state.telegram_messages[identifier] = int(message_id)
+            elif destination_type == "slack":
+                question_state.slack_messages[identifier] = str(message_id)
+
+    def get_question_message_id(
+        self,
+        session_id: str,
+        tool_use_id: str,
+        destination_type: str,
+        identifier: str,
+    ) -> int | str | None:
+        """Get the message ID for a question at a destination.
+
+        Args:
+            session_id: The session identifier.
+            tool_use_id: The question's tool_use_id.
+            destination_type: "telegram" or "slack".
+            identifier: chat_id for Telegram, channel for Slack.
+
+        Returns:
+            The message ID if found, None otherwise.
+        """
+        state = self.get_session_state(session_id)
+        if tool_use_id in state.questions:
+            question_state = state.questions[tool_use_id]
+            if destination_type == "telegram":
+                return question_state.telegram_messages.get(identifier)
+            elif destination_type == "slack":
+                return question_state.slack_messages.get(identifier)
+        return None
