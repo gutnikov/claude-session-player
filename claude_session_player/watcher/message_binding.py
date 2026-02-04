@@ -1,18 +1,25 @@
 """Message binding model for single-message session rendering.
 
 Binds messages to sessions with a specific display preset.
-Each binding tracks the message ID and last pushed content.
+Each binding tracks the message ID, last pushed content, and TTL state.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from claude_session_player.watcher.destinations import AttachedDestination
 
 
 Preset = Literal["desktop", "mobile"]
+
+# Maximum TTL cap in seconds (5 minutes)
+MAX_TTL_SECONDS = 300
+
+# Default TTL in seconds
+DEFAULT_TTL_SECONDS = 30
 
 
 @dataclass
@@ -25,6 +32,9 @@ class MessageBinding:
         destination: The messaging destination (Telegram chat or Slack channel).
         message_id: The platform message ID (Telegram message_id or Slack ts).
         last_content: The last content pushed to this message.
+        created_at: Timestamp when the binding was created.
+        ttl_seconds: Time-to-live in seconds (default 30, max 300).
+        expired: Whether the binding has been marked as expired.
     """
 
     session_id: str
@@ -32,6 +42,43 @@ class MessageBinding:
     destination: AttachedDestination
     message_id: str
     last_content: str = ""
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    ttl_seconds: int = DEFAULT_TTL_SECONDS
+    expired: bool = False
+
+    def is_expired(self) -> bool:
+        """Check if TTL has passed.
+
+        Returns:
+            True if the binding has expired or TTL has elapsed.
+        """
+        if self.expired:
+            return True
+        now = datetime.now(timezone.utc)
+        expiry_time = self.created_at + timedelta(seconds=self.ttl_seconds)
+        return now > expiry_time
+
+    def extend_ttl(self, seconds: int = DEFAULT_TTL_SECONDS) -> None:
+        """Extend TTL by given seconds, capped at MAX_TTL_SECONDS.
+
+        Args:
+            seconds: Number of seconds to add to TTL.
+        """
+        self.ttl_seconds = min(self.ttl_seconds + seconds, MAX_TTL_SECONDS)
+        self.expired = False
+
+    def time_remaining(self) -> int:
+        """Return seconds remaining, or 0 if expired.
+
+        Returns:
+            Number of seconds until expiry, or 0 if already expired.
+        """
+        if self.expired:
+            return 0
+        now = datetime.now(timezone.utc)
+        expiry_time = self.created_at + timedelta(seconds=self.ttl_seconds)
+        remaining = (expiry_time - now).total_seconds()
+        return max(0, int(remaining))
 
 
 @dataclass
@@ -159,3 +206,29 @@ class MessageBindingManager:
             List of removed bindings.
         """
         return self._bindings.pop(session_id, [])
+
+    def find_binding_by_message_id(
+        self, destination_type: str, identifier: str, message_id: str
+    ) -> MessageBinding | None:
+        """Find binding by destination and message_id (for callback handlers).
+
+        This method is used by Telegram/Slack callback handlers to find
+        the binding associated with a specific message.
+
+        Args:
+            destination_type: Type of destination ("telegram" or "slack").
+            identifier: Destination identifier (chat_id or channel).
+            message_id: The platform message ID.
+
+        Returns:
+            The matching binding, or None if not found.
+        """
+        for bindings in self._bindings.values():
+            for binding in bindings:
+                if (
+                    binding.destination.type == destination_type
+                    and binding.destination.identifier == identifier
+                    and binding.message_id == message_id
+                ):
+                    return binding
+        return None
