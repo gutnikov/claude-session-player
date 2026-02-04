@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Hub Logo" width="400">
+</p>
+
 # Claude Session Player
 
 Transform Claude Code session logs into readable documentation.
