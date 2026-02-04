@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from claude_session_player.watcher.destinations import AttachedDestination
 from claude_session_player.watcher.message_binding import (
+    DEFAULT_TTL_SECONDS,
+    MAX_TTL_SECONDS,
     MessageBinding,
     MessageBindingManager,
     Preset,
@@ -531,3 +533,264 @@ class TestModuleImports:
 
         assert "MessageBinding" in watcher.__all__
         assert "MessageBindingManager" in watcher.__all__
+
+
+# ---------------------------------------------------------------------------
+# MessageBinding TTL tests
+# ---------------------------------------------------------------------------
+
+
+class TestMessageBindingTTL:
+    """Tests for MessageBinding TTL fields and methods."""
+
+    def test_default_ttl_fields(self, telegram_dest: AttachedDestination) -> None:
+        """Binding has default TTL fields."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+        )
+        assert binding.ttl_seconds == DEFAULT_TTL_SECONDS
+        assert binding.expired is False
+        assert isinstance(binding.created_at, datetime)
+
+    def test_custom_ttl(self, telegram_dest: AttachedDestination) -> None:
+        """Can create binding with custom TTL."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            ttl_seconds=60,
+        )
+        assert binding.ttl_seconds == 60
+
+    def test_is_expired_false_when_fresh(
+        self, telegram_dest: AttachedDestination
+    ) -> None:
+        """is_expired returns False for fresh binding."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+        )
+        assert binding.is_expired() is False
+
+    def test_is_expired_true_when_ttl_passed(
+        self, telegram_dest: AttachedDestination
+    ) -> None:
+        """is_expired returns True when TTL has elapsed."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            created_at=datetime.now(timezone.utc) - timedelta(seconds=60),
+            ttl_seconds=30,
+        )
+        assert binding.is_expired() is True
+
+    def test_is_expired_true_when_marked_expired(
+        self, telegram_dest: AttachedDestination
+    ) -> None:
+        """is_expired returns True when explicitly marked."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            expired=True,
+        )
+        assert binding.is_expired() is True
+
+    def test_extend_ttl_adds_time(self, telegram_dest: AttachedDestination) -> None:
+        """extend_ttl adds seconds to TTL."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            ttl_seconds=30,
+        )
+        binding.extend_ttl(30)
+        assert binding.ttl_seconds == 60
+
+    def test_extend_ttl_respects_max(self, telegram_dest: AttachedDestination) -> None:
+        """extend_ttl caps at MAX_TTL_SECONDS."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            ttl_seconds=280,
+        )
+        binding.extend_ttl(100)  # Would be 380, should cap at 300
+        assert binding.ttl_seconds == MAX_TTL_SECONDS
+
+    def test_extend_ttl_clears_expired_flag(
+        self, telegram_dest: AttachedDestination
+    ) -> None:
+        """extend_ttl clears the expired flag."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            expired=True,
+        )
+        binding.extend_ttl(30)
+        assert binding.expired is False
+
+    def test_extend_ttl_default_seconds(
+        self, telegram_dest: AttachedDestination
+    ) -> None:
+        """extend_ttl uses default seconds when not specified."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            ttl_seconds=30,
+        )
+        binding.extend_ttl()
+        assert binding.ttl_seconds == 60  # 30 + 30
+
+    def test_time_remaining_positive(
+        self, telegram_dest: AttachedDestination
+    ) -> None:
+        """time_remaining returns positive value for fresh binding."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            ttl_seconds=60,
+        )
+        remaining = binding.time_remaining()
+        assert remaining > 0
+        assert remaining <= 60
+
+    def test_time_remaining_zero_when_expired(
+        self, telegram_dest: AttachedDestination
+    ) -> None:
+        """time_remaining returns 0 when expired."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            created_at=datetime.now(timezone.utc) - timedelta(seconds=60),
+            ttl_seconds=30,
+        )
+        assert binding.time_remaining() == 0
+
+    def test_time_remaining_zero_when_marked_expired(
+        self, telegram_dest: AttachedDestination
+    ) -> None:
+        """time_remaining returns 0 when explicitly marked expired."""
+        binding = MessageBinding(
+            session_id="test-session",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            expired=True,
+        )
+        assert binding.time_remaining() == 0
+
+
+# ---------------------------------------------------------------------------
+# MessageBindingManager.find_binding_by_message_id tests
+# ---------------------------------------------------------------------------
+
+
+class TestFindBindingByMessageId:
+    """Tests for MessageBindingManager.find_binding_by_message_id()."""
+
+    def test_find_existing_telegram_binding(
+        self, manager: MessageBindingManager, telegram_binding: MessageBinding
+    ) -> None:
+        """Can find telegram binding by message_id."""
+        manager.add_binding(telegram_binding)
+        found = manager.find_binding_by_message_id(
+            destination_type="telegram",
+            identifier="123456789",
+            message_id="999",
+        )
+        assert found == telegram_binding
+
+    def test_find_existing_slack_binding(
+        self, manager: MessageBindingManager, slack_binding: MessageBinding
+    ) -> None:
+        """Can find slack binding by message_id."""
+        manager.add_binding(slack_binding)
+        found = manager.find_binding_by_message_id(
+            destination_type="slack",
+            identifier="C0123456789",
+            message_id="1234567890.123456",
+        )
+        assert found == slack_binding
+
+    def test_find_nonexistent_message_id(
+        self, manager: MessageBindingManager, telegram_binding: MessageBinding
+    ) -> None:
+        """Returns None for nonexistent message_id."""
+        manager.add_binding(telegram_binding)
+        found = manager.find_binding_by_message_id(
+            destination_type="telegram",
+            identifier="123456789",
+            message_id="wrong-message-id",
+        )
+        assert found is None
+
+    def test_find_wrong_destination_type(
+        self, manager: MessageBindingManager, telegram_binding: MessageBinding
+    ) -> None:
+        """Returns None for wrong destination type."""
+        manager.add_binding(telegram_binding)
+        found = manager.find_binding_by_message_id(
+            destination_type="slack",
+            identifier="123456789",
+            message_id="999",
+        )
+        assert found is None
+
+    def test_find_wrong_identifier(
+        self, manager: MessageBindingManager, telegram_binding: MessageBinding
+    ) -> None:
+        """Returns None for wrong identifier."""
+        manager.add_binding(telegram_binding)
+        found = manager.find_binding_by_message_id(
+            destination_type="telegram",
+            identifier="wrong-chat-id",
+            message_id="999",
+        )
+        assert found is None
+
+    def test_find_among_multiple_bindings(
+        self,
+        manager: MessageBindingManager,
+        telegram_binding: MessageBinding,
+        slack_binding: MessageBinding,
+        telegram_dest: AttachedDestination,
+    ) -> None:
+        """Can find specific binding among multiple."""
+        # Add bindings for multiple sessions
+        binding2 = MessageBinding(
+            session_id="session-2",
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="888",
+        )
+        manager.add_binding(telegram_binding)
+        manager.add_binding(slack_binding)
+        manager.add_binding(binding2)
+
+        # Find the specific one
+        found = manager.find_binding_by_message_id(
+            destination_type="telegram",
+            identifier="123456789",
+            message_id="888",
+        )
+        assert found == binding2
