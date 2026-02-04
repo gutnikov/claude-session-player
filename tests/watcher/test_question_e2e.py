@@ -3,7 +3,6 @@
 These tests verify the complete question presentation flow from JSONL session
 events through to Telegram/Slack message output, including:
 - Question JSONL parsing and event generation
-- MessageStateTracker action generation
 - Telegram inline keyboard formatting
 - Slack Block Kit button formatting
 - Answer update handling with keyboard removal
@@ -23,11 +22,6 @@ from claude_session_player.events import (
 )
 from claude_session_player.parser import LineType, classify_line
 from claude_session_player.processor import process_line
-from claude_session_player.watcher.message_state import (
-    MessageStateTracker,
-    SendNewMessage,
-    UpdateExistingMessage,
-)
 from claude_session_player.watcher.slack_publisher import (
     MAX_QUESTION_BUTTONS,
     format_answered_question_blocks,
@@ -52,13 +46,12 @@ class TestQuestionPipelineE2E:
         self,
         question_jsonl_line: dict,
     ) -> None:
-        """Full pipeline: JSONL -> Event -> MessageAction -> Telegram keyboard.
+        """Full pipeline: JSONL -> Event -> Telegram keyboard.
 
         Verifies that a question JSONL line is:
         1. Correctly classified as TOOL_USE
         2. Processed into an AddBlock with QUESTION BlockType
-        3. Produces a SendNewMessage with correct content
-        4. Generates Telegram inline keyboard with correct callback data
+        3. Generates Telegram inline keyboard with correct callback data
         """
         # Step 1: Classify the line
         line_type = classify_line(question_jsonl_line)
@@ -80,15 +73,7 @@ class TestQuestionPipelineE2E:
         assert len(content.questions) == 1
         assert len(content.questions[0].options) == 3
 
-        # Step 3: Process through MessageStateTracker
-        tracker = MessageStateTracker()
-        action = tracker.handle_event("test-session", event)
-
-        assert isinstance(action, SendNewMessage)
-        assert action.message_type == "question"
-        assert action.metadata.get("tool_use_id") == "toolu_q123"
-
-        # Step 4: Generate Telegram keyboard
+        # Step 3: Generate Telegram keyboard
         keyboard = format_question_keyboard(content)
         assert keyboard is not None
 
@@ -118,7 +103,7 @@ class TestQuestionPipelineE2E:
         self,
         question_jsonl_line: dict,
     ) -> None:
-        """Full pipeline: JSONL -> Event -> MessageAction -> Slack blocks.
+        """Full pipeline: JSONL -> Event -> Slack blocks.
 
         Verifies that a question JSONL line produces correct Slack Block Kit
         blocks with action buttons.
@@ -134,15 +119,7 @@ class TestQuestionPipelineE2E:
         content = event.block.content
         assert isinstance(content, QuestionContent)
 
-        # Process through MessageStateTracker
-        tracker = MessageStateTracker()
-        action = tracker.handle_event("test-session", event)
-
-        assert isinstance(action, SendNewMessage)
-        # Slack blocks should be present
-        assert len(action.blocks) > 0
-
-        # Generate Slack blocks directly for detailed verification
+        # Generate Slack blocks
         blocks = format_question_blocks(content)
 
         # Find section blocks with question text
@@ -185,37 +162,20 @@ class TestQuestionPipelineE2E:
         question_jsonl_line: dict,
         question_answer_jsonl_line: dict,
     ) -> None:
-        """Answer event produces UpdateExistingMessage with remove_keyboard flag.
+        """Answer event updates question content and removes keyboard.
 
         Verifies that when a question is answered:
         1. The answer JSONL line updates the question state
-        2. MessageStateTracker produces UpdateExistingMessage
-        3. The metadata includes remove_keyboard flag
+        2. The content no longer has keyboard
+        3. The answered blocks show the selected answer
         """
         context = ProcessingContext()
-        tracker = MessageStateTracker()
 
         # First, process the question
         question_events = process_line(context, question_jsonl_line)
         assert len(question_events) == 1
-        question_action = tracker.handle_event("test-session", question_events[0])
-
-        # Simulate sending the message and recording the ID
-        assert isinstance(question_action, SendNewMessage)
-        tracker.record_question_message_id(
-            "test-session",
-            "toolu_q123",
-            "telegram",
-            "123456789",
-            12345,
-        )
-        tracker.record_question_message_id(
-            "test-session",
-            "toolu_q123",
-            "slack",
-            "C123",
-            "1234567890.000001",
-        )
+        assert isinstance(question_events[0], AddBlock)
+        assert question_events[0].block.type == BlockType.QUESTION
 
         # Now process the answer
         answer_events = process_line(context, question_answer_jsonl_line)
@@ -231,14 +191,6 @@ class TestQuestionPipelineE2E:
         assert isinstance(update_event.content, QuestionContent)
         assert update_event.content.answers is not None
         assert update_event.content.answers.get("Which approach should I use?") == "Option B"
-
-        # Process through MessageStateTracker
-        update_action = tracker.handle_event("test-session", update_event)
-
-        # Should be an update with remove_keyboard metadata
-        assert isinstance(update_action, UpdateExistingMessage)
-        assert update_action.metadata.get("answered") is True
-        assert update_action.metadata.get("remove_keyboard") is True
 
         # Verify the content no longer has keyboard
         keyboard = format_question_keyboard(update_event.content)
@@ -260,9 +212,8 @@ class TestQuestionPipelineE2E:
 
         Verifies that a question block with multiple questions:
         1. Is processed as a single QUESTION block
-        2. Produces a single SendNewMessage
-        3. Has dividers between questions in Slack blocks
-        4. Has all questions in Telegram text
+        2. Has dividers between questions in Slack blocks
+        3. Has all questions in Telegram text
         """
         context = ProcessingContext()
         events = process_line(context, multi_question_jsonl_line)
@@ -274,12 +225,6 @@ class TestQuestionPipelineE2E:
         content = event.block.content
         assert isinstance(content, QuestionContent)
         assert len(content.questions) == 2
-
-        # Process through MessageStateTracker
-        tracker = MessageStateTracker()
-        action = tracker.handle_event("test-session", event)
-
-        assert isinstance(action, SendNewMessage)
 
         # Generate Slack blocks
         blocks = format_question_blocks(content)
