@@ -16,7 +16,6 @@ from claude_session_player.watcher.telegram_publisher import (
     TelegramPublisher,
     _truncate_message,
     escape_html,
-    escape_markdown,
     format_question_keyboard,
     format_question_text,
 )
@@ -72,43 +71,6 @@ class TestEscapeHtml:
     def test_empty_string(self) -> None:
         """Empty string returns empty."""
         assert escape_html("") == ""
-
-
-# ---------------------------------------------------------------------------
-# Markdown escaping tests
-# ---------------------------------------------------------------------------
-
-
-class TestEscapeMarkdown:
-    """Tests for escape_markdown function."""
-
-    def test_escapes_underscore(self) -> None:
-        """Underscores are escaped."""
-        assert escape_markdown("hello_world") == r"hello\_world"
-
-    def test_escapes_asterisk(self) -> None:
-        """Asterisks are escaped."""
-        assert escape_markdown("hello*world") == r"hello\*world"
-
-    def test_escapes_backtick(self) -> None:
-        """Backticks are escaped."""
-        assert escape_markdown("hello`world") == r"hello\`world"
-
-    def test_escapes_bracket(self) -> None:
-        """Square brackets are escaped."""
-        assert escape_markdown("hello[world]") == r"hello\[world]"
-
-    def test_escapes_multiple_chars(self) -> None:
-        """Multiple special chars are escaped."""
-        assert escape_markdown("_*`[") == r"\_\*\`\["
-
-    def test_preserves_normal_text(self) -> None:
-        """Normal text is preserved."""
-        assert escape_markdown("hello world") == "hello world"
-
-    def test_empty_string(self) -> None:
-        """Empty string returns empty."""
-        assert escape_markdown("") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -834,13 +796,11 @@ class TestModuleImports:
         assert TE is TelegramError
         assert TAE is TelegramAuthError
 
-    def test_import_escape_functions_from_watcher(self) -> None:
-        """Can import escape functions from watcher package."""
+    def test_import_escape_html_from_watcher(self) -> None:
+        """Can import escape_html from watcher package."""
         from claude_session_player.watcher import escape_html as eh
-        from claude_session_player.watcher import escape_markdown as em
 
         assert eh is escape_html
-        assert em is escape_markdown
 
     def test_import_question_functions_from_watcher(self) -> None:
         """Can import question formatting functions from watcher package."""
@@ -858,7 +818,6 @@ class TestModuleImports:
         assert "TelegramError" in watcher.__all__
         assert "TelegramAuthError" in watcher.__all__
         assert "escape_html" in watcher.__all__
-        assert "escape_markdown" in watcher.__all__
         assert "format_question_keyboard" in watcher.__all__
         assert "format_question_text" in watcher.__all__
         assert "MAX_QUESTION_BUTTONS" in watcher.__all__
