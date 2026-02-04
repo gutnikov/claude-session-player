@@ -42,10 +42,10 @@ SlackCommandHandler = Callable[
 SlackInteractionHandler = Callable[
     [str, Optional[str], dict[str, Any]], Awaitable[None]
 ]
-# TelegramCommandHandler receives: command, args, chat_id, message_id
-TelegramCommandHandler = Callable[[str, str, int, int], Awaitable[None]]
-# TelegramCallbackHandler receives: callback_data, chat_id, message_id, callback_query_id
-TelegramCallbackHandler = Callable[[str, int, int, str], Awaitable[None]]
+# TelegramCommandHandler receives: command, args, chat_id, message_id, thread_id
+TelegramCommandHandler = Callable[[str, str, int, int, Optional[int]], Awaitable[None]]
+# TelegramCallbackHandler receives: callback_data, chat_id, message_id, callback_query_id, thread_id
+TelegramCallbackHandler = Callable[[str, int, int, str, Optional[int]], Awaitable[None]]
 
 
 # Maximum age for Slack request timestamps (5 minutes in seconds)
@@ -356,6 +356,8 @@ class BotRouter:
             chat = message.get("chat", {})
             chat_id = chat.get("id", 0)
             message_id = message.get("message_id", 0)
+            # Extract thread_id for supergroup topics
+            thread_id = message.get("message_thread_id")
 
             # Check if it's a command (starts with /)
             if text.startswith("/"):
@@ -368,17 +370,18 @@ class BotRouter:
                 args = parts[1] if len(parts) > 1 else ""
 
                 logger.info(
-                    "Received Telegram command: /%s %s from chat %s",
+                    "Received Telegram command: /%s %s from chat %s (thread=%s)",
                     command_part,
                     args,
                     chat_id,
+                    thread_id,
                 )
 
                 # Find handler
                 handler = self._telegram_command_handlers.get(command_part)
                 if handler:
                     try:
-                        await handler(command_part, args, chat_id, message_id)
+                        await handler(command_part, args, chat_id, message_id, thread_id)
                     except Exception as e:
                         logger.exception(
                             "Error handling Telegram command %s: %s", command_part, e
@@ -395,11 +398,14 @@ class BotRouter:
             chat = callback_message.get("chat", {})
             chat_id = chat.get("id", 0)
             message_id = callback_message.get("message_id", 0)
+            # Extract thread_id from the message that contains the button
+            thread_id = callback_message.get("message_thread_id")
 
             logger.info(
-                "Received Telegram callback: data=%s from chat %s",
+                "Received Telegram callback: data=%s from chat %s (thread=%s)",
                 callback_data,
                 chat_id,
+                thread_id,
             )
 
             # Find handler by prefix match
@@ -411,7 +417,7 @@ class BotRouter:
 
             if handler:
                 try:
-                    await handler(callback_data, chat_id, message_id, callback_id)
+                    await handler(callback_data, chat_id, message_id, callback_id, thread_id)
                 except Exception as e:
                     logger.exception(
                         "Error handling Telegram callback %s: %s", callback_data, e

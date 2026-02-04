@@ -533,11 +533,11 @@ class TestTelegramMessageCommandRouting:
         handler_args: tuple = ()
 
         async def search_handler(
-            command: str, args: str, chat_id: int, message_id: int
+            command: str, args: str, chat_id: int, message_id: int, thread_id: int | None
         ) -> None:
             nonlocal handler_called, handler_args
             handler_called = True
-            handler_args = (command, args, chat_id, message_id)
+            handler_args = (command, args, chat_id, message_id, thread_id)
 
         router.register_telegram_command("search", search_handler)
 
@@ -560,12 +560,13 @@ class TestTelegramMessageCommandRouting:
         assert handler_args[1] == "auth bug"
         assert handler_args[2] == 987654321
         assert handler_args[3] == 100
+        assert handler_args[4] is None  # No thread_id in non-topic message
 
     async def test_command_without_args(self, router: BotRouter) -> None:
         """Route command without arguments."""
         received_args: str | None = None
 
-        async def handler(command: str, args: str, chat_id: int, message_id: int) -> None:
+        async def handler(command: str, args: str, chat_id: int, message_id: int, thread_id: int | None) -> None:
             nonlocal received_args
             received_args = args
 
@@ -590,7 +591,7 @@ class TestTelegramMessageCommandRouting:
         """Handle /command@botname format in groups."""
         received_command: str | None = None
 
-        async def handler(command: str, args: str, chat_id: int, message_id: int) -> None:
+        async def handler(command: str, args: str, chat_id: int, message_id: int, thread_id: int | None) -> None:
             nonlocal received_command
             received_command = command
 
@@ -615,7 +616,7 @@ class TestTelegramMessageCommandRouting:
         """Non-command messages don't trigger handlers."""
         handler_called = False
 
-        async def handler(command: str, args: str, chat_id: int, message_id: int) -> None:
+        async def handler(command: str, args: str, chat_id: int, message_id: int, thread_id: int | None) -> None:
             nonlocal handler_called
             handler_called = True
 
@@ -646,11 +647,11 @@ class TestTelegramCallbackQueryRouting:
         handler_args: tuple = ()
 
         async def watch_handler(
-            callback_data: str, chat_id: int, message_id: int, callback_query_id: str
+            callback_data: str, chat_id: int, message_id: int, callback_query_id: str, thread_id: int | None
         ) -> None:
             nonlocal handler_called, handler_args
             handler_called = True
-            handler_args = (callback_data, chat_id, message_id, callback_query_id)
+            handler_args = (callback_data, chat_id, message_id, callback_query_id, thread_id)
 
         router.register_telegram_callback("w:", watch_handler)
 
@@ -676,6 +677,7 @@ class TestTelegramCallbackQueryRouting:
         assert handler_args[1] == 987654321
         assert handler_args[2] == 100
         assert handler_args[3] == "callback123"
+        assert handler_args[4] is None  # No thread_id in non-topic callback
 
     async def test_route_preview_callback(self, router: BotRouter) -> None:
         """Route preview callback to different handler."""
@@ -683,13 +685,13 @@ class TestTelegramCallbackQueryRouting:
         preview_called = False
 
         async def watch_handler(
-            callback_data: str, chat_id: int, message_id: int, callback_query_id: str
+            callback_data: str, chat_id: int, message_id: int, callback_query_id: str, thread_id: int | None
         ) -> None:
             nonlocal watch_called
             watch_called = True
 
         async def preview_handler(
-            callback_data: str, chat_id: int, message_id: int, callback_query_id: str
+            callback_data: str, chat_id: int, message_id: int, callback_query_id: str, thread_id: int | None
         ) -> None:
             nonlocal preview_called
             preview_called = True
@@ -843,7 +845,7 @@ class TestHandlerErrorHandling:
     async def test_telegram_command_handler_exception(self, router: BotRouter) -> None:
         """Handler exception still returns 200 for Telegram."""
         async def bad_handler(
-            command: str, args: str, chat_id: int, message_id: int
+            command: str, args: str, chat_id: int, message_id: int, thread_id: int | None
         ) -> None:
             raise RuntimeError("Handler crashed")
 

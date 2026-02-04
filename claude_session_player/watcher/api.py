@@ -138,14 +138,26 @@ class WatcherAPI:
 
         # Validate destination fields
         if dest_type == "telegram":
-            identifier = destination.get("chat_id")
-            if not identifier:
+            chat_id = destination.get("chat_id")
+            if not chat_id:
                 return web.json_response(
                     {"error": "destination.chat_id required for telegram"},
                     status=400,
                 )
+            thread_id = destination.get("thread_id")
+            # Reject thread_id=1 (General topic should use null)
+            if thread_id == 1:
+                return web.json_response(
+                    {"error": "Use thread_id=null for General topic, not thread_id=1"},
+                    status=400,
+                )
+            # Build compound identifier for Telegram
+            from claude_session_player.watcher.destinations import make_telegram_identifier
+            identifier = make_telegram_identifier(str(chat_id), thread_id)
         else:
             identifier = destination.get("channel")
+            thread_id = None
+            chat_id = None
             if not identifier:
                 return web.json_response(
                     {"error": "destination.channel required for slack"},
@@ -193,7 +205,9 @@ class WatcherAPI:
 
             # Build destination response based on type
             if dest_type == "telegram":
-                dest_response = {"type": dest_type, "chat_id": identifier}
+                dest_response: dict = {"type": dest_type, "chat_id": chat_id}
+                if thread_id is not None:
+                    dest_response["thread_id"] = thread_id
             else:
                 dest_response = {"type": dest_type, "channel": identifier}
 
@@ -343,18 +357,26 @@ class WatcherAPI:
 
         dest_type = destination.get("type")
         if dest_type == "telegram":
-            identifier = destination.get("chat_id")
+            chat_id = destination.get("chat_id")
+            if not chat_id:
+                return web.json_response(
+                    {"error": "Destination chat_id required for telegram"},
+                    status=400,
+                )
+            thread_id = destination.get("thread_id")
+            # Build compound identifier for exact match detach
+            from claude_session_player.watcher.destinations import make_telegram_identifier
+            identifier = make_telegram_identifier(str(chat_id), thread_id)
         elif dest_type == "slack":
             identifier = destination.get("channel")
+            if not identifier:
+                return web.json_response(
+                    {"error": "Destination channel required for slack"},
+                    status=400,
+                )
         else:
             return web.json_response(
                 {"error": "Invalid destination type"},
-                status=400,
-            )
-
-        if not identifier:
-            return web.json_response(
-                {"error": "Destination identifier required"},
                 status=400,
             )
 
@@ -400,12 +422,16 @@ class WatcherAPI:
             sse_clients = self.sse_manager.get_connection_count(session_id)
 
             # Get destinations
+            from claude_session_player.watcher.destinations import parse_telegram_identifier
             destinations = self.destination_manager.get_destinations(session_id)
-            telegram_dests = [
-                {"chat_id": d.identifier}
-                for d in destinations
-                if d.type == "telegram"
-            ]
+            telegram_dests = []
+            for d in destinations:
+                if d.type == "telegram":
+                    chat_id, thread_id = parse_telegram_identifier(d.identifier)
+                    dest_info: dict = {"chat_id": chat_id}
+                    if thread_id is not None:
+                        dest_info["thread_id"] = thread_id
+                    telegram_dests.append(dest_info)
             slack_dests = [
                 {"channel": d.identifier}
                 for d in destinations

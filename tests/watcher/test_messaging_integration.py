@@ -65,7 +65,12 @@ class MockTelegramPublisher:
         self.validated = True
 
     async def send_message(
-        self, chat_id: str, text: str, parse_mode: str = "Markdown"
+        self,
+        chat_id: str,
+        text: str,
+        parse_mode: str = "Markdown",
+        reply_markup: object = None,
+        message_thread_id: int | None = None,
     ) -> int:
         if self._should_fail:
             raise TelegramError("Send failed")
@@ -75,6 +80,7 @@ class MockTelegramPublisher:
             "chat_id": chat_id,
             "text": text,
             "message_id": message_id,
+            "message_thread_id": message_thread_id,
         })
         return message_id
 

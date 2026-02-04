@@ -978,56 +978,56 @@ class TestCallbackDataParsing:
         """Test parsing watch callback data."""
         mock_handle_watch = AsyncMock(return_value="result")
         with patch.object(handler, "_handle_watch", mock_handle_watch):
-            result = await handler.handle_callback("w:0", 123456, 789)
-        mock_handle_watch.assert_called_once_with("123456", 789, 0)
+            result = await handler.handle_callback("w:0", 123456, 789, thread_id=None)
+        mock_handle_watch.assert_called_once_with("123456", 789, 0, None)
 
     @pytest.mark.asyncio
     async def test_parse_preview_callback(self, handler: TelegramCommandHandler) -> None:
         """Test parsing preview callback data."""
         mock_handle_preview = AsyncMock(return_value="result")
         with patch.object(handler, "_handle_preview", mock_handle_preview):
-            result = await handler.handle_callback("p:2", 123456, 789)
-        mock_handle_preview.assert_called_once_with("123456", 789, 2)
+            result = await handler.handle_callback("p:2", 123456, 789, thread_id=None)
+        mock_handle_preview.assert_called_once_with("123456", 789, 2, None)
 
     @pytest.mark.asyncio
     async def test_parse_next_page_callback(self, handler: TelegramCommandHandler) -> None:
         """Test parsing next page callback data."""
         mock_handle_next = AsyncMock(return_value="result")
         with patch.object(handler, "_handle_next_page", mock_handle_next):
-            result = await handler.handle_callback("s:n", 123456, 789)
-        mock_handle_next.assert_called_once_with("123456", 789)
+            result = await handler.handle_callback("s:n", 123456, 789, thread_id=None)
+        mock_handle_next.assert_called_once_with("123456", 789, None)
 
     @pytest.mark.asyncio
     async def test_parse_prev_page_callback(self, handler: TelegramCommandHandler) -> None:
         """Test parsing prev page callback data."""
         mock_handle_prev = AsyncMock(return_value="result")
         with patch.object(handler, "_handle_prev_page", mock_handle_prev):
-            result = await handler.handle_callback("s:p", 123456, 789)
-        mock_handle_prev.assert_called_once_with("123456", 789)
+            result = await handler.handle_callback("s:p", 123456, 789, thread_id=None)
+        mock_handle_prev.assert_called_once_with("123456", 789, None)
 
     @pytest.mark.asyncio
     async def test_parse_refresh_callback(self, handler: TelegramCommandHandler) -> None:
         """Test parsing refresh callback data."""
         mock_handle_refresh = AsyncMock(return_value="result")
         with patch.object(handler, "_handle_refresh", mock_handle_refresh):
-            result = await handler.handle_callback("s:r", 123456, 789)
-        mock_handle_refresh.assert_called_once_with("123456", 789)
+            result = await handler.handle_callback("s:r", 123456, 789, thread_id=None)
+        mock_handle_refresh.assert_called_once_with("123456", 789, None)
 
     @pytest.mark.asyncio
     async def test_invalid_callback_data(self, handler: TelegramCommandHandler) -> None:
         """Test handling invalid callback data."""
         # Empty index (parts[1] is empty string)
-        result = await handler.handle_callback("w:", 123456, 789)
+        result = await handler.handle_callback("w:", 123456, 789, thread_id=None)
         assert result == "Invalid index"  # Empty string fails int conversion
 
         # Non-numeric index
-        result = await handler.handle_callback("w:abc", 123456, 789)
+        result = await handler.handle_callback("w:abc", 123456, 789, thread_id=None)
         assert result == "Invalid index"
 
         # Missing index entirely (no colon separator)
-        result = await handler.handle_callback("w", 123456, 789)
+        result = await handler.handle_callback("w", 123456, 789, thread_id=None)
         assert result == "Invalid action"
 
         # Unknown action
-        result = await handler.handle_callback("x:0", 123456, 789)
+        result = await handler.handle_callback("x:0", 123456, 789, thread_id=None)
         assert result is None

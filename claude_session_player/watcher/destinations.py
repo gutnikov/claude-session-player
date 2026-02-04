@@ -16,6 +16,46 @@ from claude_session_player.watcher.config import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Telegram Identifier Helpers
+# ---------------------------------------------------------------------------
+
+
+def make_telegram_identifier(chat_id: str, thread_id: int | None = None) -> str:
+    """Create identifier from chat_id and optional thread_id.
+
+    Args:
+        chat_id: Telegram chat ID (may be negative for groups).
+        thread_id: Topic thread ID, or None for General/non-forum.
+
+    Returns:
+        Combined identifier string.
+    """
+    if thread_id is not None:
+        return f"{chat_id}:{thread_id}"
+    return chat_id
+
+
+def parse_telegram_identifier(identifier: str) -> tuple[str, int | None]:
+    """Parse identifier into (chat_id, thread_id).
+
+    Uses rsplit to handle negative chat_ids correctly.
+
+    Args:
+        identifier: Combined identifier string.
+
+    Returns:
+        Tuple of (chat_id, thread_id or None).
+    """
+    if ":" in identifier:
+        chat_id, thread_str = identifier.rsplit(":", 1)
+        try:
+            return chat_id, int(thread_str)
+        except ValueError:
+            return identifier, None
+    return identifier, None
+
+
 @dataclass
 class AttachedDestination:
     """A single attached destination."""
@@ -134,7 +174,9 @@ class DestinationManager:
 
         # 5. Persist to config
         if destination_type == "telegram":
-            config_dest = TelegramDestination(chat_id=identifier)
+            # Parse identifier to extract chat_id and optional thread_id
+            chat_id, thread_id = parse_telegram_identifier(identifier)
+            config_dest = TelegramDestination(chat_id=chat_id, thread_id=thread_id)
         else:
             config_dest = SlackDestination(channel=identifier)
         self._config.add_destination(session_id, config_dest, path)
@@ -167,7 +209,9 @@ class DestinationManager:
 
         # 2. Remove from config
         if destination_type == "telegram":
-            config_dest = TelegramDestination(chat_id=identifier)
+            # Parse identifier to extract chat_id and optional thread_id
+            chat_id, thread_id = parse_telegram_identifier(identifier)
+            config_dest = TelegramDestination(chat_id=chat_id, thread_id=thread_id)
         else:
             config_dest = SlackDestination(channel=identifier)
         self._config.remove_destination(session_id, config_dest)
@@ -231,7 +275,7 @@ class DestinationManager:
                     self._destinations[session.session_id].append(
                         AttachedDestination(
                             type="telegram",
-                            identifier=tg.chat_id,
+                            identifier=tg.identifier,  # Uses combined identifier
                             attached_at=datetime.now(),
                         )
                     )

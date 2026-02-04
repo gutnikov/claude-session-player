@@ -419,22 +419,29 @@ class TelegramCommandHandler:
         self,
         query: str,
         chat_id: int | str,
+        thread_id: int | None = None,
     ) -> None:
         """Handle /search command.
 
         Args:
             query: The search query text (after "/search ").
             chat_id: Telegram chat ID.
+            thread_id: Topic thread ID for supergroups with topics.
         """
         chat_id_str = str(chat_id)
-        chat_key = f"telegram:{chat_id_str}"
+        # Include thread_id in chat_key for separate state per topic
+        from claude_session_player.watcher.destinations import make_telegram_identifier
+        identifier = make_telegram_identifier(chat_id_str, thread_id)
+        chat_key = f"telegram:{identifier}"
 
         # Check rate limit
         allowed, retry_after = self.rate_limiter.check(chat_key)
         if not allowed:
             if self.telegram_publisher:
                 text = format_rate_limited_telegram(retry_after)
-                await self.telegram_publisher.send_message(chat_id_str, text)
+                await self.telegram_publisher.send_message(
+                    chat_id_str, text, message_thread_id=thread_id
+                )
             return
 
         try:
@@ -442,7 +449,7 @@ class TelegramCommandHandler:
             params = self.search_engine.parse_query(query)
             results = await self.search_engine.search(params)
 
-            # Create search state
+            # Create search state (with thread_id for later use in Watch)
             state = SearchState(
                 query=params.query,
                 filters=params.filters,
@@ -451,6 +458,8 @@ class TelegramCommandHandler:
                 message_id=0,  # Will be updated after sending
                 created_at=datetime.now(timezone.utc),
             )
+            # Store thread_id in state for later use in Watch action
+            state.thread_id = thread_id  # type: ignore[attr-defined]
 
             # Format and send response
             if results.total == 0:
@@ -479,7 +488,7 @@ class TelegramCommandHandler:
             # Send message
             if self.telegram_publisher:
                 message_id = await self._send_message_with_keyboard(
-                    chat_id_str, text, keyboard
+                    chat_id_str, text, keyboard, thread_id
                 )
                 state.message_id = message_id
 
@@ -490,13 +499,16 @@ class TelegramCommandHandler:
             logger.exception("Error processing search: %s", e)
             if self.telegram_publisher:
                 text = format_error_telegram("An error occurred while searching.")
-                await self.telegram_publisher.send_message(chat_id_str, text)
+                await self.telegram_publisher.send_message(
+                    chat_id_str, text, message_thread_id=thread_id
+                )
 
     async def handle_callback(
         self,
         callback_data: str,
         chat_id: int | str,
         message_id: int,
+        thread_id: int | None = None,
     ) -> str | None:
         """Handle inline keyboard callback.
 
@@ -504,6 +516,7 @@ class TelegramCommandHandler:
             callback_data: The callback data string.
             chat_id: Telegram chat ID.
             message_id: Message ID that triggered the callback.
+            thread_id: Topic thread ID for supergroups with topics.
 
         Returns:
             Answer text for callback_query.answer() or None.
@@ -524,7 +537,7 @@ class TelegramCommandHandler:
                 index = int(parts[1])
             except ValueError:
                 return "Invalid index"
-            return await self._handle_watch(chat_id_str, message_id, index)
+            return await self._handle_watch(chat_id_str, message_id, index, thread_id)
 
         elif action == "p":  # Preview
             if len(parts) < 2:
@@ -533,18 +546,18 @@ class TelegramCommandHandler:
                 index = int(parts[1])
             except ValueError:
                 return "Invalid index"
-            return await self._handle_preview(chat_id_str, message_id, index)
+            return await self._handle_preview(chat_id_str, message_id, index, thread_id)
 
         elif action == "s":  # Search navigation
             if len(parts) < 2:
                 return "Invalid action"
             subaction = parts[1]
             if subaction == "n":
-                return await self._handle_next_page(chat_id_str, message_id)
+                return await self._handle_next_page(chat_id_str, message_id, thread_id)
             elif subaction == "p":
-                return await self._handle_prev_page(chat_id_str, message_id)
+                return await self._handle_prev_page(chat_id_str, message_id, thread_id)
             elif subaction == "r":
-                return await self._handle_refresh(chat_id_str, message_id)
+                return await self._handle_refresh(chat_id_str, message_id, thread_id)
 
         elif action == "stop":
             return await self._handle_stop_watching(chat_id_str)
@@ -556,6 +569,7 @@ class TelegramCommandHandler:
         chat_id: str,
         message_id: int,
         index: int,
+        thread_id: int | None = None,
     ) -> str:
         """Handle watch button callback.
 
@@ -563,18 +577,24 @@ class TelegramCommandHandler:
             chat_id: Telegram chat ID.
             message_id: Message ID.
             index: Result index (0-based on current page).
+            thread_id: Topic thread ID for supergroups with topics.
 
         Returns:
             Answer text for callback.
         """
-        chat_key = f"telegram:{chat_id}"
+        # Build identifier for state lookup
+        from claude_session_player.watcher.destinations import make_telegram_identifier
+        identifier = make_telegram_identifier(chat_id, thread_id)
+        chat_key = f"telegram:{identifier}"
 
         # Get search state
         state = self.search_state_manager.get(chat_key)
         if state is None:
             if self.telegram_publisher:
                 text = format_expired_state_telegram()
-                await self.telegram_publisher.send_message(chat_id, text)
+                await self.telegram_publisher.send_message(
+                    chat_id, text, message_thread_id=thread_id
+                )
             return "Search expired"
 
         # Get session
@@ -582,13 +602,17 @@ class TelegramCommandHandler:
         if session is None:
             return "Session not found"
 
-        # Attach session via callback
+        # Attach session via callback (use thread_id stored in state if callback didn't get it)
+        watch_thread_id = thread_id or getattr(state, "thread_id", None)
         if self.attach_callback:
             try:
+                dest: dict = {"type": "telegram", "chat_id": chat_id}
+                if watch_thread_id is not None:
+                    dest["thread_id"] = watch_thread_id
                 await self.attach_callback(
                     session_id=session.session_id,
                     file_path=str(session.file_path),
-                    destination={"type": "telegram", "chat_id": chat_id},
+                    destination=dest,
                     replay_count=5,
                 )
             except Exception as e:
@@ -598,7 +622,7 @@ class TelegramCommandHandler:
         # Send confirmation
         if self.telegram_publisher:
             text, keyboard = format_watch_confirmation_telegram(session)
-            await self._send_message_with_keyboard(chat_id, text, keyboard)
+            await self._send_message_with_keyboard(chat_id, text, keyboard, watch_thread_id)
 
         return f"Now watching: {session.project_display_name}"
 
@@ -607,6 +631,7 @@ class TelegramCommandHandler:
         chat_id: str,
         message_id: int,
         index: int,
+        thread_id: int | None = None,
     ) -> str:
         """Handle preview button callback.
 
@@ -614,18 +639,24 @@ class TelegramCommandHandler:
             chat_id: Telegram chat ID.
             message_id: Message ID.
             index: Result index (0-based on current page).
+            thread_id: Topic thread ID for supergroups with topics.
 
         Returns:
             Answer text for callback.
         """
-        chat_key = f"telegram:{chat_id}"
+        # Build identifier for state lookup
+        from claude_session_player.watcher.destinations import make_telegram_identifier
+        identifier = make_telegram_identifier(chat_id, thread_id)
+        chat_key = f"telegram:{identifier}"
 
         # Get search state
         state = self.search_state_manager.get(chat_key)
         if state is None:
             if self.telegram_publisher:
                 text = format_expired_state_telegram()
-                await self.telegram_publisher.send_message(chat_id, text)
+                await self.telegram_publisher.send_message(
+                    chat_id, text, message_thread_id=thread_id
+                )
             return "Search expired"
 
         # Get session
@@ -639,7 +670,7 @@ class TelegramCommandHandler:
         # Send preview as reply to search message
         if self.telegram_publisher:
             text = format_preview_telegram(session, preview_events)
-            await self._send_reply(chat_id, message_id, text)
+            await self._send_reply(chat_id, message_id, text, thread_id)
 
         return "Preview sent"
 
@@ -667,24 +698,34 @@ class TelegramCommandHandler:
 
         return events
 
-    async def _handle_next_page(self, chat_id: str, message_id: int) -> str:
+    async def _handle_next_page(
+        self,
+        chat_id: str,
+        message_id: int,
+        thread_id: int | None = None,
+    ) -> str:
         """Handle next page button callback.
 
         Args:
             chat_id: Telegram chat ID.
             message_id: Message ID.
+            thread_id: Topic thread ID for supergroups with topics.
 
         Returns:
             Answer text for callback.
         """
-        chat_key = f"telegram:{chat_id}"
+        from claude_session_player.watcher.destinations import make_telegram_identifier
+        identifier = make_telegram_identifier(chat_id, thread_id)
+        chat_key = f"telegram:{identifier}"
 
         # Get search state
         state = self.search_state_manager.get(chat_key)
         if state is None:
             if self.telegram_publisher:
                 text = format_expired_state_telegram()
-                await self.telegram_publisher.send_message(chat_id, text)
+                await self.telegram_publisher.send_message(
+                    chat_id, text, message_thread_id=thread_id
+                )
             return "Search expired"
 
         # Update offset
@@ -697,24 +738,34 @@ class TelegramCommandHandler:
         await self._update_search_message(chat_id, message_id, state)
         return "Next page"
 
-    async def _handle_prev_page(self, chat_id: str, message_id: int) -> str:
+    async def _handle_prev_page(
+        self,
+        chat_id: str,
+        message_id: int,
+        thread_id: int | None = None,
+    ) -> str:
         """Handle prev page button callback.
 
         Args:
             chat_id: Telegram chat ID.
             message_id: Message ID.
+            thread_id: Topic thread ID for supergroups with topics.
 
         Returns:
             Answer text for callback.
         """
-        chat_key = f"telegram:{chat_id}"
+        from claude_session_player.watcher.destinations import make_telegram_identifier
+        identifier = make_telegram_identifier(chat_id, thread_id)
+        chat_key = f"telegram:{identifier}"
 
         # Get search state
         state = self.search_state_manager.get(chat_key)
         if state is None:
             if self.telegram_publisher:
                 text = format_expired_state_telegram()
-                await self.telegram_publisher.send_message(chat_id, text)
+                await self.telegram_publisher.send_message(
+                    chat_id, text, message_thread_id=thread_id
+                )
             return "Search expired"
 
         # Update offset
@@ -727,24 +778,34 @@ class TelegramCommandHandler:
         await self._update_search_message(chat_id, message_id, state)
         return "Previous page"
 
-    async def _handle_refresh(self, chat_id: str, message_id: int) -> str:
+    async def _handle_refresh(
+        self,
+        chat_id: str,
+        message_id: int,
+        thread_id: int | None = None,
+    ) -> str:
         """Handle refresh button callback.
 
         Args:
             chat_id: Telegram chat ID.
             message_id: Message ID.
+            thread_id: Topic thread ID for supergroups with topics.
 
         Returns:
             Answer text for callback.
         """
-        chat_key = f"telegram:{chat_id}"
+        from claude_session_player.watcher.destinations import make_telegram_identifier
+        identifier = make_telegram_identifier(chat_id, thread_id)
+        chat_key = f"telegram:{identifier}"
 
         # Get search state
         state = self.search_state_manager.get(chat_key)
         if state is None:
             if self.telegram_publisher:
                 text = format_expired_state_telegram()
-                await self.telegram_publisher.send_message(chat_id, text)
+                await self.telegram_publisher.send_message(
+                    chat_id, text, message_thread_id=thread_id
+                )
             return "Search expired"
 
         try:
@@ -763,6 +824,8 @@ class TelegramCommandHandler:
                 message_id=message_id,
                 created_at=datetime.now(timezone.utc),
             )
+            # Preserve thread_id in state
+            new_state.thread_id = thread_id  # type: ignore[attr-defined]
 
             # Save new state
             self.search_state_manager.save(chat_key, new_state)
@@ -827,6 +890,7 @@ class TelegramCommandHandler:
         chat_id: str,
         text: str,
         keyboard: list[list[dict[str, Any]]],
+        thread_id: int | None = None,
     ) -> int:
         """Send a message with inline keyboard.
 
@@ -834,6 +898,7 @@ class TelegramCommandHandler:
             chat_id: Telegram chat ID.
             text: Message text.
             keyboard: Inline keyboard rows.
+            thread_id: Topic thread ID for supergroups with topics.
 
         Returns:
             Message ID of the sent message.
@@ -866,13 +931,16 @@ class TelegramCommandHandler:
                 text=text,
                 parse_mode="Markdown",
                 reply_markup=inline_keyboard,
+                message_thread_id=thread_id,
             )
             return result.message_id
 
         except Exception as e:
             logger.warning("Failed to send message with keyboard: %s", e)
             # Fallback to plain message
-            return await self.telegram_publisher.send_message(chat_id, text)
+            return await self.telegram_publisher.send_message(
+                chat_id, text, message_thread_id=thread_id
+            )
 
     async def _edit_message_with_keyboard(
         self,
@@ -935,6 +1003,7 @@ class TelegramCommandHandler:
         chat_id: str,
         reply_to_message_id: int,
         text: str,
+        thread_id: int | None = None,
     ) -> int:
         """Send a reply to a message.
 
@@ -942,6 +1011,7 @@ class TelegramCommandHandler:
             chat_id: Telegram chat ID.
             reply_to_message_id: Message ID to reply to.
             text: Message text.
+            thread_id: Topic thread ID for supergroups with topics.
 
         Returns:
             Message ID of the sent message.
@@ -956,10 +1026,13 @@ class TelegramCommandHandler:
                 text=text,
                 parse_mode="Markdown",
                 reply_to_message_id=reply_to_message_id,
+                message_thread_id=thread_id,
             )
             return result.message_id
 
         except Exception as e:
             logger.warning("Failed to send reply: %s", e)
             # Fallback to regular message
-            return await self.telegram_publisher.send_message(chat_id, text)
+            return await self.telegram_publisher.send_message(
+                chat_id, text, message_thread_id=thread_id
+            )
