@@ -13,7 +13,7 @@ This module provides the main orchestration service that wires together:
 - SlackPublisher: Slack Web API integration
 - MessageStateTracker: turn-based message grouping
 - MessageDebouncer: rate-limiting message updates
-- SessionIndexer: session file discovery and indexing
+- SQLiteSessionIndexer: SQLite-backed session indexing
 - SearchEngine: session search and ranking
 - SearchStateManager: pagination state for bot commands
 """
@@ -37,7 +37,7 @@ from claude_session_player.watcher.debouncer import MessageDebouncer
 from claude_session_player.watcher.destinations import AttachedDestination, DestinationManager
 from claude_session_player.watcher.event_buffer import EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher
-from claude_session_player.watcher.indexer import IndexConfig, SessionIndexer
+from claude_session_player.watcher.indexer import IndexConfig, SessionIndexer, SQLiteSessionIndexer
 from claude_session_player.watcher.message_state import (
     MessageStateTracker,
     NoAction,
@@ -88,6 +88,7 @@ class WatcherService:
 
     # Search components
     indexer: SessionIndexer | None = None
+    sqlite_indexer: SQLiteSessionIndexer | None = None
     search_engine: SearchEngine | None = None
     search_state_manager: SearchStateManager | None = None
 
@@ -100,6 +101,9 @@ class WatcherService:
     _site: TCPSite | None = field(default=None, repr=False)
     _running: bool = field(default=False, repr=False)
     _refresh_task: asyncio.Task | None = field(default=None, repr=False)
+    _checkpoint_task: asyncio.Task | None = field(default=None, repr=False)
+    _backup_task: asyncio.Task | None = field(default=None, repr=False)
+    _start_time: datetime | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize components if not injected."""
@@ -148,19 +152,30 @@ class WatcherService:
         # Initialize search components
         index_config = self.config_manager.get_index_config()
         search_config = self.config_manager.get_search_config()
+        db_config = self.config_manager.get_database_config()
 
+        # Convert IndexConfig from config module to indexer IndexConfig
+        indexer_config = IndexConfig(
+            refresh_interval=index_config.refresh_interval,
+            max_sessions_per_project=index_config.max_sessions_per_project,
+            include_subagents=index_config.include_subagents,
+            persist=index_config.persist,
+        )
+
+        # Create legacy indexer for backward compatibility if needed
         if self.indexer is None:
-            # Convert IndexConfig from config module to indexer IndexConfig
-            indexer_config = IndexConfig(
-                refresh_interval=index_config.refresh_interval,
-                max_sessions_per_project=index_config.max_sessions_per_project,
-                include_subagents=index_config.include_subagents,
-                persist=index_config.persist,
-            )
             self.indexer = SessionIndexer(
                 paths=index_config.expand_paths(),
                 config=indexer_config,
                 state_dir=self.state_dir,
+            )
+
+        # Create SQLite-backed indexer for persistent search
+        if self.sqlite_indexer is None:
+            self.sqlite_indexer = SQLiteSessionIndexer(
+                paths=index_config.expand_paths(),
+                state_dir=db_config.get_state_dir(),
+                config=indexer_config,
             )
 
         if self.search_engine is None:
@@ -184,6 +199,7 @@ class WatcherService:
                 sse_manager=self.sse_manager,
                 replay_callback=self.replay_to_destination,
                 indexer=self.indexer,
+                sqlite_indexer=self.sqlite_indexer,
                 search_engine=self.search_engine,
                 search_limiter=search_limiter,
                 preview_limiter=preview_limiter,
@@ -205,16 +221,20 @@ class WatcherService:
            - Validate file exists (remove from config if not)
            - Add to FileWatcher with saved position
         3. Restore messaging destinations from config
-        4. Build initial session index
-        5. Start periodic index refresh
-        6. Start FileWatcher
-        7. Start HTTP server
+        4. Initialize SQLite indexer and build/update index
+        5. Optionally vacuum database on startup
+        6. Start periodic index refresh
+        7. Start periodic WAL checkpoint (if configured)
+        8. Start periodic backup (if enabled)
+        9. Start FileWatcher
+        10. Start HTTP server
         """
         if self._running:
             logger.warning("Service already running")
             return
 
         logger.info("Starting watcher service...")
+        self._start_time = datetime.now(timezone.utc)
 
         # Load existing config and resume sessions
         await self._load_and_resume_sessions()
@@ -223,20 +243,58 @@ class WatcherService:
         await self.destination_manager.restore_from_config()
         logger.info("Messaging destinations restored from config")
 
-        # Build initial session index
+        # Initialize SQLite indexer
+        if self.sqlite_indexer:
+            try:
+                await self.sqlite_indexer.initialize()
+                logger.info("SQLite indexer initialized")
+
+                # Check if index needs to be built
+                stats = await self.sqlite_indexer.get_stats()
+                if stats["total_sessions"] == 0:
+                    logger.info("Building initial search index...")
+                    count = await self.sqlite_indexer.build_full_index()
+                    logger.info(f"Indexed {count} sessions")
+                else:
+                    logger.info(
+                        f"Search index loaded: {stats['total_sessions']} sessions "
+                        f"from {stats['total_projects']} projects"
+                    )
+
+                # Vacuum on startup if configured
+                db_config = self.config_manager.get_database_config()
+                if db_config.vacuum_on_startup:
+                    await self.sqlite_indexer.db.vacuum()
+                    logger.info("Database vacuum completed on startup")
+            except Exception as e:
+                logger.error(f"Failed to initialize SQLite indexer: {e}")
+                await self._handle_index_error(e)
+
+        # Build legacy index for backward compatibility
         if self.indexer:
             try:
                 index = await self.indexer.get_index()
                 logger.info(
-                    f"Indexed {len(index.sessions)} sessions "
+                    f"Legacy indexer: {len(index.sessions)} sessions "
                     f"from {len(index.projects)} projects"
                 )
             except Exception as e:
-                logger.error(f"Failed to build initial index: {e}")
+                logger.error(f"Failed to build legacy index: {e}")
 
         # Start periodic refresh task
         self._refresh_task = asyncio.create_task(self._periodic_refresh())
         logger.info("Periodic index refresh started")
+
+        # Start checkpoint task if configured
+        db_config = self.config_manager.get_database_config()
+        if db_config.checkpoint_interval > 0:
+            self._checkpoint_task = asyncio.create_task(self._periodic_checkpoint())
+            logger.info(f"Periodic checkpoint started (interval: {db_config.checkpoint_interval}s)")
+
+        # Start backup task if enabled
+        if db_config.backup.enabled:
+            self._backup_task = asyncio.create_task(self._periodic_backup())
+            logger.info("Periodic backup started")
 
         # Start file watcher
         await self.file_watcher.start()
@@ -258,13 +316,17 @@ class WatcherService:
         Shutdown sequence:
         1. Stop accepting new HTTP connections
         2. Cancel periodic refresh task
-        3. Flush pending message updates
-        4. Close messaging publishers
-        5. Stop FileWatcher
-        6. Save all session states
-        7. Send session_ended to all SSE clients
-        8. Close all SSE connections
-        9. Exit
+        3. Cancel periodic checkpoint task
+        4. Cancel periodic backup task
+        5. Flush pending message updates
+        6. Close messaging publishers
+        7. Stop FileWatcher
+        8. Save all session states
+        9. Final database checkpoint before close
+        10. Close SQLite indexer
+        11. Send session_ended to all SSE clients
+        12. Close all SSE connections
+        13. Exit
         """
         if not self._running:
             return
@@ -282,15 +344,23 @@ class WatcherService:
 
         logger.info("HTTP server stopped")
 
-        # Cancel periodic refresh task
-        if self._refresh_task:
-            self._refresh_task.cancel()
-            try:
-                await self._refresh_task
-            except asyncio.CancelledError:
-                pass
-            self._refresh_task = None
-            logger.info("Periodic refresh task cancelled")
+        # Cancel all background tasks
+        for task_name, task in [
+            ("refresh", self._refresh_task),
+            ("checkpoint", self._checkpoint_task),
+            ("backup", self._backup_task),
+        ]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                logger.info(f"Periodic {task_name} task cancelled")
+
+        self._refresh_task = None
+        self._checkpoint_task = None
+        self._backup_task = None
 
         # Flush pending message updates
         if self.message_debouncer:
@@ -314,6 +384,17 @@ class WatcherService:
         await self._save_all_states()
         logger.info("All states saved")
 
+        # Final checkpoint and close SQLite indexer
+        if self.sqlite_indexer:
+            try:
+                await self.sqlite_indexer.db.checkpoint()
+                logger.info("Final WAL checkpoint completed")
+            except Exception as e:
+                logger.warning(f"Final checkpoint failed: {e}")
+
+            await self.sqlite_indexer.close()
+            logger.info("SQLite indexer closed")
+
         # Shutdown destination manager (cancel keep-alive tasks)
         await self.destination_manager.shutdown()
         logger.info("Destination manager shutdown")
@@ -326,6 +407,7 @@ class WatcherService:
         logger.info("All SSE connections closed")
 
         self._running = False
+        self._start_time = None
         logger.info("Watcher service stopped")
 
     async def watch(self, session_id: str, path: Path) -> None:
@@ -830,12 +912,9 @@ class WatcherService:
     async def _periodic_refresh(self) -> None:
         """Background task for periodic index refresh.
 
-        Runs continuously, refreshing the index at the configured interval.
-        Errors are logged but do not crash the service.
+        Runs continuously, refreshing both legacy and SQLite indexes
+        at the configured interval. Errors are logged but do not crash the service.
         """
-        if self.indexer is None:
-            return
-
         index_config = self.config_manager.get_index_config()
         interval = index_config.refresh_interval
 
@@ -844,15 +923,117 @@ class WatcherService:
                 await asyncio.sleep(interval)
 
                 start = time.monotonic()
-                await self.indexer.refresh(force=True)
-                duration = time.monotonic() - start
 
-                logger.debug(f"Index refreshed in {duration:.2f}s")
+                # Refresh SQLite index (incremental update)
+                if self.sqlite_indexer:
+                    try:
+                        added, updated, removed = await self.sqlite_indexer.incremental_update()
+                        duration = time.monotonic() - start
+
+                        if added or updated or removed:
+                            logger.info(
+                                f"Index updated in {duration:.2f}s: "
+                                f"+{added}, ~{updated}, -{removed}"
+                            )
+                        else:
+                            logger.debug(f"Index check in {duration:.2f}s: no changes")
+                    except Exception as e:
+                        logger.error(f"SQLite index refresh failed: {e}")
+                        await self._handle_index_error(e)
+
+                # Also refresh legacy index for backward compatibility
+                if self.indexer:
+                    try:
+                        await self.indexer.refresh(force=True)
+                    except Exception as e:
+                        logger.debug(f"Legacy index refresh failed: {e}")
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Index refresh failed: {e}")
                 # Continue running, try again next interval
+
+    async def _periodic_checkpoint(self) -> None:
+        """Background task for WAL checkpoint.
+
+        Periodically checkpoints the SQLite database to reduce WAL file size
+        and improve read performance.
+        """
+        db_config = self.config_manager.get_database_config()
+        interval = db_config.checkpoint_interval
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+
+                if self.sqlite_indexer:
+                    await self.sqlite_indexer.db.checkpoint()
+                    logger.debug("WAL checkpoint completed")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"WAL checkpoint failed: {e}")
+
+    async def _periodic_backup(self) -> None:
+        """Background task for automated backups.
+
+        Creates daily backups of the search database and rotates old ones.
+        """
+        # Run once per day (86400 seconds)
+        interval = 86400
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._create_backup()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Backup failed: {e}")
+
+    async def _create_backup(self) -> None:
+        """Create a backup and rotate old ones."""
+        if not self.sqlite_indexer:
+            return
+
+        db_config = self.config_manager.get_database_config()
+        backup_dir = db_config.get_backup_dir()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create timestamped backup
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = backup_dir / f"search_{timestamp}.db"
+
+        await self.sqlite_indexer.db.backup(backup_path)
+        logger.info(f"Backup created: {backup_path}")
+
+        # Rotate old backups
+        keep_count = db_config.backup.keep_count
+        backups = sorted(backup_dir.glob("search_*.db"), reverse=True)
+
+        for old_backup in backups[keep_count:]:
+            old_backup.unlink()
+            logger.debug(f"Deleted old backup: {old_backup}")
+
+    async def _handle_index_error(self, error: Exception) -> None:
+        """Handle index-related errors.
+
+        Attempts to recover from database corruption if detected.
+
+        Args:
+            error: The exception that occurred.
+        """
+        logger.error(f"Index error: {error}")
+
+        if self.sqlite_indexer and "corrupt" in str(error).lower():
+            logger.warning("Attempting database recovery...")
+            try:
+                await self.sqlite_indexer.db._recover_database()
+                count = await self.sqlite_indexer.build_full_index()
+                logger.info(f"Database recovered and rebuilt with {count} sessions")
+            except Exception as recovery_error:
+                logger.error(f"Database recovery failed: {recovery_error}")
 
     async def validate_destination(self, destination_type: str) -> None:
         """Validate bot credentials for a destination type.
