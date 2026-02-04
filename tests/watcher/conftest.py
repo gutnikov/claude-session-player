@@ -176,3 +176,150 @@ def add_session_to_project(
     content += '{"type": "user", "message": {"content": "Test"}}\n'
     session_file.write_text(content)
     return session_file
+
+
+# ---------------------------------------------------------------------------
+# Question JSONL fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def question_jsonl_line() -> dict:
+    """Single AskUserQuestion tool_use with 3 options.
+
+    Returns a JSONL line representing an AskUserQuestion tool call
+    with tool_use_id "toolu_q123" and 3 options.
+    """
+    return {
+        "type": "assistant",
+        "requestId": "req-123",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_q123",
+                    "name": "AskUserQuestion",
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "Which approach should I use?",
+                                "header": "Implementation Strategy",
+                                "options": [
+                                    {"label": "Option A", "description": "Use pattern A"},
+                                    {"label": "Option B", "description": "Use pattern B"},
+                                    {"label": "Option C", "description": "Use pattern C"},
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+    }
+
+
+@pytest.fixture
+def question_answer_jsonl_line() -> dict:
+    """User's answer to an AskUserQuestion with toolUseResult.answers.
+
+    Returns a JSONL line representing a tool_result with answers.
+    """
+    return {
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_q123",
+                    "content": "Selected: Option B",
+                }
+            ]
+        },
+        "toolUseResult": {
+            "answers": {
+                "Which approach should I use?": "Option B",
+            }
+        },
+    }
+
+
+@pytest.fixture
+def multi_question_jsonl_line() -> dict:
+    """AskUserQuestion with 2 questions.
+
+    Returns a JSONL line representing an AskUserQuestion tool call
+    with 2 separate questions.
+    """
+    return {
+        "type": "assistant",
+        "requestId": "req-multi",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_multi",
+                    "name": "AskUserQuestion",
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "Which language?",
+                                "header": "Language Selection",
+                                "options": [
+                                    {"label": "Python", "description": "Use Python"},
+                                    {"label": "TypeScript", "description": "Use TypeScript"},
+                                ],
+                            },
+                            {
+                                "question": "Which framework?",
+                                "header": "Framework Selection",
+                                "options": [
+                                    {"label": "FastAPI", "description": "Use FastAPI"},
+                                    {"label": "Flask", "description": "Use Flask"},
+                                ],
+                            },
+                        ]
+                    },
+                }
+            ]
+        },
+    }
+
+
+@pytest.fixture
+def many_options_jsonl_line() -> dict:
+    """AskUserQuestion with 8 options (triggers truncation at 5).
+
+    Returns a JSONL line representing an AskUserQuestion tool call
+    with 8 options to test truncation behavior.
+    """
+    return {
+        "type": "assistant",
+        "requestId": "req-many",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_many",
+                    "name": "AskUserQuestion",
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "Which file to edit?",
+                                "header": "File Selection",
+                                "options": [
+                                    {"label": "file1.py", "description": "First file"},
+                                    {"label": "file2.py", "description": "Second file"},
+                                    {"label": "file3.py", "description": "Third file"},
+                                    {"label": "file4.py", "description": "Fourth file"},
+                                    {"label": "file5.py", "description": "Fifth file"},
+                                    {"label": "file6.py", "description": "Sixth file"},
+                                    {"label": "file7.py", "description": "Seventh file"},
+                                    {"label": "file8.py", "description": "Eighth file"},
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+    }
