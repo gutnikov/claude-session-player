@@ -25,7 +25,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -103,7 +103,12 @@ class WatcherService:
     _refresh_task: asyncio.Task | None = field(default=None, repr=False)
     _checkpoint_task: asyncio.Task | None = field(default=None, repr=False)
     _backup_task: asyncio.Task | None = field(default=None, repr=False)
+    _cleanup_task: asyncio.Task | None = field(default=None, repr=False)
     _start_time: datetime | None = field(default=None, repr=False)
+
+    # Cleanup configuration
+    _cleanup_interval: int = 3600  # Run cleanup every hour
+    _binding_max_expired_age: int = 86400  # Remove bindings expired for > 24 hours
 
     def __post_init__(self) -> None:
         """Initialize components if not injected."""
@@ -298,6 +303,16 @@ class WatcherService:
             self._backup_task = asyncio.create_task(self._periodic_backup())
             logger.info("Periodic backup started")
 
+        # Start expired binding cleanup task
+        self._cleanup_task = asyncio.create_task(self._cleanup_expired_bindings_loop())
+        logger.info(
+            "Expired binding cleanup started",
+            extra={
+                "interval_seconds": self._cleanup_interval,
+                "max_expired_age_seconds": self._binding_max_expired_age,
+            },
+        )
+
         # Start file watcher
         await self.file_watcher.start()
         logger.info("File watcher started")
@@ -325,15 +340,16 @@ class WatcherService:
         2. Cancel periodic refresh task
         3. Cancel periodic checkpoint task
         4. Cancel periodic backup task
-        5. Flush pending message updates
-        6. Close messaging publishers
-        7. Stop FileWatcher
-        8. Save all session states
-        9. Final database checkpoint before close
-        10. Close SQLite indexer
-        11. Send session_ended to all SSE clients
-        12. Close all SSE connections
-        13. Exit
+        5. Cancel periodic cleanup task
+        6. Flush pending message updates
+        7. Close messaging publishers
+        8. Stop FileWatcher
+        9. Save all session states
+        10. Final database checkpoint before close
+        11. Close SQLite indexer
+        12. Send session_ended to all SSE clients
+        13. Close all SSE connections
+        14. Exit
         """
         if not self._running:
             return
@@ -356,6 +372,7 @@ class WatcherService:
             ("refresh", self._refresh_task),
             ("checkpoint", self._checkpoint_task),
             ("backup", self._backup_task),
+            ("cleanup", self._cleanup_task),
         ]:
             if task:
                 task.cancel()
@@ -368,6 +385,7 @@ class WatcherService:
         self._refresh_task = None
         self._checkpoint_task = None
         self._backup_task = None
+        self._cleanup_task = None
 
         # Flush pending message updates
         if self.message_debouncer:
@@ -1074,6 +1092,93 @@ class WatcherService:
                 break
             except Exception as e:
                 logger.error(f"Backup failed: {e}")
+
+    async def _cleanup_expired_bindings_loop(self) -> None:
+        """Background task for periodic expired binding cleanup.
+
+        Runs continuously, removing bindings that have been expired for
+        longer than _binding_max_expired_age seconds.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._cleanup_interval)
+                await self._cleanup_expired_bindings()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(
+                    "Expired binding cleanup failed",
+                    extra={"error": str(e)},
+                )
+                # Continue running, try again next interval
+
+    async def _cleanup_expired_bindings(self) -> None:
+        """Remove bindings that have been expired for more than max age.
+
+        Iterates over all bindings, checks if they are expired and have been
+        expired for longer than _binding_max_expired_age, then removes them
+        and clears associated debouncer state.
+        """
+        if not self.message_bindings or not self.message_debouncer:
+            return
+
+        now = datetime.now(timezone.utc)
+        bindings_to_remove: list[MessageBinding] = []
+
+        # Get a copy of all bindings for safe iteration
+        all_bindings = self.message_bindings.get_all_bindings()
+
+        for binding in all_bindings:
+            # Calculate when the binding expired
+            expiry_time = binding.created_at + timedelta(seconds=binding.ttl_seconds)
+
+            # Check if binding is expired
+            if now <= expiry_time:
+                continue  # Not expired yet
+
+            # Calculate how long the binding has been expired
+            expired_duration = now - expiry_time
+
+            # Only remove if expired for longer than max age
+            if expired_duration.total_seconds() > self._binding_max_expired_age:
+                bindings_to_remove.append(binding)
+
+        # Remove the identified bindings
+        removed_count = 0
+        for binding in bindings_to_remove:
+            # Remove the binding
+            removed = self.message_bindings.remove_binding(
+                binding.session_id, binding.destination
+            )
+            if removed:
+                removed_count += 1
+
+                # Clear debouncer state for this binding
+                await self.message_debouncer.clear_message(
+                    binding.destination.type,
+                    binding.destination.identifier,
+                    binding.message_id,
+                )
+
+                logger.debug(
+                    "Removed expired binding",
+                    extra={
+                        "session_id": binding.session_id,
+                        "destination_type": binding.destination.type,
+                        "message_id": binding.message_id,
+                        "created_at": binding.created_at.isoformat(),
+                        "ttl_seconds": binding.ttl_seconds,
+                    },
+                )
+
+        if removed_count > 0:
+            logger.info(
+                "Expired binding cleanup completed",
+                extra={
+                    "removed_count": removed_count,
+                    "total_bindings_checked": len(all_bindings),
+                },
+            )
 
     async def _create_backup(self) -> None:
         """Create a backup and rotate old ones."""

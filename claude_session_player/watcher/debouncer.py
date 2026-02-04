@@ -295,3 +295,43 @@ class MessageDebouncer:
         """
         key = (destination_type, identifier, message_id)
         return self._last_pushed_content.get(key)
+
+    async def clear_message(
+        self, destination_type: str, identifier: str, message_id: str
+    ) -> None:
+        """Clear all state for a specific message.
+
+        Cancels any pending update and removes change detection tracking.
+        Call this when removing a message binding to free resources.
+
+        Args:
+            destination_type: "telegram" or "slack"
+            identifier: chat_id (Telegram) or channel (Slack)
+            message_id: The message ID to clear
+        """
+        key = (destination_type, identifier, message_id)
+
+        # Cancel pending update if any
+        if key in self._pending:
+            pending = self._pending.pop(key)
+            pending.task.cancel()
+            try:
+                await pending.task
+            except asyncio.CancelledError:
+                pass
+            logger.debug(
+                "Cancelled pending update for %s/%s/%s (clear_message)",
+                destination_type,
+                identifier,
+                message_id,
+            )
+
+        # Clear content tracking
+        if key in self._last_pushed_content:
+            del self._last_pushed_content[key]
+            logger.debug(
+                "Cleared content tracking for %s/%s/%s (clear_message)",
+                destination_type,
+                identifier,
+                message_id,
+            )
