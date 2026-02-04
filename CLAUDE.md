@@ -224,7 +224,9 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `claude_session_player/watcher/destinations.py` - Destination lifecycle management
 - `claude_session_player/watcher/telegram_publisher.py` - Telegram Bot API integration
 - `claude_session_player/watcher/slack_publisher.py` - Slack Web API integration
-- `claude_session_player/watcher/message_state.py` - Turn-based message grouping
+- `claude_session_player/watcher/screen_renderer.py` - Terminal-style screen rendering
+- `claude_session_player/watcher/render_cache.py` - Per-session render cache with TTL eviction
+- `claude_session_player/watcher/message_binding.py` - Message binding model for single-message rendering
 - `claude_session_player/watcher/debouncer.py` - Rate limiting for message updates
 - `claude_session_player/watcher/event_buffer.py` - Per-session event ring buffer
 - `claude_session_player/watcher/transformer.py` - Stateless line-to-event transformer
@@ -259,7 +261,11 @@ if line.get("isSidechain") and msg_type in ("user", "assistant"):
 - `tests/test_stress.py` - Stress tests with large sessions
 - `tests/watcher/test_*.py` - Watcher module tests
 - `tests/watcher/test_e2e.py` - End-to-end watcher tests
-- `tests/watcher/test_messaging_integration.py` - Messaging integration tests
+- `tests/watcher/test_screen_renderer.py` - Screen renderer tests
+- `tests/watcher/test_render_cache.py` - Render cache tests
+- `tests/watcher/test_message_binding.py` - Message binding tests
+- `tests/watcher/test_service_single_message.py` - Single-message rendering integration tests
+- `tests/watcher/test_question_e2e.py` - Question presentation E2E tests
 - `tests/watcher/test_indexer.py` - Session indexer tests
 - `tests/watcher/test_search.py` - Search engine tests
 - `tests/watcher/test_search_state.py` - Search state manager tests
@@ -460,10 +466,13 @@ HTTP Request → WatcherAPI → WatcherService → Components
          └──────────────┴──────────┴──────────┘              │
                                │                             │
                                ▼                             │
-                    MessageStateTracker ←────────────────────┘
-                               │
-                               ▼
-                       MessageDebouncer
+                    ScreenRenderer ←─────────────────────────┘
+                         │
+                         ▼
+                    RenderCache → MessageBindingManager
+                                        │
+                                        ▼
+                                  MessageDebouncer
 ```
 
 ### Event Flow (File Change → Messaging)
@@ -478,9 +487,13 @@ transformer.transform(lines, context) → events
 For each event:
     ├─→ EventBufferManager.add_event() → event_id
     ├─→ SSEManager.broadcast()
-    └─→ MessageStateTracker.handle_event() → MessageAction
-            ├─→ SendNewMessage → TelegramPublisher / SlackPublisher
-            └─→ UpdateExistingMessage → MessageDebouncer → Publishers
+    └─→ ScreenRenderer.render(events) → rendered_content
+            ↓
+        RenderCache.update(session_id, rendered_content)
+            ↓
+        MessageBindingManager.get_or_create_binding()
+            ↓
+        MessageDebouncer → TelegramPublisher / SlackPublisher
 ```
 
 ### Key Components
@@ -492,9 +505,11 @@ For each event:
 - **EventBufferManager**: Per-session ring buffer (last 20 events) for replay
 - **SSEManager**: Manages SSE connections, broadcasts events, handles keepalive
 - **DestinationManager**: Track attached destinations, coordinate with ConfigManager
+- **ScreenRenderer**: Renders events to terminal-style text for given viewport dimensions/preset
+- **RenderCache**: Caches rendered output per session, handles cache invalidation
+- **MessageBindingManager**: Maps sessions to message IDs for each destination
 - **TelegramPublisher**: Telegram Bot API via aiogram (send/edit messages)
 - **SlackPublisher**: Slack Web API via slack-sdk (post/update messages)
-- **MessageStateTracker**: Map turns to message IDs, handle turn finalization
 - **MessageDebouncer**: Rate-limit message updates per destination
 - **ConfigManager**: Persists watched sessions and bot config to `config.yaml`
 - **StateManager**: Persists processing context and file position per session
