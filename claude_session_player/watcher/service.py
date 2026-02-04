@@ -38,6 +38,7 @@ from claude_session_player.watcher.destinations import AttachedDestination, Dest
 from claude_session_player.watcher.event_buffer import EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher
 from claude_session_player.watcher.indexer import IndexConfig, SessionIndexer, SQLiteSessionIndexer
+from claude_session_player.watcher.message_binding import MessageBinding, MessageBindingManager
 from claude_session_player.watcher.message_state import (
     MessageStateTracker,
     NoAction,
@@ -45,6 +46,7 @@ from claude_session_player.watcher.message_state import (
     UpdateExistingMessage,
 )
 from claude_session_player.watcher.rate_limit import RateLimiter
+from claude_session_player.watcher.render_cache import RenderCache
 from claude_session_player.watcher.search import SearchEngine
 from claude_session_player.watcher.search_state import SearchStateManager
 from claude_session_player.watcher.slack_publisher import SlackError, SlackPublisher
@@ -85,6 +87,10 @@ class WatcherService:
     slack_publisher: SlackPublisher | None = None
     message_state: MessageStateTracker | None = None
     message_debouncer: MessageDebouncer | None = None
+
+    # Single-message rendering components
+    render_cache: RenderCache | None = None
+    message_bindings: MessageBindingManager | None = None
 
     # Search components
     indexer: SessionIndexer | None = None
@@ -148,6 +154,13 @@ class WatcherService:
 
         if self.message_debouncer is None:
             self.message_debouncer = MessageDebouncer()
+
+        # Initialize single-message rendering components
+        if self.render_cache is None:
+            self.render_cache = RenderCache()
+
+        if self.message_bindings is None:
+            self.message_bindings = MessageBindingManager()
 
         # Initialize search components
         index_config = self.config_manager.get_index_config()
@@ -300,6 +313,11 @@ class WatcherService:
         await self.file_watcher.start()
         logger.info("File watcher started")
 
+        # Start render cache eviction task
+        if self.render_cache:
+            await self.render_cache.start()
+            logger.info("Render cache eviction task started")
+
         # Start HTTP server
         app = self.api.create_app()
         self._runner = web.AppRunner(app)
@@ -379,6 +397,11 @@ class WatcherService:
         # Stop file watcher
         await self.file_watcher.stop()
         logger.info("File watcher stopped")
+
+        # Stop render cache eviction task
+        if self.render_cache:
+            await self.render_cache.stop()
+            logger.info("Render cache stopped")
 
         # Save all session states
         await self._save_all_states()
@@ -611,12 +634,22 @@ class WatcherService:
         )
         self.state_manager.save(session_id, new_state)
 
-        # Buffer events and broadcast to SSE subscribers + messaging destinations
+        # Buffer events and broadcast to SSE subscribers
         for event in events:
             event_id = self.event_buffer.add_event(session_id, event)
             await self.sse_manager.broadcast(session_id, event_id, event)
 
-            # Publish to messaging destinations
+        # Rebuild render cache with all buffered events
+        if self.render_cache and self.message_bindings:
+            all_events_with_ids = self.event_buffer.get_events_since(session_id, None)
+            all_events = [evt for _, evt in all_events_with_ids]
+            self.render_cache.rebuild(session_id, all_events)
+
+            # Push cached content to all bindings for this session
+            await self._push_to_bindings(session_id)
+
+        # Legacy: publish to messaging via turn-based tracker
+        for event in events:
             await self._publish_to_messaging(session_id, event)
 
     async def _on_file_deleted(self, session_id: str) -> None:
@@ -922,6 +955,218 @@ class WatcherService:
             return 0
 
         return len(events_to_replay)
+
+    # -------------------------------------------------------------------------
+    # Single-Message Rendering Methods
+    # -------------------------------------------------------------------------
+
+    async def _push_to_bindings(self, session_id: str) -> None:
+        """Push cached render content to all bindings for a session.
+
+        For each binding:
+        1. Get cached content for the binding's preset
+        2. Schedule debounced update with change detection
+
+        Args:
+            session_id: The session identifier.
+        """
+        if not self.render_cache or not self.message_bindings or not self.message_debouncer:
+            return
+
+        bindings = self.message_bindings.get_bindings_for_session(session_id)
+        if not bindings:
+            return
+
+        for binding in bindings:
+            content = self.render_cache.get(session_id, binding.preset)
+            if content is None:
+                continue
+
+            # Schedule debounced update with change detection
+            await self._push_binding_content(binding, content)
+
+    async def _push_binding_content(self, binding: MessageBinding, content: str) -> None:
+        """Push content to a single binding through the debouncer.
+
+        Args:
+            binding: The message binding to push to.
+            content: The pre-rendered content to push.
+        """
+        if not self.message_debouncer:
+            return
+
+        from claude_session_player.watcher.destinations import parse_telegram_identifier
+
+        dest = binding.destination
+
+        async def do_update() -> None:
+            try:
+                if dest.type == "telegram" and self.telegram_publisher:
+                    chat_id, _ = parse_telegram_identifier(dest.identifier)
+                    await self.telegram_publisher.update_session_message(
+                        chat_id=chat_id,
+                        message_id=int(binding.message_id),
+                        content=content,
+                    )
+                elif dest.type == "slack" and self.slack_publisher:
+                    await self.slack_publisher.update_session_message(
+                        channel=dest.identifier,
+                        ts=binding.message_id,
+                        content=content,
+                    )
+
+                # Update last_content in binding after successful push
+                if self.message_bindings:
+                    self.message_bindings.update_last_content(
+                        binding.session_id, dest, content
+                    )
+            except (TelegramError, SlackError) as e:
+                logger.warning(
+                    "Failed to push binding content",
+                    extra={
+                        "session_id": binding.session_id,
+                        "destination_type": dest.type,
+                        "message_id": binding.message_id,
+                        "error": str(e),
+                    },
+                )
+
+        await self.message_debouncer.schedule_update(
+            destination_type=dest.type,
+            identifier=dest.identifier,
+            message_id=binding.message_id,
+            update_fn=do_update,
+            content=content,  # String for change detection
+        )
+
+    async def create_session_binding(
+        self,
+        session_id: str,
+        destination: AttachedDestination,
+        preset: str = "desktop",
+    ) -> str | None:
+        """Create a new session message and binding.
+
+        Creates an initial message with the current session state and
+        creates a binding to track updates to that message.
+
+        Args:
+            session_id: The session identifier.
+            destination: The destination to create the message in.
+            preset: Display preset ("desktop" or "mobile").
+
+        Returns:
+            The message ID if successful, None if failed.
+        """
+        from claude_session_player.watcher.destinations import parse_telegram_identifier
+
+        if not self.render_cache or not self.message_bindings:
+            return None
+
+        # Get or build initial content
+        content = self.render_cache.get(session_id, preset)  # type: ignore[arg-type]
+        if content is None:
+            # Build cache if not present (e.g., first attach)
+            all_events_with_ids = self.event_buffer.get_events_since(session_id, None)
+            all_events = [evt for _, evt in all_events_with_ids]
+            self.render_cache.rebuild(session_id, all_events)
+            content = self.render_cache.get(session_id, preset)  # type: ignore[arg-type]
+
+        # Create initial message
+        message_id: str | None = None
+        try:
+            if destination.type == "telegram" and self.telegram_publisher:
+                chat_id, thread_id = parse_telegram_identifier(destination.identifier)
+                msg_id_int = await self.telegram_publisher.send_session_message(
+                    chat_id=chat_id,
+                    content=content or "",
+                    thread_id=thread_id,
+                )
+                message_id = str(msg_id_int)
+
+            elif destination.type == "slack" and self.slack_publisher:
+                ts = await self.slack_publisher.send_session_message(
+                    channel=destination.identifier,
+                    content=content or "",
+                )
+                message_id = ts
+
+        except (TelegramError, SlackError) as e:
+            logger.warning(
+                "Failed to create session message",
+                extra={
+                    "session_id": session_id,
+                    "destination_type": destination.type,
+                    "error": str(e),
+                },
+            )
+            return None
+
+        if not message_id:
+            return None
+
+        # Create binding
+        binding = MessageBinding(
+            session_id=session_id,
+            preset=preset,  # type: ignore[arg-type]
+            destination=destination,
+            message_id=message_id,
+            last_content=content or "",
+        )
+        self.message_bindings.add_binding(binding)
+
+        logger.info(
+            "Created session binding",
+            extra={
+                "session_id": session_id,
+                "destination_type": destination.type,
+                "message_id": message_id,
+                "preset": preset,
+            },
+        )
+
+        return message_id
+
+    async def remove_session_binding(
+        self,
+        session_id: str,
+        destination: AttachedDestination,
+    ) -> bool:
+        """Remove a session binding.
+
+        Removes the binding and clears debouncer state for the message.
+
+        Args:
+            session_id: The session identifier.
+            destination: The destination to unbind.
+
+        Returns:
+            True if binding was removed, False if not found.
+        """
+        if not self.message_bindings or not self.message_debouncer:
+            return False
+
+        binding = self.message_bindings.remove_binding(session_id, destination)
+        if not binding:
+            return False
+
+        # Clear debouncer state
+        self.message_debouncer.clear_content(
+            destination.type,
+            destination.identifier,
+            binding.message_id,
+        )
+
+        logger.info(
+            "Removed session binding",
+            extra={
+                "session_id": session_id,
+                "destination_type": destination.type,
+                "message_id": binding.message_id,
+            },
+        )
+
+        return True
 
     async def _periodic_refresh(self) -> None:
         """Background task for periodic index refresh.
