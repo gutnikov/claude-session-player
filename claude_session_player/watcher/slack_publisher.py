@@ -205,16 +205,58 @@ def _truncate_blocks(blocks: list[dict], max_blocks: int = _MAX_BLOCKS) -> list[
     return truncated
 
 
-def _wrap_in_code_block(content: str) -> list[dict]:
-    """Wrap content in a Block Kit code block.
+def _build_ttl_controls_block(message_ts: str, is_live: bool = True) -> dict:
+    """Build a Block Kit actions block with TTL controls.
+
+    Args:
+        message_ts: Message timestamp for button value (used for binding lookup).
+        is_live: Whether to show live indicator button.
+
+    Returns:
+        Actions block dict with TTL control buttons.
+    """
+    elements = []
+    if is_live:
+        # Live indicator (no-op, purely visual)
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "\u26a1 Live", "emoji": True},
+            "action_id": "ttl_live_indicator",
+            "style": "primary",
+        })
+    # +30s button always present
+    elements.append({
+        "type": "button",
+        "text": {"type": "plain_text", "text": "+30s", "emoji": True},
+        "action_id": "extend_ttl",
+        "value": message_ts,
+    })
+    return {
+        "type": "actions",
+        "block_id": "ttl_controls",
+        "elements": elements,
+    }
+
+
+def _wrap_in_code_block(
+    content: str,
+    message_ts: str | None = None,
+    is_live: bool = True,
+) -> list[dict]:
+    """Wrap content in a Block Kit code block with optional TTL controls.
 
     Args:
         content: Pre-rendered content to wrap.
+        message_ts: If provided, adds TTL controls with this ts as button value.
+        is_live: When message_ts is set, whether to show live indicator.
 
     Returns:
-        List containing a single section block with code formatting.
+        List of Block Kit blocks: section with code, and optionally actions.
     """
-    return [{"type": "section", "text": {"type": "mrkdwn", "text": f"```{content}```"}}]
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"```{content}```"}}]
+    if message_ts is not None:
+        blocks.append(_build_ttl_controls_block(message_ts, is_live))
+    return blocks
 
 
 class SlackPublisher:
@@ -374,14 +416,22 @@ class SlackPublisher:
                 logger.warning(f"Failed to update Slack message {ts}: {e2}")
                 return False
 
-    async def send_session_message(self, channel: str, content: str) -> str:
+    async def send_session_message(
+        self,
+        channel: str,
+        content: str,
+        include_ttl_controls: bool = False,
+    ) -> str:
         """Send a session message with pre-rendered content.
 
         Wraps the content in a code block and sends to the channel.
+        Optionally adds TTL controls by updating the message immediately
+        after sending (since we need the ts for the button value).
 
         Args:
             channel: Channel ID or name.
             content: Pre-rendered session content.
+            include_ttl_controls: If True, update message to add TTL controls.
 
         Returns:
             Message timestamp (ts) for future updates.
@@ -389,22 +439,38 @@ class SlackPublisher:
         Raises:
             SlackError: On API failure after retry.
         """
+        # Initial send without controls (we don't have ts yet)
         blocks = _wrap_in_code_block(content)
-        return await self.send_message(channel=channel, text=content, blocks=blocks)
+        ts = await self.send_message(channel=channel, text=content, blocks=blocks)
+
+        # If TTL controls requested, immediately update to add them
+        if include_ttl_controls:
+            blocks_with_controls = _wrap_in_code_block(content, message_ts=ts, is_live=True)
+            await self.update_message(
+                channel=channel, ts=ts, text=content, blocks=blocks_with_controls
+            )
+
+        return ts
 
     async def update_session_message(
-        self, channel: str, ts: str, content: str
+        self,
+        channel: str,
+        ts: str,
+        content: str,
+        is_live: bool = True,
     ) -> None:
         """Update a session message with pre-rendered content.
 
         Wraps the content in a code block and updates the message.
+        Always includes TTL controls with the message ts for button value.
 
         Args:
             channel: Channel ID or name.
             ts: Message timestamp to update.
             content: Pre-rendered session content.
+            is_live: Whether to show live indicator (default True).
         """
-        blocks = _wrap_in_code_block(content)
+        blocks = _wrap_in_code_block(content, message_ts=ts, is_live=is_live)
         await self.update_message(channel=channel, ts=ts, text=content, blocks=blocks)
 
     async def close(self) -> None:
