@@ -707,3 +707,176 @@ class TestSingleMessageIntegration:
         content = watcher_service.render_cache.get(session_1, "desktop")
         assert content is not None
         assert "session 1 update" in content
+
+
+# --- TTL Expiry Tests ---
+
+
+class TestTTLExpiryChecking:
+    """Tests for TTL expiry checking in _push_to_bindings()."""
+
+    @pytest.mark.asyncio
+    async def test_expired_binding_skipped(
+        self,
+        watcher_service: WatcherService,
+        telegram_dest: AttachedDestination,
+    ) -> None:
+        """_push_to_bindings() skips expired bindings."""
+        from datetime import timedelta, timezone
+
+        session_id = "test-session"
+
+        # Create an already-expired binding (created 60 seconds ago, TTL = 30)
+        binding = MessageBinding(
+            session_id=session_id,
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            created_at=datetime.now(timezone.utc) - timedelta(seconds=60),
+            ttl_seconds=30,
+        )
+        watcher_service.message_bindings.add_binding(binding)
+
+        # Build cache
+        events = [
+            AddBlock(
+                block=Block(
+                    id="b1",
+                    type=BlockType.USER,
+                    content=UserContent(text="test content"),
+                )
+            )
+        ]
+        watcher_service.render_cache.rebuild(session_id, events)
+
+        # Push to bindings
+        await watcher_service._push_to_bindings(session_id)
+
+        # Binding should be marked as expired
+        assert binding.expired is True
+
+    @pytest.mark.asyncio
+    async def test_active_binding_receives_update(
+        self,
+        watcher_service: WatcherService,
+        telegram_dest: AttachedDestination,
+    ) -> None:
+        """_push_to_bindings() pushes to active (non-expired) bindings."""
+        session_id = "test-session"
+
+        # Create a fresh binding with long TTL
+        binding = MessageBinding(
+            session_id=session_id,
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            ttl_seconds=300,  # 5 minutes
+        )
+        watcher_service.message_bindings.add_binding(binding)
+
+        # Build cache
+        events = [
+            AddBlock(
+                block=Block(
+                    id="b1",
+                    type=BlockType.USER,
+                    content=UserContent(text="test content"),
+                )
+            )
+        ]
+        watcher_service.render_cache.rebuild(session_id, events)
+
+        # Push to bindings
+        await watcher_service._push_to_bindings(session_id)
+
+        # Binding should not be expired
+        assert binding.expired is False
+        assert binding.is_expired() is False
+
+    @pytest.mark.asyncio
+    async def test_mixed_bindings_only_active_updated(
+        self,
+        watcher_service: WatcherService,
+        telegram_dest: AttachedDestination,
+        slack_dest: AttachedDestination,
+    ) -> None:
+        """_push_to_bindings() updates active bindings, skips expired ones."""
+        from datetime import timedelta, timezone
+
+        session_id = "test-session"
+
+        # Create one expired and one active binding
+        expired_binding = MessageBinding(
+            session_id=session_id,
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            created_at=datetime.now(timezone.utc) - timedelta(seconds=60),
+            ttl_seconds=30,
+        )
+        active_binding = MessageBinding(
+            session_id=session_id,
+            preset="mobile",
+            destination=slack_dest,
+            message_id="1234567890.123456",
+            ttl_seconds=300,
+        )
+        watcher_service.message_bindings.add_binding(expired_binding)
+        watcher_service.message_bindings.add_binding(active_binding)
+
+        # Build cache
+        events = [
+            AddBlock(
+                block=Block(
+                    id="b1",
+                    type=BlockType.USER,
+                    content=UserContent(text="test content"),
+                )
+            )
+        ]
+        watcher_service.render_cache.rebuild(session_id, events)
+
+        # Push to bindings
+        await watcher_service._push_to_bindings(session_id)
+
+        # Expired binding should be marked
+        assert expired_binding.expired is True
+        # Active binding should not be expired
+        assert active_binding.expired is False
+
+    @pytest.mark.asyncio
+    async def test_already_marked_expired_still_skipped(
+        self,
+        watcher_service: WatcherService,
+        telegram_dest: AttachedDestination,
+    ) -> None:
+        """_push_to_bindings() skips bindings already marked as expired."""
+        session_id = "test-session"
+
+        # Create a binding already marked as expired
+        binding = MessageBinding(
+            session_id=session_id,
+            preset="desktop",
+            destination=telegram_dest,
+            message_id="999",
+            expired=True,  # Already marked
+        )
+        watcher_service.message_bindings.add_binding(binding)
+
+        # Build cache
+        events = [
+            AddBlock(
+                block=Block(
+                    id="b1",
+                    type=BlockType.USER,
+                    content=UserContent(text="test content"),
+                )
+            )
+        ]
+        watcher_service.render_cache.rebuild(session_id, events)
+
+        # Push to bindings
+        await watcher_service._push_to_bindings(session_id)
+
+        # Binding should still be expired
+        assert binding.expired is True

@@ -693,8 +693,9 @@ class WatcherService:
         """Push cached render content to all bindings for a session.
 
         For each binding:
-        1. Get cached content for the binding's preset
-        2. Schedule debounced update with change detection
+        1. Check if binding is expired (skip if so)
+        2. Get cached content for the binding's preset
+        3. Schedule debounced update with change detection
 
         Args:
             session_id: The session identifier.
@@ -707,6 +708,21 @@ class WatcherService:
             return
 
         for binding in bindings:
+            # Check TTL - skip expired bindings
+            if binding.is_expired():
+                if not binding.expired:
+                    # Newly expired - mark it and log
+                    binding.expired = True
+                    logger.debug(
+                        "Binding expired, skipping update",
+                        extra={
+                            "session_id": session_id,
+                            "destination_type": binding.destination.type,
+                            "message_id": binding.message_id,
+                        },
+                    )
+                continue  # Skip update for expired bindings
+
             content = self.render_cache.get(session_id, binding.preset)
             if content is None:
                 continue
