@@ -11,7 +11,8 @@ This module provides the main orchestration service that wires together:
 - WatcherAPI: HTTP API endpoints
 - TelegramPublisher: Telegram Bot API integration
 - SlackPublisher: Slack Web API integration
-- MessageStateTracker: turn-based message grouping
+- RenderCache: pre-rendered session content caching
+- MessageBindingManager: message-to-destination bindings
 - MessageDebouncer: rate-limiting message updates
 - SQLiteSessionIndexer: SQLite-backed session indexing
 - SearchEngine: session search and ranking
@@ -39,12 +40,6 @@ from claude_session_player.watcher.event_buffer import EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher
 from claude_session_player.watcher.indexer import IndexConfig, SessionIndexer, SQLiteSessionIndexer
 from claude_session_player.watcher.message_binding import MessageBinding, MessageBindingManager
-from claude_session_player.watcher.message_state import (
-    MessageStateTracker,
-    NoAction,
-    SendNewMessage,
-    UpdateExistingMessage,
-)
 from claude_session_player.watcher.rate_limit import RateLimiter
 from claude_session_player.watcher.render_cache import RenderCache
 from claude_session_player.watcher.search import SearchEngine
@@ -85,7 +80,6 @@ class WatcherService:
     # Messaging components (optional, created based on bot config)
     telegram_publisher: TelegramPublisher | None = None
     slack_publisher: SlackPublisher | None = None
-    message_state: MessageStateTracker | None = None
     message_debouncer: MessageDebouncer | None = None
 
     # Single-message rendering components
@@ -148,10 +142,7 @@ class WatcherService:
         if self.slack_publisher is None and bot_config.slack_token:
             self.slack_publisher = SlackPublisher(token=bot_config.slack_token)
 
-        # Always create message state and debouncer (they work without publishers)
-        if self.message_state is None:
-            self.message_state = MessageStateTracker()
-
+        # Always create debouncer (works without publishers)
         if self.message_debouncer is None:
             self.message_debouncer = MessageDebouncer()
 
@@ -210,7 +201,6 @@ class WatcherService:
                 destination_manager=self.destination_manager,
                 event_buffer=self.event_buffer,
                 sse_manager=self.sse_manager,
-                replay_callback=self.replay_to_destination,
                 indexer=self.indexer,
                 sqlite_indexer=self.sqlite_indexer,
                 search_engine=self.search_engine,
@@ -648,10 +638,6 @@ class WatcherService:
             # Push cached content to all bindings for this session
             await self._push_to_bindings(session_id)
 
-        # Legacy: publish to messaging via turn-based tracker
-        for event in events:
-            await self._publish_to_messaging(session_id, event)
-
     async def _on_file_deleted(self, session_id: str) -> None:
         """Handle file deletion callback from FileWatcher.
 
@@ -715,10 +701,6 @@ class WatcherService:
         """
         logger.info(f"Stopping file watching for session: {session_id}")
 
-        # Clear message state for session
-        if self.message_state:
-            self.message_state.clear_session(session_id)
-
         # Emit session_ended event to SSE subscribers
         await self.sse_manager.close_session(session_id, reason="no_destinations")
 
@@ -732,229 +714,6 @@ class WatcherService:
         self.state_manager.delete(session_id)
 
         # Note: config is not removed - session info persists
-
-    # -------------------------------------------------------------------------
-    # Messaging Methods
-    # -------------------------------------------------------------------------
-
-    async def _publish_to_messaging(self, session_id: str, event: Event) -> None:
-        """Publish event to all attached messaging destinations.
-
-        Args:
-            session_id: The session identifier.
-            event: The event to publish.
-        """
-        if not self.destination_manager or not self.message_state:
-            return
-
-        destinations = self.destination_manager.get_destinations(session_id)
-        if not destinations:
-            return
-
-        # Determine action based on event
-        action = self.message_state.handle_event(session_id, event)
-
-        if isinstance(action, NoAction):
-            return
-
-        # Publish to each destination
-        for dest in destinations:
-            await self._publish_action_to_destination(session_id, dest, action)
-
-    async def _publish_action_to_destination(
-        self,
-        session_id: str,
-        destination: AttachedDestination,
-        action: SendNewMessage | UpdateExistingMessage,
-    ) -> None:
-        """Publish a message action to a single destination.
-
-        Args:
-            session_id: The session identifier.
-            destination: The destination to publish to.
-            action: The message action to perform.
-        """
-        if isinstance(action, SendNewMessage):
-            await self._send_new_message(session_id, destination, action)
-        elif isinstance(action, UpdateExistingMessage):
-            await self._update_message(session_id, destination, action)
-
-    async def _send_new_message(
-        self,
-        session_id: str,
-        destination: AttachedDestination,
-        action: SendNewMessage,
-    ) -> None:
-        """Send a new message to a destination.
-
-        Args:
-            session_id: The session identifier.
-            destination: The destination to send to.
-            action: The SendNewMessage action with content.
-        """
-        from claude_session_player.watcher.destinations import parse_telegram_identifier
-
-        try:
-            if destination.type == "telegram" and self.telegram_publisher:
-                # Parse identifier to extract chat_id and optional thread_id
-                chat_id, thread_id = parse_telegram_identifier(destination.identifier)
-                message_id = await self.telegram_publisher.send_message(
-                    chat_id=chat_id,
-                    text=action.content,
-                    message_thread_id=thread_id,
-                )
-                if self.message_state:
-                    self.message_state.record_message_id(
-                        session_id,
-                        action.turn_id,
-                        "telegram",
-                        destination.identifier,
-                        message_id,
-                    )
-
-            elif destination.type == "slack" and self.slack_publisher:
-                ts = await self.slack_publisher.send_message(
-                    channel=destination.identifier,
-                    text=action.text_fallback,
-                    blocks=action.blocks,
-                )
-                if self.message_state:
-                    self.message_state.record_message_id(
-                        session_id,
-                        action.turn_id,
-                        "slack",
-                        destination.identifier,
-                        ts,
-                    )
-
-        except (TelegramError, SlackError) as e:
-            logger.warning(f"Failed to send message to {destination}: {e}")
-
-    async def _update_message(
-        self,
-        session_id: str,
-        destination: AttachedDestination,
-        action: UpdateExistingMessage,
-    ) -> None:
-        """Update an existing message (debounced).
-
-        Args:
-            session_id: The session identifier.
-            destination: The destination to update.
-            action: The UpdateExistingMessage action with content.
-        """
-        if not self.message_state:
-            return
-
-        message_id = self.message_state.get_message_id(
-            session_id, action.turn_id, destination.type, destination.identifier
-        )
-
-        if not message_id:
-            # No existing message, send new instead
-            # (This can happen after restart)
-            await self._send_new_message(
-                session_id,
-                destination,
-                SendNewMessage(
-                    turn_id=action.turn_id,
-                    message_type="turn",
-                    content=action.content,
-                    blocks=action.blocks,
-                    text_fallback=action.text_fallback,
-                ),
-            )
-            return
-
-        # Schedule debounced update
-        async def do_update() -> None:
-            from claude_session_player.watcher.destinations import parse_telegram_identifier
-
-            try:
-                if destination.type == "telegram" and self.telegram_publisher:
-                    # Parse identifier to extract chat_id (thread_id not needed for edits)
-                    chat_id, _ = parse_telegram_identifier(destination.identifier)
-                    await self.telegram_publisher.edit_message(
-                        chat_id=chat_id,
-                        message_id=int(message_id),
-                        text=action.content,
-                    )
-                elif destination.type == "slack" and self.slack_publisher:
-                    await self.slack_publisher.update_message(
-                        channel=destination.identifier,
-                        ts=str(message_id),
-                        text=action.text_fallback,
-                        blocks=action.blocks,
-                    )
-            except (TelegramError, SlackError) as e:
-                logger.warning(f"Failed to update message: {e}")
-
-        if self.message_debouncer:
-            await self.message_debouncer.schedule_update(
-                destination_type=destination.type,
-                identifier=destination.identifier,
-                message_id=str(message_id),
-                update_fn=do_update,
-                content=action,
-            )
-
-    async def replay_to_destination(
-        self,
-        session_id: str,
-        destination_type: str,
-        identifier: str,
-        count: int,
-    ) -> int:
-        """Replay recent events to a newly attached destination.
-
-        Args:
-            session_id: The session identifier.
-            destination_type: "telegram" or "slack".
-            identifier: chat_id for Telegram, channel for Slack.
-            count: Number of events to replay.
-
-        Returns:
-            Number of events replayed.
-        """
-        buffer = self.event_buffer.get_buffer(session_id)
-        events = buffer.get_since(None)
-
-        # Limit to requested count (take last N)
-        events_to_replay = events[-count:] if len(events) > count else events
-
-        if not events_to_replay or not self.message_state:
-            return 0
-
-        # Render as batched catch-up message
-        event_list = [e for _, e in events_to_replay]
-        content, blocks = self.message_state.render_replay(session_id, event_list)
-
-        if not content:
-            return 0
-
-        # Send catch-up message
-        from claude_session_player.watcher.destinations import parse_telegram_identifier
-
-        try:
-            if destination_type == "telegram" and self.telegram_publisher:
-                # Parse identifier to extract chat_id and optional thread_id
-                chat_id, thread_id = parse_telegram_identifier(identifier)
-                await self.telegram_publisher.send_message(
-                    chat_id=chat_id,
-                    text=content,
-                    message_thread_id=thread_id,
-                )
-            elif destination_type == "slack" and self.slack_publisher:
-                await self.slack_publisher.send_message(
-                    channel=identifier,
-                    text=f"Catching up ({len(events_to_replay)} events)",
-                    blocks=blocks,
-                )
-        except (TelegramError, SlackError) as e:
-            logger.warning(f"Failed to send replay: {e}")
-            return 0
-
-        return len(events_to_replay)
 
     # -------------------------------------------------------------------------
     # Single-Message Rendering Methods

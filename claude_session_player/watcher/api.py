@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,10 +25,6 @@ if TYPE_CHECKING:
     from claude_session_player.watcher.rate_limit import RateLimiter
     from claude_session_player.watcher.search import SearchEngine
     from claude_session_player.watcher.sse import SSEManager
-
-# Type alias for replay callback
-ReplayCallback = Callable[[str, str, str, int], Awaitable[int]]
-
 
 def _parse_iso_date(value: str | None) -> datetime | None:
     """Parse an ISO date string to datetime.
@@ -66,9 +61,6 @@ class WatcherAPI:
     destination_manager: DestinationManager
     event_buffer: EventBufferManager
     sse_manager: SSEManager
-
-    # Optional callback for replaying events (injected by WatcherService)
-    replay_callback: ReplayCallback | None = None
 
     # Optional search components (injected by WatcherService)
     indexer: SessionIndexer | None = None
@@ -313,24 +305,17 @@ class WatcherAPI:
         identifier: str,
         count: int,
     ) -> int:
-        """Replay events to a destination.
+        """Count available events for replay (actual replay handled by message bindings).
 
         Args:
             session_id: Session identifier.
             destination_type: "telegram" or "slack".
             identifier: chat_id or channel.
-            count: Number of events to replay.
+            count: Number of events requested.
 
         Returns:
-            Number of events actually replayed.
+            Number of events available for replay.
         """
-        # Use callback if provided (injected by WatcherService)
-        if self.replay_callback:
-            return await self.replay_callback(
-                session_id, destination_type, identifier, count
-            )
-
-        # Fallback: just count available events without sending
         buffer = self.event_buffer.get_buffer(session_id)
         events = buffer.get_since(None)
 
