@@ -13,6 +13,7 @@ from claude_session_player.watcher.slack_publisher import (
     SlackAuthError,
     SlackError,
     SlackPublisher,
+    _build_ttl_controls_block,
     _truncate_blocks,
     _wrap_in_code_block,
     escape_mrkdwn,
@@ -147,6 +148,109 @@ class TestWrapInCodeBlock:
         result = _wrap_in_code_block(content)
         # Content is NOT escaped when wrapped in code block
         assert result[0]["text"]["text"] == f"```{content}```"
+
+    def test_wraps_content_with_ttl_controls_is_live(self) -> None:
+        """Adds TTL controls when message_ts provided and is_live=True."""
+        result = _wrap_in_code_block("content", message_ts="1234567890.123456", is_live=True)
+
+        assert len(result) == 2
+        assert result[0]["type"] == "section"
+        assert result[1]["type"] == "actions"
+        assert result[1]["block_id"] == "ttl_controls"
+
+        elements = result[1]["elements"]
+        assert len(elements) == 2
+
+        # Live indicator button
+        assert elements[0]["action_id"] == "ttl_live_indicator"
+        assert elements[0]["style"] == "primary"
+        assert "\u26a1 Live" in elements[0]["text"]["text"]
+
+        # +30s button
+        assert elements[1]["action_id"] == "extend_ttl"
+        assert elements[1]["value"] == "1234567890.123456"
+        assert elements[1]["text"]["text"] == "+30s"
+
+    def test_wraps_content_with_ttl_controls_not_live(self) -> None:
+        """Adds only +30s button when is_live=False."""
+        result = _wrap_in_code_block("content", message_ts="1234567890.123456", is_live=False)
+
+        assert len(result) == 2
+        elements = result[1]["elements"]
+        assert len(elements) == 1
+
+        # Only +30s button, no live indicator
+        assert elements[0]["action_id"] == "extend_ttl"
+        assert elements[0]["value"] == "1234567890.123456"
+
+    def test_wraps_content_no_ttl_controls_by_default(self) -> None:
+        """No TTL controls when message_ts is None."""
+        result = _wrap_in_code_block("content")
+        assert len(result) == 1
+        assert result[0]["type"] == "section"
+
+    def test_wraps_content_is_live_ignored_without_message_ts(self) -> None:
+        """is_live parameter is ignored when message_ts is None."""
+        result = _wrap_in_code_block("content", is_live=False)
+        assert len(result) == 1
+        assert result[0]["type"] == "section"
+
+
+# ---------------------------------------------------------------------------
+# TTL controls block tests
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTtlControlsBlock:
+    """Tests for _build_ttl_controls_block function."""
+
+    def test_builds_block_with_live_indicator(self) -> None:
+        """Builds actions block with live indicator when is_live=True."""
+        block = _build_ttl_controls_block("1234567890.123456", is_live=True)
+
+        assert block["type"] == "actions"
+        assert block["block_id"] == "ttl_controls"
+        assert len(block["elements"]) == 2
+
+        # First element: live indicator
+        live_btn = block["elements"][0]
+        assert live_btn["type"] == "button"
+        assert live_btn["action_id"] == "ttl_live_indicator"
+        assert live_btn["style"] == "primary"
+        assert live_btn["text"]["type"] == "plain_text"
+        assert live_btn["text"]["emoji"] is True
+
+        # Second element: +30s button
+        extend_btn = block["elements"][1]
+        assert extend_btn["type"] == "button"
+        assert extend_btn["action_id"] == "extend_ttl"
+        assert extend_btn["value"] == "1234567890.123456"
+
+    def test_builds_block_without_live_indicator(self) -> None:
+        """Builds actions block without live indicator when is_live=False."""
+        block = _build_ttl_controls_block("1234567890.123456", is_live=False)
+
+        assert len(block["elements"]) == 1
+
+        # Only +30s button
+        extend_btn = block["elements"][0]
+        assert extend_btn["action_id"] == "extend_ttl"
+        assert extend_btn["value"] == "1234567890.123456"
+
+    def test_button_values_match_message_ts(self) -> None:
+        """Button value contains the exact message_ts for lookup."""
+        ts = "9999999999.999999"
+        block = _build_ttl_controls_block(ts, is_live=True)
+
+        extend_btn = block["elements"][1]
+        assert extend_btn["value"] == ts
+
+    def test_button_text_has_emoji_flag(self) -> None:
+        """Both buttons have emoji flag set."""
+        block = _build_ttl_controls_block("123.456", is_live=True)
+
+        for element in block["elements"]:
+            assert element["text"]["emoji"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +671,7 @@ class TestSlackPublisherSessionMessage:
     async def test_update_session_message_wraps_in_code_block(
         self, validated_publisher: SlackPublisher
     ) -> None:
-        """update_session_message wraps content in code block."""
+        """update_session_message wraps content in code block with TTL controls."""
         validated_publisher._client.chat_update = AsyncMock(
             return_value={"ok": True}
         )
@@ -581,8 +685,11 @@ class TestSlackPublisherSessionMessage:
         call_args = validated_publisher._client.chat_update.call_args
         assert call_args.kwargs["text"] == "Updated session content"
         blocks = call_args.kwargs["blocks"]
-        assert len(blocks) == 1
+        # Now includes TTL controls by default
+        assert len(blocks) == 2
         assert blocks[0]["text"]["text"] == "```Updated session content```"
+        assert blocks[1]["type"] == "actions"
+        assert blocks[1]["block_id"] == "ttl_controls"
 
     @pytest.mark.asyncio
     async def test_update_session_message_returns_none(
@@ -600,6 +707,153 @@ class TestSlackPublisherSessionMessage:
         )
 
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_update_session_message_includes_ttl_controls_with_ts(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """update_session_message includes TTL controls with message ts as value."""
+        validated_publisher._client.chat_update = AsyncMock(
+            return_value={"ok": True}
+        )
+
+        await validated_publisher.update_session_message(
+            channel="C0123456789",
+            ts="9999999999.999999",
+            content="Content",
+        )
+
+        call_args = validated_publisher._client.chat_update.call_args
+        blocks = call_args.kwargs["blocks"]
+        actions_block = blocks[1]
+
+        # Should have live indicator and +30s button
+        assert len(actions_block["elements"]) == 2
+        assert actions_block["elements"][0]["action_id"] == "ttl_live_indicator"
+        assert actions_block["elements"][1]["action_id"] == "extend_ttl"
+        assert actions_block["elements"][1]["value"] == "9999999999.999999"
+
+    @pytest.mark.asyncio
+    async def test_update_session_message_is_live_true_shows_indicator(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """update_session_message with is_live=True shows live indicator."""
+        validated_publisher._client.chat_update = AsyncMock(
+            return_value={"ok": True}
+        )
+
+        await validated_publisher.update_session_message(
+            channel="C0123456789",
+            ts="1234567890.123456",
+            content="Content",
+            is_live=True,
+        )
+
+        call_args = validated_publisher._client.chat_update.call_args
+        blocks = call_args.kwargs["blocks"]
+        elements = blocks[1]["elements"]
+
+        assert len(elements) == 2
+        assert elements[0]["action_id"] == "ttl_live_indicator"
+        assert elements[0]["style"] == "primary"
+
+    @pytest.mark.asyncio
+    async def test_update_session_message_is_live_false_no_indicator(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """update_session_message with is_live=False hides live indicator."""
+        validated_publisher._client.chat_update = AsyncMock(
+            return_value={"ok": True}
+        )
+
+        await validated_publisher.update_session_message(
+            channel="C0123456789",
+            ts="1234567890.123456",
+            content="Content",
+            is_live=False,
+        )
+
+        call_args = validated_publisher._client.chat_update.call_args
+        blocks = call_args.kwargs["blocks"]
+        elements = blocks[1]["elements"]
+
+        # Only +30s button, no live indicator
+        assert len(elements) == 1
+        assert elements[0]["action_id"] == "extend_ttl"
+
+    @pytest.mark.asyncio
+    async def test_send_session_message_without_ttl_controls(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """send_session_message without TTL controls doesn't update message."""
+        validated_publisher._client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1234567890.123456"}
+        )
+        validated_publisher._client.chat_update = AsyncMock(
+            return_value={"ok": True}
+        )
+
+        ts = await validated_publisher.send_session_message(
+            channel="C0123456789",
+            content="Content",
+            include_ttl_controls=False,
+        )
+
+        assert ts == "1234567890.123456"
+        # Should only call postMessage, not update
+        validated_publisher._client.chat_postMessage.assert_called_once()
+        validated_publisher._client.chat_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_session_message_with_ttl_controls(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """send_session_message with TTL controls updates message after send."""
+        validated_publisher._client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1234567890.123456"}
+        )
+        validated_publisher._client.chat_update = AsyncMock(
+            return_value={"ok": True}
+        )
+
+        ts = await validated_publisher.send_session_message(
+            channel="C0123456789",
+            content="Session content",
+            include_ttl_controls=True,
+        )
+
+        assert ts == "1234567890.123456"
+
+        # Should call postMessage then update
+        validated_publisher._client.chat_postMessage.assert_called_once()
+        validated_publisher._client.chat_update.assert_called_once()
+
+        # Verify update includes TTL controls with correct ts
+        update_call = validated_publisher._client.chat_update.call_args
+        blocks = update_call.kwargs["blocks"]
+        assert len(blocks) == 2
+        assert blocks[1]["type"] == "actions"
+        assert blocks[1]["elements"][1]["value"] == "1234567890.123456"
+
+    @pytest.mark.asyncio
+    async def test_send_session_message_backward_compatible(
+        self, validated_publisher: SlackPublisher
+    ) -> None:
+        """send_session_message is backward compatible without new params."""
+        validated_publisher._client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1234567890.123456"}
+        )
+
+        # Call without include_ttl_controls (defaults to False)
+        ts = await validated_publisher.send_session_message(
+            channel="C0123456789",
+            content="Content",
+        )
+
+        assert ts == "1234567890.123456"
+        # Only one block (code), no TTL controls
+        blocks = validated_publisher._client.chat_postMessage.call_args.kwargs["blocks"]
+        assert len(blocks) == 1
 
 
 class TestSlackPublisherClose:
