@@ -94,6 +94,7 @@ class WatcherAPI:
                     "chat_id": "123456789",  # for telegram
                     "channel": "C0123456789"  # for slack
                 },
+                "preset": "desktop",  # or "mobile" - required
                 "replay_count": 0  # Optional, default 0
             }
 
@@ -102,6 +103,8 @@ class WatcherAPI:
                 "attached": true,
                 "session_id": "my-session",
                 "destination": {"type": "telegram", "chat_id": "123456789"},
+                "preset": "desktop",
+                "message_id": "12345",
                 "replayed_events": 0
             }
 
@@ -133,6 +136,14 @@ class WatcherAPI:
         if dest_type not in ("telegram", "slack"):
             return web.json_response(
                 {"error": "destination.type must be 'telegram' or 'slack'"},
+                status=400,
+            )
+
+        # Validate preset field
+        preset = data.get("preset")
+        if preset not in ("desktop", "mobile"):
+            return web.json_response(
+                {"error": "preset must be 'desktop' or 'mobile'"},
                 status=400,
             )
 
@@ -211,11 +222,17 @@ class WatcherAPI:
             else:
                 dest_response = {"type": dest_type, "channel": identifier}
 
+            # Note: message_id will be set by the watcher service when it creates
+            # the message. For now, return a placeholder that indicates no message
+            # has been created yet. The actual message creation happens in the
+            # WatcherService layer.
             return web.json_response(
                 {
                     "attached": True,
                     "session_id": session_id,
                     "destination": dest_response,
+                    "preset": preset,
+                    "message_id": None,  # Set by WatcherService after message creation
                     "replayed_events": replayed,
                 },
                 status=201,
@@ -1063,6 +1080,7 @@ class WatcherAPI:
                     "type": "telegram",
                     "chat_id": "123456789"
                 },
+                "preset": "desktop",
                 "replay_count": 5
             }
 
@@ -1071,6 +1089,8 @@ class WatcherAPI:
                 "attached": true,
                 "session_id": "930c1604-...",
                 "destination": {"type": "telegram", "chat_id": "123456789"},
+                "preset": "desktop",
+                "message_id": "12345",
                 "replayed_events": 5,
                 "session_summary": "Fix authentication bug"
             }
@@ -1109,6 +1129,14 @@ class WatcherAPI:
                 status=404,
             )
 
+        # Validate preset field
+        preset = data.get("preset")
+        if preset not in ("desktop", "mobile"):
+            return web.json_response(
+                {"error": "preset must be 'desktop' or 'mobile'"},
+                status=400,
+            )
+
         # Default replay_count to 5 for search/watch
         replay_count = data.get("replay_count", 5)
 
@@ -1117,6 +1145,7 @@ class WatcherAPI:
             "session_id": session_id,
             "path": str(session.file_path),
             "destination": destination,
+            "preset": preset,
             "replay_count": replay_count,
         }
 
