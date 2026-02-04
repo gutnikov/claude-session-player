@@ -6,8 +6,14 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from claude_session_player.watcher.deps import check_telegram_available
+
+if TYPE_CHECKING:
+    from aiogram.types import InlineKeyboardMarkup
+
+    from claude_session_player.events import QuestionContent
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +171,90 @@ def format_context_compacted() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Question Keyboard Formatting
+# ---------------------------------------------------------------------------
+
+
+# Maximum number of buttons to show in the inline keyboard
+MAX_QUESTION_BUTTONS = 5
+
+
+def format_question_keyboard(
+    content: QuestionContent,
+) -> InlineKeyboardMarkup | None:
+    """Create an inline keyboard for a question.
+
+    Shows up to MAX_QUESTION_BUTTONS options as inline buttons.
+    If the question has already been answered, returns None.
+
+    Args:
+        content: QuestionContent with questions and options.
+
+    Returns:
+        InlineKeyboardMarkup with option buttons, or None if answered.
+    """
+    # Don't show keyboard for answered questions
+    if content.answers:
+        return None
+
+    # Import aiogram types lazily
+    try:
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    except ImportError:
+        return None
+
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    for q_idx, question in enumerate(content.questions):
+        for opt_idx, option in enumerate(question.options[:MAX_QUESTION_BUTTONS]):
+            # Callback data format: q:{tool_use_id}:{question_idx}:{option_idx}
+            callback_data = f"q:{content.tool_use_id}:{q_idx}:{opt_idx}"
+            # Truncate label to fit Telegram's 64-byte callback_data limit
+            label = option.label
+            if len(label) > 30:
+                label = label[:27] + "..."
+            buttons.append(
+                [InlineKeyboardButton(text=label, callback_data=callback_data)]
+            )
+
+    if not buttons:
+        return None
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def format_question_text(content: QuestionContent) -> str:
+    """Format question text for Telegram display.
+
+    Includes the question header, text, and overflow notice if there
+    are more options than MAX_QUESTION_BUTTONS.
+
+    Args:
+        content: QuestionContent with questions and options.
+
+    Returns:
+        Formatted Telegram Markdown text.
+    """
+    lines: list[str] = []
+
+    for question in content.questions:
+        header = question.header or "Question"
+        lines.append(f"❓ *{escape_markdown(header)}*")
+        lines.append(escape_markdown(question.question))
+
+        # Check for overflow options
+        total_options = len(question.options)
+        if total_options > MAX_QUESTION_BUTTONS:
+            overflow_count = total_options - MAX_QUESTION_BUTTONS
+            lines.append("")
+            lines.append(f"_...and {overflow_count} more option{'s' if overflow_count > 1 else ''} in CLI_")
+        lines.append("")
+
+    lines.append("_(respond in CLI)_")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # TelegramPublisher
 # ---------------------------------------------------------------------------
 
@@ -241,6 +331,7 @@ class TelegramPublisher:
         chat_id: str,
         text: str,
         parse_mode: str = "Markdown",
+        reply_markup: InlineKeyboardMarkup | None = None,
     ) -> int:
         """Send a new message to a chat.
 
@@ -248,6 +339,7 @@ class TelegramPublisher:
             chat_id: Telegram chat ID.
             text: Message text (Markdown formatted).
             parse_mode: Telegram parse mode (default "Markdown").
+            reply_markup: Optional inline keyboard markup.
 
         Returns:
             message_id of the sent message.
@@ -268,6 +360,7 @@ class TelegramPublisher:
                 chat_id=chat_id,
                 text=text,
                 parse_mode=parse_mode,
+                reply_markup=reply_markup,
             )
             return result.message_id
         except TelegramAPIError:
@@ -278,6 +371,7 @@ class TelegramPublisher:
                     chat_id=chat_id,
                     text=text,
                     parse_mode=parse_mode,
+                    reply_markup=reply_markup,
                 )
                 return result.message_id
             except TelegramAPIError as e2:
@@ -290,6 +384,7 @@ class TelegramPublisher:
         message_id: int,
         text: str,
         parse_mode: str = "Markdown",
+        reply_markup: InlineKeyboardMarkup | None = None,
     ) -> bool:
         """Edit an existing message.
 
@@ -298,6 +393,7 @@ class TelegramPublisher:
             message_id: ID of the message to edit.
             text: New message text (Markdown formatted).
             parse_mode: Telegram parse mode (default "Markdown").
+            reply_markup: Optional inline keyboard markup (None to remove keyboard).
 
         Returns:
             True if edited successfully, False if message not found/editable.
@@ -316,6 +412,7 @@ class TelegramPublisher:
                 message_id=message_id,
                 text=text,
                 parse_mode=parse_mode,
+                reply_markup=reply_markup,
             )
             return True
         except TelegramAPIError as e:
@@ -333,6 +430,7 @@ class TelegramPublisher:
                     message_id=message_id,
                     text=text,
                     parse_mode=parse_mode,
+                    reply_markup=reply_markup,
                 )
                 return True
             except TelegramAPIError as e2:

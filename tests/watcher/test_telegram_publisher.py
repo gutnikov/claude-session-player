@@ -8,7 +8,9 @@ import pytest
 from aiogram.exceptions import TelegramAPIError
 from aiogram.methods import GetMe, SendMessage, EditMessageText
 
+from claude_session_player.events import Question, QuestionContent, QuestionOption
 from claude_session_player.watcher.telegram_publisher import (
+    MAX_QUESTION_BUTTONS,
     TelegramAuthError,
     TelegramError,
     TelegramPublisher,
@@ -16,6 +18,8 @@ from claude_session_player.watcher.telegram_publisher import (
     _truncate_message,
     escape_markdown,
     format_context_compacted,
+    format_question_keyboard,
+    format_question_text,
     format_system_message,
     format_turn_message,
     format_user_message,
@@ -418,6 +422,7 @@ class TestTelegramPublisherSendMessage:
             chat_id="123456789",
             text="Hello world",
             parse_mode="Markdown",
+            reply_markup=None,
         )
 
     @pytest.mark.asyncio
@@ -506,6 +511,37 @@ class TestTelegramPublisherSendMessage:
         assert message_id == 123
         assert publisher._validated is True
 
+    @pytest.mark.asyncio
+    async def test_send_message_with_reply_markup(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Successfully sends message with inline keyboard."""
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        mock_result = MagicMock()
+        mock_result.message_id = 123
+        validated_publisher._bot.send_message = AsyncMock(return_value=mock_result)
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Option A", callback_data="q:123:0:0")]
+            ]
+        )
+
+        message_id = await validated_publisher.send_message(
+            chat_id="123456789",
+            text="Choose an option",
+            reply_markup=keyboard,
+        )
+
+        assert message_id == 123
+        validated_publisher._bot.send_message.assert_called_once_with(
+            chat_id="123456789",
+            text="Choose an option",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
 
 class TestTelegramPublisherEditMessage:
     """Tests for TelegramPublisher.edit_message()."""
@@ -535,6 +571,7 @@ class TestTelegramPublisherEditMessage:
             message_id=123,
             text="Updated text",
             parse_mode="Markdown",
+            reply_markup=None,
         )
 
     @pytest.mark.asyncio
@@ -631,6 +668,55 @@ class TestTelegramPublisherEditMessage:
         assert len(sent_text) <= 4096
         assert sent_text.endswith("... [truncated]")
 
+    @pytest.mark.asyncio
+    async def test_edit_message_with_reply_markup(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Successfully edits message with inline keyboard."""
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        validated_publisher._bot.edit_message_text = AsyncMock()
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Option A", callback_data="q:123:0:0")]
+            ]
+        )
+
+        result = await validated_publisher.edit_message(
+            chat_id="123456789",
+            message_id=123,
+            text="Updated with keyboard",
+            reply_markup=keyboard,
+        )
+
+        assert result is True
+        validated_publisher._bot.edit_message_text.assert_called_once_with(
+            chat_id="123456789",
+            message_id=123,
+            text="Updated with keyboard",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+    @pytest.mark.asyncio
+    async def test_edit_message_remove_keyboard(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Removes keyboard by passing None."""
+        validated_publisher._bot.edit_message_text = AsyncMock()
+
+        result = await validated_publisher.edit_message(
+            chat_id="123456789",
+            message_id=123,
+            text="No keyboard",
+            reply_markup=None,
+        )
+
+        assert result is True
+        call_args = validated_publisher._bot.edit_message_text.call_args
+        assert call_args.kwargs["reply_markup"] is None
+
 
 class TestTelegramPublisherClose:
     """Tests for TelegramPublisher.close()."""
@@ -722,3 +808,231 @@ class TestModuleImports:
         assert "format_system_message" in watcher.__all__
         assert "format_context_compacted" in watcher.__all__
         assert "get_tool_icon" in watcher.__all__
+        assert "format_question_keyboard" in watcher.__all__
+        assert "format_question_text" in watcher.__all__
+        assert "MAX_QUESTION_BUTTONS" in watcher.__all__
+
+
+# ---------------------------------------------------------------------------
+# Question keyboard tests
+# ---------------------------------------------------------------------------
+
+
+class TestFormatQuestionKeyboard:
+    """Tests for format_question_keyboard function."""
+
+    def test_single_question_with_options(self) -> None:
+        """Creates keyboard with buttons for each option."""
+        content = QuestionContent(
+            tool_use_id="tool-123",
+            questions=[
+                Question(
+                    question="Which option?",
+                    header="Choose",
+                    options=[
+                        QuestionOption(label="Option A", description="First option"),
+                        QuestionOption(label="Option B", description="Second option"),
+                    ],
+                )
+            ],
+        )
+
+        keyboard = format_question_keyboard(content)
+
+        assert keyboard is not None
+        # Two buttons, one per row
+        assert len(keyboard.inline_keyboard) == 2
+        assert keyboard.inline_keyboard[0][0].text == "Option A"
+        assert keyboard.inline_keyboard[1][0].text == "Option B"
+        # Check callback data format
+        assert keyboard.inline_keyboard[0][0].callback_data == "q:tool-123:0:0"
+        assert keyboard.inline_keyboard[1][0].callback_data == "q:tool-123:0:1"
+
+    def test_truncates_at_max_buttons(self) -> None:
+        """Only shows MAX_QUESTION_BUTTONS options."""
+        options = [
+            QuestionOption(label=f"Option {i}", description=f"Desc {i}")
+            for i in range(10)
+        ]
+        content = QuestionContent(
+            tool_use_id="tool-456",
+            questions=[
+                Question(
+                    question="Pick one",
+                    header="Many options",
+                    options=options,
+                )
+            ],
+        )
+
+        keyboard = format_question_keyboard(content)
+
+        assert keyboard is not None
+        assert len(keyboard.inline_keyboard) == MAX_QUESTION_BUTTONS
+        # Verify only first 5 options are shown
+        for i in range(MAX_QUESTION_BUTTONS):
+            assert keyboard.inline_keyboard[i][0].text == f"Option {i}"
+
+    def test_answered_question_returns_none(self) -> None:
+        """Returns None for answered questions."""
+        content = QuestionContent(
+            tool_use_id="tool-789",
+            questions=[
+                Question(
+                    question="Which?",
+                    header="Q",
+                    options=[
+                        QuestionOption(label="A", description="a"),
+                    ],
+                )
+            ],
+            answers={"Which?": "A"},
+        )
+
+        keyboard = format_question_keyboard(content)
+
+        assert keyboard is None
+
+    def test_truncates_long_labels(self) -> None:
+        """Truncates labels longer than 30 characters."""
+        long_label = "A" * 50
+        content = QuestionContent(
+            tool_use_id="tool-long",
+            questions=[
+                Question(
+                    question="Q",
+                    header="H",
+                    options=[
+                        QuestionOption(label=long_label, description="d"),
+                    ],
+                )
+            ],
+        )
+
+        keyboard = format_question_keyboard(content)
+
+        assert keyboard is not None
+        button_text = keyboard.inline_keyboard[0][0].text
+        assert len(button_text) == 30
+        assert button_text.endswith("...")
+
+    def test_empty_options_returns_none(self) -> None:
+        """Returns None when no options available."""
+        content = QuestionContent(
+            tool_use_id="tool-empty",
+            questions=[
+                Question(
+                    question="Q",
+                    header="H",
+                    options=[],
+                )
+            ],
+        )
+
+        keyboard = format_question_keyboard(content)
+
+        assert keyboard is None
+
+
+class TestFormatQuestionText:
+    """Tests for format_question_text function."""
+
+    def test_basic_question_text(self) -> None:
+        """Formats question with header and text."""
+        content = QuestionContent(
+            tool_use_id="tool-123",
+            questions=[
+                Question(
+                    question="What is your choice?",
+                    header="Permission",
+                    options=[
+                        QuestionOption(label="Yes", description="y"),
+                        QuestionOption(label="No", description="n"),
+                    ],
+                )
+            ],
+        )
+
+        text = format_question_text(content)
+
+        assert "\u2753 *Permission*" in text
+        assert "What is your choice?" in text
+        assert "_(respond in CLI)_" in text
+
+    def test_shows_overflow_message(self) -> None:
+        """Shows overflow message when more than MAX_QUESTION_BUTTONS options."""
+        options = [
+            QuestionOption(label=f"Option {i}", description=f"d{i}")
+            for i in range(8)
+        ]
+        content = QuestionContent(
+            tool_use_id="tool-overflow",
+            questions=[
+                Question(
+                    question="Pick",
+                    header="Many",
+                    options=options,
+                )
+            ],
+        )
+
+        text = format_question_text(content)
+
+        overflow_count = 8 - MAX_QUESTION_BUTTONS
+        assert f"...and {overflow_count} more options in CLI" in text
+
+    def test_singular_overflow_message(self) -> None:
+        """Uses singular 'option' when only one extra."""
+        options = [
+            QuestionOption(label=f"Option {i}", description=f"d{i}")
+            for i in range(MAX_QUESTION_BUTTONS + 1)
+        ]
+        content = QuestionContent(
+            tool_use_id="tool-one-more",
+            questions=[
+                Question(
+                    question="Pick",
+                    header="H",
+                    options=options,
+                )
+            ],
+        )
+
+        text = format_question_text(content)
+
+        assert "...and 1 more option in CLI" in text
+        assert "options" not in text.split("...and 1 more")[1].split("\n")[0]
+
+    def test_escapes_markdown_in_header(self) -> None:
+        """Escapes markdown special chars in header."""
+        content = QuestionContent(
+            tool_use_id="tool-esc",
+            questions=[
+                Question(
+                    question="Q",
+                    header="Use *bold* here",
+                    options=[QuestionOption(label="A", description="a")],
+                )
+            ],
+        )
+
+        text = format_question_text(content)
+
+        assert r"\*bold\*" in text
+
+    def test_default_header(self) -> None:
+        """Uses 'Question' as default header when none provided."""
+        content = QuestionContent(
+            tool_use_id="tool-no-header",
+            questions=[
+                Question(
+                    question="What?",
+                    header="",
+                    options=[QuestionOption(label="A", description="a")],
+                )
+            ],
+        )
+
+        text = format_question_text(content)
+
+        assert "\u2753 *Question*" in text

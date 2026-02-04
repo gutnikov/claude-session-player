@@ -13,6 +13,7 @@ from claude_session_player.watcher.telegram_bot import (
     TelegramBotState,
     TelegramPollingRunner,
     build_webhook_url,
+    create_question_callback_handler,
     delete_telegram_webhook,
     get_bot_info,
     get_webhook_info,
@@ -540,3 +541,67 @@ class TestBotCommandsRegistration:
         assert len(custom_commands) == 2
         assert custom_commands[0].command == "help"
         assert custom_commands[1].command == "status"
+
+
+# ---------------------------------------------------------------------------
+# Question Callback Handler Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateQuestionCallbackHandler:
+    """Tests for create_question_callback_handler function."""
+
+    @pytest.mark.asyncio
+    async def test_handler_answers_question_callback(self) -> None:
+        """Handler answers callback with CLI message."""
+        handler = create_question_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "q:tool-123:0:1"
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_called_once_with(
+            text="Please respond to this question in the Claude CLI",
+            show_alert=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_handler_ignores_non_question_callbacks(self) -> None:
+        """Handler ignores callbacks not starting with q:."""
+        handler = create_question_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "search:page:2"
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handler_ignores_empty_callback_data(self) -> None:
+        """Handler ignores callbacks with no data."""
+        handler = create_question_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = None
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handler_ignores_empty_string_callback_data(self) -> None:
+        """Handler ignores callbacks with empty string data."""
+        handler = create_question_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = ""
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_not_called()

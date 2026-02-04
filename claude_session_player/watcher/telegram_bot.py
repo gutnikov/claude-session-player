@@ -420,6 +420,37 @@ async def shutdown_telegram_bot(state: TelegramBotState) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Question Callback Handler
+# ---------------------------------------------------------------------------
+
+
+def create_question_callback_handler() -> CallbackHandler:
+    """Create a callback handler for question button presses.
+
+    When a user clicks a question option button (callback data starting with "q:"),
+    we show a toast message indicating they should respond in the CLI.
+    This is informational only - actual responses happen in the CLI.
+
+    Returns:
+        Async callback handler function.
+    """
+
+    async def handler(callback: CallbackQuery) -> None:
+        """Handle question button callback."""
+        # Only handle our question callbacks
+        if not callback.data or not callback.data.startswith("q:"):
+            return
+
+        # Show toast notification to user
+        await callback.answer(
+            text="Please respond to this question in the Claude CLI",
+            show_alert=False,
+        )
+
+    return handler
+
+
+# ---------------------------------------------------------------------------
 # Utility Functions
 # ---------------------------------------------------------------------------
 
