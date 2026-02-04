@@ -27,7 +27,12 @@ from claude_session_player.watcher.search_db import (
 from claude_session_player.watcher.indexer import SQLiteSessionIndexer
 from claude_session_player.watcher.debouncer import MessageDebouncer, PendingUpdate
 from claude_session_player.watcher.deps import check_slack_available, check_telegram_available
-from claude_session_player.watcher.destinations import AttachedDestination, DestinationManager
+from claude_session_player.watcher.destinations import (
+    AttachedDestination,
+    DestinationManager,
+    make_telegram_identifier,
+    parse_telegram_identifier,
+)
 from claude_session_player.watcher.event_buffer import EventBuffer, EventBufferManager
 from claude_session_player.watcher.file_watcher import FileWatcher, IncrementalReader
 from claude_session_player.watcher.message_state import (
@@ -107,6 +112,7 @@ __all__ = [
     "format_question_text",
     "IndexConfig",
     "IndexedSession",
+    "make_telegram_identifier",
     "MAX_QUESTION_BUTTONS",
     "migrate_config",
     "delete_telegram_webhook",
@@ -161,6 +167,7 @@ __all__ = [
     "TelegramBotState",
     "TelegramDestination",
     "TelegramError",
+    "parse_telegram_identifier",
     "TelegramPollingRunner",
     "TelegramPublisher",
     "ToolCallInfo",

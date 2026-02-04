@@ -332,14 +332,16 @@ class TelegramPublisher:
         text: str,
         parse_mode: str = "Markdown",
         reply_markup: InlineKeyboardMarkup | None = None,
+        message_thread_id: int | None = None,
     ) -> int:
-        """Send a new message to a chat.
+        """Send a new message to a chat or topic.
 
         Args:
             chat_id: Telegram chat ID.
             text: Message text (Markdown formatted).
             parse_mode: Telegram parse mode (default "Markdown").
             reply_markup: Optional inline keyboard markup.
+            message_thread_id: Topic thread ID for supergroups with topics.
 
         Returns:
             message_id of the sent message.
@@ -361,6 +363,7 @@ class TelegramPublisher:
                 text=text,
                 parse_mode=parse_mode,
                 reply_markup=reply_markup,
+                message_thread_id=message_thread_id,
             )
             return result.message_id
         except TelegramAPIError:
@@ -372,6 +375,7 @@ class TelegramPublisher:
                     text=text,
                     parse_mode=parse_mode,
                     reply_markup=reply_markup,
+                    message_thread_id=message_thread_id,
                 )
                 return result.message_id
             except TelegramAPIError as e2:

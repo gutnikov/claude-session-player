@@ -18,18 +18,39 @@ import yaml
 
 @dataclass
 class TelegramDestination:
-    """A Telegram chat destination for session events."""
+    """A Telegram chat destination for session events.
+
+    Supports supergroup topics via the optional thread_id field.
+    When thread_id is set, messages are sent to that specific topic.
+    """
 
     chat_id: str
+    thread_id: int | None = None
 
     def to_dict(self) -> dict:
         """Serialize to dict for YAML storage."""
-        return {"chat_id": self.chat_id}
+        d = {"chat_id": self.chat_id}
+        if self.thread_id is not None:
+            d["thread_id"] = self.thread_id
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> TelegramDestination:
         """Deserialize from dict."""
-        return cls(chat_id=data["chat_id"])
+        return cls(
+            chat_id=data["chat_id"],
+            thread_id=data.get("thread_id"),
+        )
+
+    @property
+    def identifier(self) -> str:
+        """Combined identifier for tracking.
+
+        Format: chat_id or chat_id:thread_id if topic is specified.
+        """
+        from claude_session_player.watcher.destinations import make_telegram_identifier
+
+        return make_telegram_identifier(self.chat_id, self.thread_id)
 
 
 @dataclass
@@ -841,9 +862,9 @@ class ConfigManager:
 
         # Add destination (idempotent)
         if isinstance(destination, TelegramDestination):
-            # Check if already exists
+            # Check if already exists (match by identifier which includes thread_id)
             for existing in session.destinations.telegram:
-                if existing.chat_id == destination.chat_id:
+                if existing.identifier == destination.identifier:
                     return True  # Already exists
             session.destinations.telegram.append(destination)
         else:  # SlackDestination
@@ -882,13 +903,13 @@ class ConfigManager:
         if session is None:
             return False
 
-        # Remove destination
+        # Remove destination (exact match by identifier which includes thread_id)
         if isinstance(destination, TelegramDestination):
             original_count = len(session.destinations.telegram)
             session.destinations.telegram = [
                 d
                 for d in session.destinations.telegram
-                if d.chat_id != destination.chat_id
+                if d.identifier != destination.identifier
             ]
             if len(session.destinations.telegram) == original_count:
                 return False

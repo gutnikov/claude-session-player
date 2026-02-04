@@ -69,7 +69,12 @@ class MockTelegramBot:
             raise TelegramError("Validation failed")
 
     async def send_message(
-        self, chat_id: str, text: str, parse_mode: str = "Markdown"
+        self,
+        chat_id: str,
+        text: str,
+        parse_mode: str = "Markdown",
+        reply_markup: object = None,
+        message_thread_id: int | None = None,
     ) -> int:
         """Send a message to a chat."""
         if self._should_fail_send:
@@ -81,6 +86,7 @@ class MockTelegramBot:
             "text": text,
             "message_id": message_id,
             "parse_mode": parse_mode,
+            "message_thread_id": message_thread_id,
         })
         return message_id
 

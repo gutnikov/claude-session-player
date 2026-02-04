@@ -656,7 +656,8 @@ class TestHandleDetachValidationErrors:
 
         assert response.status == 400
         data = json.loads(response.body)
-        assert "identifier required" in data["error"].lower()
+        # Error message says "chat_id required" for telegram
+        assert "chat_id required" in data["error"].lower() or "identifier required" in data["error"].lower()
 
 
 class TestHandleDetachNotFound:

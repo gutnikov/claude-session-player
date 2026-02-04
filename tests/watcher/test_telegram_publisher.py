@@ -423,6 +423,7 @@ class TestTelegramPublisherSendMessage:
             text="Hello world",
             parse_mode="Markdown",
             reply_markup=None,
+            message_thread_id=None,
         )
 
     @pytest.mark.asyncio
@@ -540,6 +541,7 @@ class TestTelegramPublisherSendMessage:
             text="Choose an option",
             parse_mode="Markdown",
             reply_markup=keyboard,
+            message_thread_id=None,
         )
 
 

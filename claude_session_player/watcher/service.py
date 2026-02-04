@@ -759,11 +759,16 @@ class WatcherService:
             destination: The destination to send to.
             action: The SendNewMessage action with content.
         """
+        from claude_session_player.watcher.destinations import parse_telegram_identifier
+
         try:
             if destination.type == "telegram" and self.telegram_publisher:
+                # Parse identifier to extract chat_id and optional thread_id
+                chat_id, thread_id = parse_telegram_identifier(destination.identifier)
                 message_id = await self.telegram_publisher.send_message(
-                    chat_id=destination.identifier,
+                    chat_id=chat_id,
                     text=action.content,
+                    message_thread_id=thread_id,
                 )
                 if self.message_state:
                     self.message_state.record_message_id(
@@ -830,10 +835,14 @@ class WatcherService:
 
         # Schedule debounced update
         async def do_update() -> None:
+            from claude_session_player.watcher.destinations import parse_telegram_identifier
+
             try:
                 if destination.type == "telegram" and self.telegram_publisher:
+                    # Parse identifier to extract chat_id (thread_id not needed for edits)
+                    chat_id, _ = parse_telegram_identifier(destination.identifier)
                     await self.telegram_publisher.edit_message(
-                        chat_id=destination.identifier,
+                        chat_id=chat_id,
                         message_id=int(message_id),
                         text=action.content,
                     )
@@ -891,11 +900,16 @@ class WatcherService:
             return 0
 
         # Send catch-up message
+        from claude_session_player.watcher.destinations import parse_telegram_identifier
+
         try:
             if destination_type == "telegram" and self.telegram_publisher:
+                # Parse identifier to extract chat_id and optional thread_id
+                chat_id, thread_id = parse_telegram_identifier(identifier)
                 await self.telegram_publisher.send_message(
-                    chat_id=identifier,
+                    chat_id=chat_id,
                     text=content,
+                    message_thread_id=thread_id,
                 )
             elif destination_type == "slack" and self.slack_publisher:
                 await self.slack_publisher.send_message(
