@@ -197,7 +197,7 @@ class TestTurnState:
 
     def test_create_with_values(self) -> None:
         """Test creating TurnState with values."""
-        from claude_session_player.watcher.telegram_publisher import ToolCallInfo
+        from claude_session_player.watcher.message_state import ToolCallInfo
 
         turn = TurnState(
             turn_id="turn-1",

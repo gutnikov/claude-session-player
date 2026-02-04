@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiogram.exceptions import TelegramAPIError
-from aiogram.methods import GetMe, SendMessage, EditMessageText
+from aiogram.methods import EditMessageText, GetMe, SendMessage
 
 from claude_session_player.events import Question, QuestionContent, QuestionOption
 from claude_session_player.watcher.telegram_publisher import (
@@ -14,16 +14,11 @@ from claude_session_player.watcher.telegram_publisher import (
     TelegramAuthError,
     TelegramError,
     TelegramPublisher,
-    ToolCallInfo,
     _truncate_message,
+    escape_html,
     escape_markdown,
-    format_context_compacted,
     format_question_keyboard,
     format_question_text,
-    format_system_message,
-    format_turn_message,
-    format_user_message,
-    get_tool_icon,
 )
 
 
@@ -44,6 +39,39 @@ def make_telegram_api_error(message: str, method_type: str = "send") -> Telegram
     else:
         method = SendMessage(chat_id=0, text="")
     return TelegramAPIError(method=method, message=message)
+
+
+# ---------------------------------------------------------------------------
+# HTML escaping tests
+# ---------------------------------------------------------------------------
+
+
+class TestEscapeHtml:
+    """Tests for escape_html function."""
+
+    def test_escapes_ampersand(self) -> None:
+        """Ampersands are escaped."""
+        assert escape_html("hello & world") == "hello &amp; world"
+
+    def test_escapes_less_than(self) -> None:
+        """Less-than signs are escaped."""
+        assert escape_html("a < b") == "a &lt; b"
+
+    def test_escapes_greater_than(self) -> None:
+        """Greater-than signs are escaped."""
+        assert escape_html("a > b") == "a &gt; b"
+
+    def test_escapes_multiple_chars(self) -> None:
+        """Multiple HTML chars are escaped."""
+        assert escape_html("<a>&</a>") == "&lt;a&gt;&amp;&lt;/a&gt;"
+
+    def test_preserves_normal_text(self) -> None:
+        """Normal text is preserved."""
+        assert escape_html("hello world") == "hello world"
+
+    def test_empty_string(self) -> None:
+        """Empty string returns empty."""
+        assert escape_html("") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -81,194 +109,6 @@ class TestEscapeMarkdown:
     def test_empty_string(self) -> None:
         """Empty string returns empty."""
         assert escape_markdown("") == ""
-
-
-# ---------------------------------------------------------------------------
-# Tool icon tests
-# ---------------------------------------------------------------------------
-
-
-class TestGetToolIcon:
-    """Tests for get_tool_icon function."""
-
-    def test_read_icon(self) -> None:
-        """Read tool has book icon."""
-        assert get_tool_icon("Read") == "\U0001f4d6"
-
-    def test_write_icon(self) -> None:
-        """Write tool has memo icon."""
-        assert get_tool_icon("Write") == "\U0001f4dd"
-
-    def test_edit_icon(self) -> None:
-        """Edit tool has pencil icon."""
-        assert get_tool_icon("Edit") == "\u270f\ufe0f"
-
-    def test_bash_icon(self) -> None:
-        """Bash tool has wrench icon."""
-        assert get_tool_icon("Bash") == "\U0001f527"
-
-    def test_task_icon(self) -> None:
-        """Task tool has robot icon."""
-        assert get_tool_icon("Task") == "\U0001f916"
-
-    def test_unknown_tool_icon(self) -> None:
-        """Unknown tool gets gear icon."""
-        assert get_tool_icon("UnknownTool") == "\u2699\ufe0f"
-
-
-# ---------------------------------------------------------------------------
-# Message formatting tests
-# ---------------------------------------------------------------------------
-
-
-class TestFormatUserMessage:
-    """Tests for format_user_message function."""
-
-    def test_basic_message(self) -> None:
-        """Formats basic user message."""
-        result = format_user_message("Hello world")
-        assert result == "\U0001f464 *User*\n\nHello world"
-
-    def test_escapes_markdown(self) -> None:
-        """Escapes markdown in user text."""
-        result = format_user_message("Hello *world*")
-        assert r"\*world\*" in result
-
-    def test_multiline_message(self) -> None:
-        """Handles multiline message."""
-        result = format_user_message("Line 1\nLine 2")
-        assert "Line 1\nLine 2" in result
-
-
-class TestFormatTurnMessage:
-    """Tests for format_turn_message function."""
-
-    def test_assistant_text_only(self) -> None:
-        """Formats turn with assistant text only."""
-        result = format_turn_message(
-            assistant_text="Hello world",
-            tool_calls=[],
-            duration_ms=None,
-        )
-        assert "\U0001f916 *Assistant*" in result
-        assert "Hello world" in result
-
-    def test_with_duration(self) -> None:
-        """Includes duration footer."""
-        result = format_turn_message(
-            assistant_text="Hello",
-            tool_calls=[],
-            duration_ms=5000,
-        )
-        assert "5.0s" in result
-        assert "\u23f1" in result  # Timer emoji
-
-    def test_with_tool_call(self) -> None:
-        """Formats tool call."""
-        result = format_turn_message(
-            assistant_text=None,
-            tool_calls=[
-                ToolCallInfo(
-                    name="Read",
-                    label="file.txt",
-                    icon="\U0001f4d6",
-                    result="contents",
-                    is_error=False,
-                )
-            ],
-            duration_ms=None,
-        )
-        assert "*Read*" in result
-        assert "`file.txt`" in result
-        assert "\u2713 contents" in result
-
-    def test_tool_call_with_error(self) -> None:
-        """Formats tool call error."""
-        result = format_turn_message(
-            assistant_text=None,
-            tool_calls=[
-                ToolCallInfo(
-                    name="Bash",
-                    label="ls -la",
-                    icon="\U0001f527",
-                    result=None,
-                    is_error=True,
-                )
-            ],
-            duration_ms=None,
-        )
-        assert "\u2717 Error" in result
-
-    def test_multiple_tool_calls(self) -> None:
-        """Handles multiple tool calls."""
-        result = format_turn_message(
-            assistant_text=None,
-            tool_calls=[
-                ToolCallInfo(
-                    name="Read", label="a.txt", icon="\U0001f4d6", result="a", is_error=False
-                ),
-                ToolCallInfo(
-                    name="Read", label="b.txt", icon="\U0001f4d6", result="b", is_error=False
-                ),
-            ],
-            duration_ms=None,
-        )
-        assert "a.txt" in result
-        assert "b.txt" in result
-        # Dividers between tools
-        assert result.count("\u2500\u2500\u2500") >= 2
-
-    def test_truncates_long_tool_result(self) -> None:
-        """Truncates long tool results."""
-        long_result = "x" * 600
-        result = format_turn_message(
-            assistant_text=None,
-            tool_calls=[
-                ToolCallInfo(
-                    name="Read",
-                    label="big.txt",
-                    icon="\U0001f4d6",
-                    result=long_result,
-                    is_error=False,
-                )
-            ],
-            duration_ms=None,
-        )
-        assert "..." in result
-        # Should be truncated to 500 chars
-        assert len(result) < len(long_result) + 200
-
-    def test_escapes_assistant_text(self) -> None:
-        """Escapes markdown in assistant text."""
-        result = format_turn_message(
-            assistant_text="Hello _world_",
-            tool_calls=[],
-            duration_ms=None,
-        )
-        assert r"\_world\_" in result
-
-
-class TestFormatSystemMessage:
-    """Tests for format_system_message function."""
-
-    def test_basic_system_message(self) -> None:
-        """Formats system message."""
-        result = format_system_message("Session started")
-        assert result == "\u26a1 *Session started*"
-
-    def test_escapes_markdown(self) -> None:
-        """Escapes markdown in system text."""
-        result = format_system_message("Error: _failed_")
-        assert r"\_failed\_" in result
-
-
-class TestFormatContextCompacted:
-    """Tests for format_context_compacted function."""
-
-    def test_compaction_message(self) -> None:
-        """Returns context compacted message."""
-        result = format_context_compacted()
-        assert result == "\u26a1 *Context compacted* \u2014 previous messages cleared"
 
 
 # ---------------------------------------------------------------------------
@@ -358,10 +198,11 @@ class TestTelegramPublisherValidate:
         mock_me.username = "test_bot"
         mock_bot.get_me = AsyncMock(return_value=mock_me)
 
-        with patch("claude_session_player.watcher.telegram_publisher.check_telegram_available", return_value=True):
-            with patch(
-                "aiogram.Bot", return_value=mock_bot
-            ):
+        with patch(
+            "claude_session_player.watcher.telegram_publisher.check_telegram_available",
+            return_value=True,
+        ):
+            with patch("aiogram.Bot", return_value=mock_bot):
                 await publisher.validate()
 
         assert publisher._validated is True
@@ -377,10 +218,11 @@ class TestTelegramPublisherValidate:
             side_effect=make_telegram_api_error("Unauthorized", "get_me")
         )
 
-        with patch("claude_session_player.watcher.telegram_publisher.check_telegram_available", return_value=True):
-            with patch(
-                "aiogram.Bot", return_value=mock_bot
-            ):
+        with patch(
+            "claude_session_player.watcher.telegram_publisher.check_telegram_available",
+            return_value=True,
+        ):
+            with patch("aiogram.Bot", return_value=mock_bot):
                 with pytest.raises(TelegramAuthError, match="validation failed"):
                     await publisher.validate()
 
@@ -389,7 +231,10 @@ class TestTelegramPublisherValidate:
         """Raises TelegramError if aiogram not installed."""
         publisher = TelegramPublisher(token="test-token")
 
-        with patch("claude_session_player.watcher.telegram_publisher.check_telegram_available", return_value=False):
+        with patch(
+            "claude_session_player.watcher.telegram_publisher.check_telegram_available",
+            return_value=False,
+        ):
             with pytest.raises(TelegramError, match="aiogram library not installed"):
                 await publisher.validate()
 
@@ -406,7 +251,9 @@ class TestTelegramPublisherSendMessage:
         return publisher
 
     @pytest.mark.asyncio
-    async def test_send_message_success(self, validated_publisher: TelegramPublisher) -> None:
+    async def test_send_message_success(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
         """Successfully sends message."""
         mock_result = MagicMock()
         mock_result.message_id = 123
@@ -421,7 +268,7 @@ class TestTelegramPublisherSendMessage:
         validated_publisher._bot.send_message.assert_called_once_with(
             chat_id="123456789",
             text="Hello world",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=None,
             message_thread_id=None,
         )
@@ -502,7 +349,10 @@ class TestTelegramPublisherSendMessage:
         mock_result.message_id = 123
         mock_bot.send_message = AsyncMock(return_value=mock_result)
 
-        with patch("claude_session_player.watcher.telegram_publisher.check_telegram_available", return_value=True):
+        with patch(
+            "claude_session_player.watcher.telegram_publisher.check_telegram_available",
+            return_value=True,
+        ):
             with patch("aiogram.Bot", return_value=mock_bot):
                 message_id = await publisher.send_message(
                     chat_id="123456789",
@@ -539,9 +389,33 @@ class TestTelegramPublisherSendMessage:
         validated_publisher._bot.send_message.assert_called_once_with(
             chat_id="123456789",
             text="Choose an option",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=keyboard,
             message_thread_id=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_message_with_thread_id(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Successfully sends message to a topic thread."""
+        mock_result = MagicMock()
+        mock_result.message_id = 123
+        validated_publisher._bot.send_message = AsyncMock(return_value=mock_result)
+
+        message_id = await validated_publisher.send_message(
+            chat_id="123456789",
+            text="Hello",
+            message_thread_id=42,
+        )
+
+        assert message_id == 123
+        validated_publisher._bot.send_message.assert_called_once_with(
+            chat_id="123456789",
+            text="Hello",
+            parse_mode="HTML",
+            reply_markup=None,
+            message_thread_id=42,
         )
 
 
@@ -557,7 +431,9 @@ class TestTelegramPublisherEditMessage:
         return publisher
 
     @pytest.mark.asyncio
-    async def test_edit_message_success(self, validated_publisher: TelegramPublisher) -> None:
+    async def test_edit_message_success(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
         """Successfully edits message."""
         validated_publisher._bot.edit_message_text = AsyncMock()
 
@@ -572,7 +448,7 @@ class TestTelegramPublisherEditMessage:
             chat_id="123456789",
             message_id=123,
             text="Updated text",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=None,
         )
 
@@ -697,7 +573,7 @@ class TestTelegramPublisherEditMessage:
             chat_id="123456789",
             message_id=123,
             text="Updated with keyboard",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=keyboard,
         )
 
@@ -718,6 +594,192 @@ class TestTelegramPublisherEditMessage:
         assert result is True
         call_args = validated_publisher._bot.edit_message_text.call_args
         assert call_args.kwargs["reply_markup"] is None
+
+
+# ---------------------------------------------------------------------------
+# Session message tests
+# ---------------------------------------------------------------------------
+
+
+class TestTelegramPublisherSendSessionMessage:
+    """Tests for TelegramPublisher.send_session_message()."""
+
+    @pytest.fixture
+    def validated_publisher(self) -> TelegramPublisher:
+        """Create a pre-validated publisher with mock bot."""
+        publisher = TelegramPublisher(token="test-token")
+        publisher._validated = True
+        publisher._bot = MagicMock()
+        return publisher
+
+    @pytest.mark.asyncio
+    async def test_send_session_message_wraps_in_pre(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Wraps content in <pre> tags with HTML escaping."""
+        mock_result = MagicMock()
+        mock_result.message_id = 123
+        validated_publisher._bot.send_message = AsyncMock(return_value=mock_result)
+
+        message_id = await validated_publisher.send_session_message(
+            chat_id="123456789",
+            content="Hello <world> & friends",
+        )
+
+        assert message_id == 123
+        call_args = validated_publisher._bot.send_message.call_args
+        assert call_args.kwargs["text"] == "<pre>Hello &lt;world&gt; &amp; friends</pre>"
+        assert call_args.kwargs["parse_mode"] == "HTML"
+
+    @pytest.mark.asyncio
+    async def test_send_session_message_with_thread_id(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Passes thread_id to send_message."""
+        mock_result = MagicMock()
+        mock_result.message_id = 123
+        validated_publisher._bot.send_message = AsyncMock(return_value=mock_result)
+
+        message_id = await validated_publisher.send_session_message(
+            chat_id="123456789",
+            content="Hello",
+            thread_id=42,
+        )
+
+        assert message_id == 123
+        call_args = validated_publisher._bot.send_message.call_args
+        assert call_args.kwargs["message_thread_id"] == 42
+
+
+class TestTelegramPublisherUpdateSessionMessage:
+    """Tests for TelegramPublisher.update_session_message()."""
+
+    @pytest.fixture
+    def validated_publisher(self) -> TelegramPublisher:
+        """Create a pre-validated publisher with mock bot."""
+        publisher = TelegramPublisher(token="test-token")
+        publisher._validated = True
+        publisher._bot = MagicMock()
+        return publisher
+
+    @pytest.mark.asyncio
+    async def test_update_session_message_wraps_in_pre(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Wraps content in <pre> tags with HTML escaping."""
+        validated_publisher._bot.edit_message_text = AsyncMock()
+
+        result = await validated_publisher.update_session_message(
+            chat_id="123456789",
+            message_id=123,
+            content="Updated <content> & more",
+        )
+
+        assert result is True
+        call_args = validated_publisher._bot.edit_message_text.call_args
+        assert (
+            call_args.kwargs["text"] == "<pre>Updated &lt;content&gt; &amp; more</pre>"
+        )
+        assert call_args.kwargs["parse_mode"] == "HTML"
+
+    @pytest.mark.asyncio
+    async def test_update_session_message_returns_false_on_not_found(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Returns False when message not found."""
+        validated_publisher._bot.edit_message_text = AsyncMock(
+            side_effect=make_telegram_api_error("message to edit not found", "edit")
+        )
+
+        result = await validated_publisher.update_session_message(
+            chat_id="123456789",
+            message_id=123,
+            content="Updated",
+        )
+
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Question message tests
+# ---------------------------------------------------------------------------
+
+
+class TestTelegramPublisherSendQuestion:
+    """Tests for TelegramPublisher.send_question()."""
+
+    @pytest.fixture
+    def validated_publisher(self) -> TelegramPublisher:
+        """Create a pre-validated publisher with mock bot."""
+        publisher = TelegramPublisher(token="test-token")
+        publisher._validated = True
+        publisher._bot = MagicMock()
+        return publisher
+
+    @pytest.mark.asyncio
+    async def test_send_question_with_keyboard(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Sends question with inline keyboard buttons."""
+        mock_result = MagicMock()
+        mock_result.message_id = 123
+        validated_publisher._bot.send_message = AsyncMock(return_value=mock_result)
+
+        content = QuestionContent(
+            tool_use_id="tool-123",
+            questions=[
+                Question(
+                    question="Which option?",
+                    header="Choose",
+                    options=[
+                        QuestionOption(label="Option A", description="First"),
+                        QuestionOption(label="Option B", description="Second"),
+                    ],
+                )
+            ],
+        )
+
+        message_id = await validated_publisher.send_question(
+            chat_id="123456789",
+            content=content,
+        )
+
+        assert message_id == 123
+        call_args = validated_publisher._bot.send_message.call_args
+        assert call_args.kwargs["parse_mode"] == "HTML"
+        assert call_args.kwargs["reply_markup"] is not None
+        # Check keyboard has buttons
+        keyboard = call_args.kwargs["reply_markup"]
+        assert len(keyboard.inline_keyboard) == 2
+
+    @pytest.mark.asyncio
+    async def test_send_question_with_thread_id(
+        self, validated_publisher: TelegramPublisher
+    ) -> None:
+        """Passes thread_id when sending question."""
+        mock_result = MagicMock()
+        mock_result.message_id = 123
+        validated_publisher._bot.send_message = AsyncMock(return_value=mock_result)
+
+        content = QuestionContent(
+            tool_use_id="tool-123",
+            questions=[
+                Question(
+                    question="Q?",
+                    header="H",
+                    options=[QuestionOption(label="A", description="a")],
+                )
+            ],
+        )
+
+        await validated_publisher.send_question(
+            chat_id="123456789",
+            content=content,
+            thread_id=42,
+        )
+
+        call_args = validated_publisher._bot.send_message.call_args
+        assert call_args.kwargs["message_thread_id"] == 42
 
 
 class TestTelegramPublisherClose:
@@ -772,29 +834,21 @@ class TestModuleImports:
         assert TE is TelegramError
         assert TAE is TelegramAuthError
 
-    def test_import_formatting_functions_from_watcher(self) -> None:
-        """Can import formatting functions from watcher package."""
-        from claude_session_player.watcher import (
-            escape_markdown as em,
-            format_context_compacted as fcc,
-            format_system_message as fsm,
-            format_turn_message as ftm,
-            format_user_message as fum,
-            get_tool_icon as gti,
-        )
+    def test_import_escape_functions_from_watcher(self) -> None:
+        """Can import escape functions from watcher package."""
+        from claude_session_player.watcher import escape_html as eh
+        from claude_session_player.watcher import escape_markdown as em
 
+        assert eh is escape_html
         assert em is escape_markdown
-        assert fcc is format_context_compacted
-        assert fsm is format_system_message
-        assert ftm is format_turn_message
-        assert fum is format_user_message
-        assert gti is get_tool_icon
 
-    def test_import_tool_call_info_from_watcher(self) -> None:
-        """Can import ToolCallInfo from watcher package."""
-        from claude_session_player.watcher import ToolCallInfo as TCI
+    def test_import_question_functions_from_watcher(self) -> None:
+        """Can import question formatting functions from watcher package."""
+        from claude_session_player.watcher import format_question_keyboard as fqk
+        from claude_session_player.watcher import format_question_text as fqt
 
-        assert TCI is ToolCallInfo
+        assert fqk is format_question_keyboard
+        assert fqt is format_question_text
 
     def test_exports_in_all(self) -> None:
         """All exports are in __all__."""
@@ -803,13 +857,8 @@ class TestModuleImports:
         assert "TelegramPublisher" in watcher.__all__
         assert "TelegramError" in watcher.__all__
         assert "TelegramAuthError" in watcher.__all__
-        assert "ToolCallInfo" in watcher.__all__
+        assert "escape_html" in watcher.__all__
         assert "escape_markdown" in watcher.__all__
-        assert "format_user_message" in watcher.__all__
-        assert "format_turn_message" in watcher.__all__
-        assert "format_system_message" in watcher.__all__
-        assert "format_context_compacted" in watcher.__all__
-        assert "get_tool_icon" in watcher.__all__
         assert "format_question_keyboard" in watcher.__all__
         assert "format_question_text" in watcher.__all__
         assert "MAX_QUESTION_BUTTONS" in watcher.__all__
@@ -940,7 +989,7 @@ class TestFormatQuestionText:
     """Tests for format_question_text function."""
 
     def test_basic_question_text(self) -> None:
-        """Formats question with header and text."""
+        """Formats question with header and text in HTML."""
         content = QuestionContent(
             tool_use_id="tool-123",
             questions=[
@@ -957,15 +1006,14 @@ class TestFormatQuestionText:
 
         text = format_question_text(content)
 
-        assert "\u2753 *Permission*" in text
-        assert "What is your choice?" in text
-        assert "_(respond in CLI)_" in text
+        assert "<b>❓ Permission</b>" in text
+        assert "<pre>What is your choice?</pre>" in text
+        assert "<i>(respond in CLI)</i>" in text
 
     def test_shows_overflow_message(self) -> None:
         """Shows overflow message when more than MAX_QUESTION_BUTTONS options."""
         options = [
-            QuestionOption(label=f"Option {i}", description=f"d{i}")
-            for i in range(8)
+            QuestionOption(label=f"Option {i}", description=f"d{i}") for i in range(8)
         ]
         content = QuestionContent(
             tool_use_id="tool-overflow",
@@ -1005,14 +1053,14 @@ class TestFormatQuestionText:
         assert "...and 1 more option in CLI" in text
         assert "options" not in text.split("...and 1 more")[1].split("\n")[0]
 
-    def test_escapes_markdown_in_header(self) -> None:
-        """Escapes markdown special chars in header."""
+    def test_escapes_html_in_header(self) -> None:
+        """Escapes HTML special chars in header."""
         content = QuestionContent(
             tool_use_id="tool-esc",
             questions=[
                 Question(
                     question="Q",
-                    header="Use *bold* here",
+                    header="Use <tag> here",
                     options=[QuestionOption(label="A", description="a")],
                 )
             ],
@@ -1020,7 +1068,7 @@ class TestFormatQuestionText:
 
         text = format_question_text(content)
 
-        assert r"\*bold\*" in text
+        assert "&lt;tag&gt;" in text
 
     def test_default_header(self) -> None:
         """Uses 'Question' as default header when none provided."""
@@ -1037,4 +1085,4 @@ class TestFormatQuestionText:
 
         text = format_question_text(content)
 
-        assert "\u2753 *Question*" in text
+        assert "<b>❓ Question</b>" in text

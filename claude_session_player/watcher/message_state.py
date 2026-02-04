@@ -30,14 +30,7 @@ from claude_session_player.events import (
     UpdateBlock,
     UserContent,
 )
-from claude_session_player.watcher.telegram_publisher import (
-    ToolCallInfo,
-    format_context_compacted,
-    format_system_message,
-    format_turn_message,
-    format_user_message,
-    get_tool_icon,
-)
+from claude_session_player.watcher.telegram_publisher import escape_html
 from claude_session_player.watcher.slack_publisher import (
     ToolCallInfo as SlackToolCallInfo,
     format_answered_question_blocks,
@@ -48,6 +41,105 @@ from claude_session_player.watcher.slack_publisher import (
     format_user_message_blocks,
     get_tool_icon as slack_get_tool_icon,
 )
+
+
+# ---------------------------------------------------------------------------
+# Telegram Formatting Utilities (local to message_state)
+# ---------------------------------------------------------------------------
+
+# Box drawing characters for terminal look
+BOX_H = "─"  # horizontal
+
+# Tool name to icon mapping
+_TOOL_ICONS = {
+    "Read": "📖",
+    "Write": "📝",
+    "Edit": "✏️",
+    "Bash": "🔧",
+    "Glob": "🔍",
+    "Grep": "🔍",
+    "Task": "🤖",
+    "WebSearch": "🌐",
+    "WebFetch": "🌐",
+}
+
+
+def get_tool_icon(tool_name: str) -> str:
+    """Get the icon for a tool name."""
+    return _TOOL_ICONS.get(tool_name, "⚙️")
+
+
+@dataclass
+class ToolCallInfo:
+    """Information about a tool call for formatting."""
+
+    name: str
+    label: str
+    icon: str
+    result: str | None = None
+    is_error: bool = False
+
+
+def format_user_message(text: str) -> str:
+    """Format a user message for Telegram in terminal style."""
+    escaped = escape_html(text)
+    return f"<b>👤 User</b>\n<pre>{escaped}</pre>"
+
+
+def format_turn_message(
+    assistant_text: str | None,
+    tool_calls: list[ToolCallInfo],
+    duration_ms: int | None,
+    thinking_text: str | None = None,
+) -> str:
+    """Format a complete turn message for Telegram in terminal style."""
+    parts: list[str] = []
+
+    # Thinking block (if present)
+    if thinking_text:
+        truncated = thinking_text[:200]
+        if len(thinking_text) > 200:
+            truncated += "..."
+        parts.append(f"<b>💭 Thinking</b>\n<pre>{escape_html(truncated)}</pre>\n")
+
+    # Assistant header
+    parts.append("<b>🤖 Assistant</b>")
+
+    # Assistant text
+    if assistant_text:
+        escaped = escape_html(assistant_text)
+        parts.append(f"\n<pre>{escaped}</pre>")
+
+    # Tool calls
+    for tool in tool_calls:
+        parts.append(f"\n\n{BOX_H * 30}")
+        parts.append(f"\n<b>{tool.icon} {escape_html(tool.name)}</b> <code>{escape_html(tool.label)}</code>")
+        if tool.result:
+            result = tool.result[:500]
+            if len(tool.result) > 500:
+                result += "..."
+            result = escape_html(result)
+            prefix = "✗" if tool.is_error else "✓"
+            parts.append(f"\n<pre>{prefix} {result}</pre>")
+        elif tool.is_error:
+            parts.append("\n<pre>✗ Error</pre>")
+
+    # Duration
+    if duration_ms:
+        seconds = duration_ms / 1000
+        parts.append(f"\n\n<code>⏱ {seconds:.1f}s</code>")
+
+    return "".join(parts)
+
+
+def format_system_message(text: str) -> str:
+    """Format a system message for Telegram in terminal style."""
+    return f"<b>⚡ System</b>\n<pre>{escape_html(text)}</pre>"
+
+
+def format_context_compacted() -> str:
+    """Format context compaction notice for Telegram in terminal style."""
+    return f"<b>⚡ Context compacted</b>\n<pre>{BOX_H * 30}\nPrevious messages cleared\n{BOX_H * 30}</pre>"
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from claude_session_player.watcher.deps import check_telegram_available
@@ -36,12 +35,25 @@ class TelegramAuthError(TelegramError):
 
 
 # ---------------------------------------------------------------------------
-# Message Formatting Utilities
+# HTML Escaping Utilities
 # ---------------------------------------------------------------------------
 
 
-# Characters that need escaping in Telegram Markdown V1
-# Reference: https://core.telegram.org/bots/api#markdown-style
+def escape_html(text: str) -> str:
+    """Escape HTML special characters for Telegram HTML mode.
+
+    Escapes: & < >
+
+    Args:
+        text: Raw text to escape.
+
+    Returns:
+        Text with HTML entities escaped.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# Legacy markdown escape for backwards compatibility
 _MARKDOWN_ESCAPE_CHARS = re.compile(r"([_*`\[])")
 
 
@@ -57,117 +69,6 @@ def escape_markdown(text: str) -> str:
         Text with special characters escaped.
     """
     return _MARKDOWN_ESCAPE_CHARS.sub(r"\\\1", text)
-
-
-@dataclass
-class ToolCallInfo:
-    """Information about a tool call for formatting."""
-
-    name: str
-    label: str
-    icon: str
-    result: str | None = None
-    is_error: bool = False
-
-
-# Tool name to icon mapping
-_TOOL_ICONS = {
-    "Read": "📖",
-    "Write": "📝",
-    "Edit": "✏️",
-    "Bash": "🔧",
-    "Glob": "🔍",
-    "Grep": "🔍",
-    "Task": "🤖",
-    "WebSearch": "🌐",
-    "WebFetch": "🌐",
-}
-
-
-def get_tool_icon(tool_name: str) -> str:
-    """Get the icon for a tool name.
-
-    Args:
-        tool_name: Name of the tool.
-
-    Returns:
-        Emoji icon for the tool.
-    """
-    return _TOOL_ICONS.get(tool_name, "⚙️")
-
-
-def format_user_message(text: str) -> str:
-    """Format a user message for Telegram.
-
-    Args:
-        text: User message text.
-
-    Returns:
-        Formatted Telegram Markdown message.
-    """
-    escaped = escape_markdown(text)
-    return f"👤 *User*\n\n{escaped}"
-
-
-def format_turn_message(
-    assistant_text: str | None,
-    tool_calls: list[ToolCallInfo],
-    duration_ms: int | None,
-) -> str:
-    """Format a complete turn message for Telegram.
-
-    Args:
-        assistant_text: Optional assistant response text.
-        tool_calls: List of tool call information.
-        duration_ms: Optional turn duration in milliseconds.
-
-    Returns:
-        Formatted Telegram Markdown message.
-    """
-    parts = ["🤖 *Assistant*"]
-
-    if assistant_text:
-        parts.append(f"\n\n{escape_markdown(assistant_text)}")
-
-    for tool in tool_calls:
-        parts.append("\n\n───────────────")
-        parts.append(f"\n{tool.icon} *{escape_markdown(tool.name)}* `{escape_markdown(tool.label)}`")
-        if tool.result:
-            # Truncate long results
-            result = tool.result[:500]
-            if len(tool.result) > 500:
-                result += "..."
-            result = escape_markdown(result)
-            parts.append(f"\n✓ {result}")
-        elif tool.is_error:
-            parts.append("\n✗ Error")
-
-    if duration_ms:
-        seconds = duration_ms / 1000
-        parts.append(f"\n\n_⏱ {seconds:.1f}s_")
-
-    return "".join(parts)
-
-
-def format_system_message(text: str) -> str:
-    """Format a system message for Telegram.
-
-    Args:
-        text: System message text.
-
-    Returns:
-        Formatted Telegram Markdown message.
-    """
-    return f"⚡ *{escape_markdown(text)}*"
-
-
-def format_context_compacted() -> str:
-    """Format context compaction notice for Telegram.
-
-    Returns:
-        Formatted Telegram Markdown message.
-    """
-    return "⚡ *Context compacted* — previous messages cleared"
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +125,7 @@ def format_question_keyboard(
 
 
 def format_question_text(content: QuestionContent) -> str:
-    """Format question text for Telegram display.
+    """Format question text for Telegram display in terminal style.
 
     Includes the question header, text, and overflow notice if there
     are more options than MAX_QUESTION_BUTTONS.
@@ -233,24 +134,23 @@ def format_question_text(content: QuestionContent) -> str:
         content: QuestionContent with questions and options.
 
     Returns:
-        Formatted Telegram Markdown text.
+        Formatted Telegram HTML text.
     """
     lines: list[str] = []
 
     for question in content.questions:
         header = question.header or "Question"
-        lines.append(f"❓ *{escape_markdown(header)}*")
-        lines.append(escape_markdown(question.question))
+        lines.append(f"<b>❓ {escape_html(header)}</b>")
+        lines.append(f"<pre>{escape_html(question.question)}</pre>")
 
         # Check for overflow options
         total_options = len(question.options)
         if total_options > MAX_QUESTION_BUTTONS:
             overflow_count = total_options - MAX_QUESTION_BUTTONS
-            lines.append("")
-            lines.append(f"_...and {overflow_count} more option{'s' if overflow_count > 1 else ''} in CLI_")
+            lines.append(f"<i>...and {overflow_count} more option{'s' if overflow_count > 1 else ''} in CLI</i>")
         lines.append("")
 
-    lines.append("_(respond in CLI)_")
+    lines.append("<i>(respond in CLI)</i>")
     return "\n".join(lines)
 
 
@@ -330,7 +230,7 @@ class TelegramPublisher:
         self,
         chat_id: str,
         text: str,
-        parse_mode: str = "Markdown",
+        parse_mode: str = "HTML",
         reply_markup: InlineKeyboardMarkup | None = None,
         message_thread_id: int | None = None,
     ) -> int:
@@ -338,8 +238,8 @@ class TelegramPublisher:
 
         Args:
             chat_id: Telegram chat ID.
-            text: Message text (Markdown formatted).
-            parse_mode: Telegram parse mode (default "Markdown").
+            text: Message text (HTML formatted by default).
+            parse_mode: Telegram parse mode (default "HTML" for terminal style).
             reply_markup: Optional inline keyboard markup.
             message_thread_id: Topic thread ID for supergroups with topics.
 
@@ -387,7 +287,7 @@ class TelegramPublisher:
         chat_id: str,
         message_id: int,
         text: str,
-        parse_mode: str = "Markdown",
+        parse_mode: str = "HTML",
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> bool:
         """Edit an existing message.
@@ -395,8 +295,8 @@ class TelegramPublisher:
         Args:
             chat_id: Telegram chat ID.
             message_id: ID of the message to edit.
-            text: New message text (Markdown formatted).
-            parse_mode: Telegram parse mode (default "Markdown").
+            text: New message text (HTML formatted by default).
+            parse_mode: Telegram parse mode (default "HTML" for terminal style).
             reply_markup: Optional inline keyboard markup (None to remove keyboard).
 
         Returns:
@@ -440,6 +340,86 @@ class TelegramPublisher:
             except TelegramAPIError as e2:
                 logger.warning(f"Failed to edit Telegram message {message_id}: {e2}")
                 return False
+
+    async def send_session_message(
+        self,
+        chat_id: str,
+        content: str,
+        thread_id: int | None = None,
+    ) -> int:
+        """Send pre-rendered session content wrapped in <pre> tags.
+
+        Args:
+            chat_id: Telegram chat ID.
+            content: Pre-rendered session content (plain text).
+            thread_id: Topic thread ID for supergroups with topics.
+
+        Returns:
+            message_id of the sent message.
+
+        Raises:
+            TelegramError: On API failure after retry.
+        """
+        html_text = f"<pre>{escape_html(content)}</pre>"
+        return await self.send_message(
+            chat_id=chat_id,
+            text=html_text,
+            parse_mode="HTML",
+            message_thread_id=thread_id,
+        )
+
+    async def update_session_message(
+        self,
+        chat_id: str,
+        message_id: int,
+        content: str,
+    ) -> bool:
+        """Update pre-rendered session content wrapped in <pre> tags.
+
+        Args:
+            chat_id: Telegram chat ID.
+            message_id: ID of the message to edit.
+            content: Pre-rendered session content (plain text).
+
+        Returns:
+            True if edited successfully, False if message not found/editable.
+        """
+        html_text = f"<pre>{escape_html(content)}</pre>"
+        return await self.edit_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=html_text,
+            parse_mode="HTML",
+        )
+
+    async def send_question(
+        self,
+        chat_id: str,
+        content: QuestionContent,
+        thread_id: int | None = None,
+    ) -> int:
+        """Send a question with inline keyboard buttons.
+
+        Args:
+            chat_id: Telegram chat ID.
+            content: QuestionContent with question text and options.
+            thread_id: Topic thread ID for supergroups with topics.
+
+        Returns:
+            message_id of the sent message.
+
+        Raises:
+            TelegramError: On API failure after retry.
+        """
+        text = format_question_text(content)
+        keyboard = format_question_keyboard(content)
+        return await self.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+            message_thread_id=thread_id,
+        )
 
     async def close(self) -> None:
         """Close the bot session."""
