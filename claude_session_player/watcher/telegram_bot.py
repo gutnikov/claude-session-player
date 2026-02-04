@@ -420,7 +420,7 @@ async def shutdown_telegram_bot(state: TelegramBotState) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Question Callback Handler
+# Callback Handlers
 # ---------------------------------------------------------------------------
 
 
@@ -446,6 +446,144 @@ def create_question_callback_handler() -> CallbackHandler:
             text="Please respond to this question in the Claude CLI",
             show_alert=False,
         )
+
+    return handler
+
+
+def create_noop_callback_handler() -> CallbackHandler:
+    """Create a callback handler for noop button presses.
+
+    The noop button (used for the "Live" indicator) should just acknowledge
+    the callback without showing any toast or taking any action.
+
+    Returns:
+        Async callback handler function.
+    """
+
+    async def handler(callback: CallbackQuery) -> None:
+        """Handle noop button callback."""
+        if callback.data != "noop":
+            return
+
+        # Acknowledge callback silently (no toast)
+        await callback.answer()
+
+    return handler
+
+
+def create_extend_ttl_callback_handler(
+    on_extend: Callable[[str, str], Awaitable[bool]],
+) -> CallbackHandler:
+    """Create a callback handler for extend TTL button presses.
+
+    When a user clicks the +30s button (callback data starting with "extend:"),
+    the handler parses the message_id and calls the provided callback to extend
+    the TTL on the associated binding.
+
+    Args:
+        on_extend: Async callback taking (chat_id, message_id) and returning
+                   True if TTL was extended, False if binding not found.
+
+    Returns:
+        Async callback handler function.
+    """
+
+    async def handler(callback: CallbackQuery) -> None:
+        """Handle extend TTL button callback."""
+        # Only handle our extend callbacks
+        if not callback.data or not callback.data.startswith("extend:"):
+            return
+
+        # Parse message_id from callback data (format: extend:{message_id})
+        parts = callback.data.split(":", 1)
+        if len(parts) != 2:
+            await callback.answer(text="Invalid callback data", show_alert=False)
+            return
+
+        message_id = parts[1]
+        chat_id = str(callback.message.chat.id) if callback.message else None
+
+        if not chat_id:
+            await callback.answer(text="Unable to find chat", show_alert=False)
+            return
+
+        # Call the extend handler
+        success = await on_extend(chat_id, message_id)
+
+        if success:
+            await callback.answer(text="+30s added", show_alert=False)
+        else:
+            await callback.answer(text="Session not found", show_alert=False)
+
+    return handler
+
+
+def create_combined_callback_handler(
+    on_extend: Callable[[str, str], Awaitable[bool]] | None = None,
+) -> CallbackHandler:
+    """Create a combined callback handler for all session-related callbacks.
+
+    Combines handling for:
+    - q:* - question option buttons (show CLI message)
+    - noop - live indicator button (acknowledge silently)
+    - extend:* - TTL extension button (extend TTL and show toast)
+
+    This is the recommended handler to use for both polling and webhook modes.
+
+    Args:
+        on_extend: Optional async callback for TTL extension taking
+                   (chat_id, message_id) and returning success bool.
+                   If None, extend callbacks will show "Not configured".
+
+    Returns:
+        Async callback handler function.
+    """
+
+    async def handler(callback: CallbackQuery) -> None:
+        """Handle all session-related callbacks."""
+        data = callback.data
+
+        if not data:
+            return
+
+        # Question callbacks (q:*)
+        if data.startswith("q:"):
+            await callback.answer(
+                text="Please respond to this question in the Claude CLI",
+                show_alert=False,
+            )
+            return
+
+        # Noop callbacks (live indicator)
+        if data == "noop":
+            await callback.answer()
+            return
+
+        # Extend TTL callbacks (extend:*)
+        if data.startswith("extend:"):
+            if on_extend is None:
+                await callback.answer(text="Not configured", show_alert=False)
+                return
+
+            parts = data.split(":", 1)
+            if len(parts) != 2:
+                await callback.answer(text="Invalid callback data", show_alert=False)
+                return
+
+            message_id = parts[1]
+            chat_id = str(callback.message.chat.id) if callback.message else None
+
+            if not chat_id:
+                await callback.answer(text="Unable to find chat", show_alert=False)
+                return
+
+            success = await on_extend(chat_id, message_id)
+
+            if success:
+                await callback.answer(text="+30s added", show_alert=False)
+            else:
+                await callback.answer(text="Session not found", show_alert=False)
+            return
 
     return handler
 

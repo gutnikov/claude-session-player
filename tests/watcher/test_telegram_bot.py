@@ -13,6 +13,9 @@ from claude_session_player.watcher.telegram_bot import (
     TelegramBotState,
     TelegramPollingRunner,
     build_webhook_url,
+    create_combined_callback_handler,
+    create_extend_ttl_callback_handler,
+    create_noop_callback_handler,
     create_question_callback_handler,
     delete_telegram_webhook,
     get_bot_info,
@@ -600,6 +603,269 @@ class TestCreateQuestionCallbackHandler:
 
         mock_callback = AsyncMock()
         mock_callback.data = ""
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Noop Callback Handler Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateNoopCallbackHandler:
+    """Tests for create_noop_callback_handler function."""
+
+    @pytest.mark.asyncio
+    async def test_handler_acknowledges_noop_callback(self) -> None:
+        """Handler acknowledges noop callback silently."""
+        handler = create_noop_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "noop"
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_handler_ignores_other_callbacks(self) -> None:
+        """Handler ignores non-noop callbacks."""
+        handler = create_noop_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "extend:123"
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Extend TTL Callback Handler Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateExtendTTLCallbackHandler:
+    """Tests for create_extend_ttl_callback_handler function."""
+
+    @pytest.mark.asyncio
+    async def test_handler_extends_ttl_successfully(self) -> None:
+        """Handler calls on_extend and shows success toast."""
+        on_extend = AsyncMock(return_value=True)
+        handler = create_extend_ttl_callback_handler(on_extend)
+
+        mock_message = MagicMock()
+        mock_message.chat.id = 123456789
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "extend:42"
+        mock_callback.message = mock_message
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        on_extend.assert_called_once_with("123456789", "42")
+        mock_callback.answer.assert_called_once_with(
+            text="+30s added", show_alert=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_handler_handles_binding_not_found(self) -> None:
+        """Handler shows error toast when binding not found."""
+        on_extend = AsyncMock(return_value=False)
+        handler = create_extend_ttl_callback_handler(on_extend)
+
+        mock_message = MagicMock()
+        mock_message.chat.id = 123456789
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "extend:42"
+        mock_callback.message = mock_message
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        on_extend.assert_called_once_with("123456789", "42")
+        mock_callback.answer.assert_called_once_with(
+            text="Session not found", show_alert=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_handler_ignores_non_extend_callbacks(self) -> None:
+        """Handler ignores callbacks not starting with extend:."""
+        on_extend = AsyncMock(return_value=True)
+        handler = create_extend_ttl_callback_handler(on_extend)
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "q:tool-123:0:1"
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        on_extend.assert_not_called()
+        mock_callback.answer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handler_handles_missing_message(self) -> None:
+        """Handler shows error when message is missing."""
+        on_extend = AsyncMock(return_value=True)
+        handler = create_extend_ttl_callback_handler(on_extend)
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "extend:42"
+        mock_callback.message = None
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        on_extend.assert_not_called()
+        mock_callback.answer.assert_called_once_with(
+            text="Unable to find chat", show_alert=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_handler_handles_empty_message_id(self) -> None:
+        """Handler shows error for empty message_id after colon."""
+        on_extend = AsyncMock(return_value=True)
+        handler = create_extend_ttl_callback_handler(on_extend)
+
+        mock_message = MagicMock()
+        mock_message.chat.id = 123456789
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "extend:"  # Empty message_id
+        mock_callback.message = mock_message
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        # Should call on_extend with empty string
+        on_extend.assert_called_once_with("123456789", "")
+
+    @pytest.mark.asyncio
+    async def test_handler_handles_negative_chat_id(self) -> None:
+        """Handler handles negative chat IDs (group chats)."""
+        on_extend = AsyncMock(return_value=True)
+        handler = create_extend_ttl_callback_handler(on_extend)
+
+        mock_message = MagicMock()
+        mock_message.chat.id = -1001234567890  # Supergroup ID
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "extend:99"
+        mock_callback.message = mock_message
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        on_extend.assert_called_once_with("-1001234567890", "99")
+        mock_callback.answer.assert_called_once_with(
+            text="+30s added", show_alert=False
+        )
+
+
+# ---------------------------------------------------------------------------
+# Combined Callback Handler Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateCombinedCallbackHandler:
+    """Tests for create_combined_callback_handler function."""
+
+    @pytest.mark.asyncio
+    async def test_handles_question_callback(self) -> None:
+        """Combined handler handles question callbacks."""
+        handler = create_combined_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "q:tool-123:0:1"
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_called_once_with(
+            text="Please respond to this question in the Claude CLI",
+            show_alert=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_handles_noop_callback(self) -> None:
+        """Combined handler handles noop callbacks."""
+        handler = create_combined_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "noop"
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_handles_extend_callback_with_handler(self) -> None:
+        """Combined handler handles extend callbacks when on_extend provided."""
+        on_extend = AsyncMock(return_value=True)
+        handler = create_combined_callback_handler(on_extend=on_extend)
+
+        mock_message = MagicMock()
+        mock_message.chat.id = 123456789
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "extend:42"
+        mock_callback.message = mock_message
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        on_extend.assert_called_once_with("123456789", "42")
+        mock_callback.answer.assert_called_once_with(
+            text="+30s added", show_alert=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_handles_extend_callback_without_handler(self) -> None:
+        """Combined handler shows error when extend called without on_extend."""
+        handler = create_combined_callback_handler()  # No on_extend
+
+        mock_message = MagicMock()
+        mock_message.chat.id = 123456789
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "extend:42"
+        mock_callback.message = mock_message
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_called_once_with(
+            text="Not configured", show_alert=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_ignores_empty_callback_data(self) -> None:
+        """Combined handler ignores callbacks with no data."""
+        handler = create_combined_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = None
+        mock_callback.answer = AsyncMock()
+
+        await handler(mock_callback)
+
+        mock_callback.answer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ignores_unknown_callback_data(self) -> None:
+        """Combined handler ignores unknown callback types."""
+        handler = create_combined_callback_handler()
+
+        mock_callback = AsyncMock()
+        mock_callback.data = "unknown:data"
         mock_callback.answer = AsyncMock()
 
         await handler(mock_callback)
