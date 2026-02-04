@@ -130,7 +130,6 @@ class WatcherService:
             self.destination_manager = DestinationManager(
                 _config=self.config_manager,
                 _on_session_start=self._on_destination_session_start,
-                _on_session_stop=self._on_destination_session_stop,
             )
 
         # Initialize messaging components based on bot config
@@ -407,10 +406,6 @@ class WatcherService:
 
             await self.sqlite_indexer.close()
             logger.info("SQLite indexer closed")
-
-        # Shutdown destination manager (cancel keep-alive tasks)
-        await self.destination_manager.shutdown()
-        logger.info("Destination manager shutdown")
 
         # Close all SSE connections (send session_ended)
         sessions = self.config_manager.list_all()
@@ -689,31 +684,6 @@ class WatcherService:
 
         # Process initial lines for context
         await self.file_watcher.process_initial(session_id, last_n_lines=3)
-
-    async def _on_destination_session_stop(self, session_id: str) -> None:
-        """Handle session stop callback from DestinationManager.
-
-        Called when the keep-alive timer expires after the last destination
-        detaches from a session. Stops file watching and cleans up.
-
-        Args:
-            session_id: The session to stop watching.
-        """
-        logger.info(f"Stopping file watching for session: {session_id}")
-
-        # Emit session_ended event to SSE subscribers
-        await self.sse_manager.close_session(session_id, reason="no_destinations")
-
-        # Remove from file watcher
-        self.file_watcher.remove(session_id)
-
-        # Remove event buffer
-        self.event_buffer.remove_buffer(session_id)
-
-        # Delete state file
-        self.state_manager.delete(session_id)
-
-        # Note: config is not removed - session info persists
 
     # -------------------------------------------------------------------------
     # Single-Message Rendering Methods
